@@ -141,7 +141,9 @@ AD_VERBOSE=1 python3 server.py   # 打印异常堆栈与通知调试信息
 ### 测试
 
 ```bash
-python3 -m unittest discover -s tests     # 136 项单元测试（指标 / 存储 / 日志 / 数据接口）
+python3 -m unittest discover -s tests        # 143 项单元测试（指标 / 存储 / 日志 / JSON 出口 / 数据接口）
+python3 tests/audit_json_endpoints.py        # 按浏览器严格性审计全部接口（需服务已启动）
+node tests/ui/create_tracker_sync.js         # 前端表单回归测试（需 jsdom，详见 tests/ui/README.md）
 ```
 
 ---

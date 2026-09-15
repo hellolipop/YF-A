@@ -134,7 +134,7 @@
             api.quote(f.market, [code]).catch(() => ({ rows: [] })),
           ]);
           const hit = (s.rows || []).find((r) => r.code.toUpperCase() === code) || (s.rows || [])[0];
-          if (hit) f.name = hit.name;
+          if (hit) { f.name = hit.name; f.nameFor = code; }
           const row = (q.rows || [])[0];
           f.price = row && row.price;
           f.minCapital = f.price ? f.price * Number(f.lot) * 1.01 : null;
@@ -282,14 +282,16 @@
       const f = st.form;
       const code = syncFromDom();
       if (!code) { ctx.toast('请先填写标的代码', 'warn'); return; }
-      /* 名称未知时即时解析，避免任务名退化成代码 */
-      if (!f.name || f.name === code) {
+      /* 名称未知、或名称属于另一个标的时即时解析
+         （输入框被改成别的代码后，预填的旧名称不能跟着提交） */
+      if (!f.name || f.nameFor !== code) {
         try {
           const s = await api.search(code);
           const hit = (s.rows || []).find((r) => String(r.code).toUpperCase() === code) || (s.rows || [])[0];
-          if (hit && hit.name) f.name = hit.name;
+          if (hit && hit.name) { f.name = hit.name; f.nameFor = code; }
         } catch (e) { /* 名称可选 */ }
       }
+      const initialUsed = Number(f.initial) || 100000;
       const body = {
         market: f.market, code, name: f.name || code, strategy: f.strategy, period: f.period,
         params: f.params, lookback: f.lookback, targetDays: f.targetDays,
@@ -306,8 +308,14 @@
         const res = await api.strategyCreate(body);
         st.selected = res.run && res.run.id;
         ctx.toast('跟踪任务已创建：' + label, 'ok');
+        /* 资金不够买一手时明确提示，否则用户会看到"信号很多但没成交" */
+        if (res.minCapital && res.minCapital > initialUsed) {
+          ctx.toast('注意：' + (f.lot || 100) + ' 股约需 ' + F.amt(res.minCapital, body.market) +
+            '，当前初始资金 ' + F.amt(initialUsed, body.market) + '，买入信号会被跳过（可在详情里调整）', 'warn');
+        }
         f.code = '';
         f.name = '';
+        f.nameFor = null;
         f.params = {};
         f.note = '';
         f.price = null;
@@ -1074,6 +1082,7 @@
       if (ctx.state.symbol && ctx.state.symbol.code) {
         st.form.code = ctx.state.symbol.code;
         st.form.name = ctx.state.symbol.name || '';
+        st.form.nameFor = ctx.state.symbol.code;   // 预填名称属于这个代码
         st.form.market = ctx.state.symbol.market || st.form.market;
         st.form.lot = st.form.market === 'cn' ? 100 : 1;
       }
@@ -1083,7 +1092,7 @@
         if (pre.strategy && st.meta.strategies[pre.strategy]) st.form.strategy = pre.strategy;
         if (pre.params) st.form.params = Object.assign({}, pre.params);
         if (pre.period) st.form.period = pre.period;
-        if (pre.name) st.form.name = pre.name;
+        if (pre.name) { st.form.name = pre.name; st.form.nameFor = st.form.code; }
         ctx.state.trackerPrefill = null;
       }
       renderForm();
