@@ -47,6 +47,11 @@
     let eqChart = null;
     let timer = null;
 
+    /* 调整任务面板：持久节点，避免自动刷新打断正在编辑的内容 */
+    const adjustHost = h('div');
+    const adjustState = { forId: null, showLogic: false, reset: false, vals: {}, logic: {}, revisions: [] };
+    const revHost = h('div');
+
     const engineChip = h('span', { class: 'engine-chip off' });
     const totalsHost = h('div', { class: 'metric-list' });
     const formHost = h('div');
@@ -371,6 +376,324 @@
       }
     }
 
+    /* ----------------------------------------------------- 调整任务 */
+
+    function fieldLabel(key) {
+      const labels = (st.meta && st.meta.editable && st.meta.editable.labels) || {};
+      return labels[key] || key;
+    }
+
+    function fmtVal(v) {
+      if (v === null || v === undefined) return '—';
+      if (typeof v === 'object') {
+        return Object.keys(v).map((k) => k + '=' + F.num(v[k], 4)).join(' ') || '—';
+      }
+      if (typeof v === 'number') return String(Math.round(v * 1e6) / 1e6);
+      return String(v) || '—';
+    }
+
+    /** 计算待提交的变更（只提交真正改动的字段） */
+    function currentPatch(run) {
+      const logicKeys = ((st.meta && st.meta.editable && st.meta.editable.logic) || []);
+      const v = adjustState.vals;
+      const patch = {};
+      if (String(v.name || '') !== (run.name || '')) patch.name = String(v.name || '');
+      if (String(v.note || '') !== (run.note || '')) patch.note = String(v.note || '');
+      if (Number(v.targetDays) !== Number(run.targetDays)) patch.targetDays = Number(v.targetDays);
+      if (Math.abs(Number(v.fee) - Number(run.fee)) > 1e-9) patch.fee = Number(v.fee);
+      if (Math.abs(Number(v.slippage) - Number(run.slippage)) > 1e-9) patch.slippage = Number(v.slippage);
+      if (Math.abs(Number(v.stopLoss) - Number(run.stopLoss)) > 1e-9) patch.stopLoss = Number(v.stopLoss);
+      if (Math.abs(Number(v.takeProfit) - Number(run.takeProfit)) > 1e-9) patch.takeProfit = Number(v.takeProfit);
+      if (adjustState.showLogic) {
+        const lv = adjustState.logic;
+        if (lv.strategy !== run.strategy) {
+          patch.strategy = lv.strategy;
+        } else if (JSON.stringify(lv.params) !== JSON.stringify(run.params)) {
+          patch.params = lv.params;
+        }
+        if (lv.period !== run.period) patch.period = lv.period;
+        if (Number(lv.fq) !== Number(run.fq)) patch.fq = Number(lv.fq);
+        if (Math.abs(Number(lv.initial) - Number(run.initial)) > 1e-6) patch.initial = Number(lv.initial);
+        if (Number(lv.lot) !== Number(run.lot)) patch.lot = Number(lv.lot);
+        if (lv.startDate !== run.startDate) patch.startDate = lv.startDate;
+      }
+      return { patch, logicKeys };
+    }
+
+    const diffHost = h('div', { class: 'legend-inline', style: { marginTop: '10px' } });
+    const saveBtn = h('button', { class: 'btn primary sm', text: '保存调整' });
+    const logicToggle = h('button', { class: 'btn sm', text: '显示会改变统计口径的字段' });
+    let logicBoxRef = null;
+    logicToggle.addEventListener('click', () => {
+      adjustState.showLogic = !adjustState.showLogic;
+      if (logicBoxRef) logicBoxRef.style.display = adjustState.showLogic ? '' : 'none';
+      logicToggle.textContent = adjustState.showLogic ? '收起高级字段' : '显示会改变统计口径的字段';
+      logicToggle.classList.toggle('active', adjustState.showLogic);
+      updateDiff();
+    });
+
+    function updateDiff() {
+      const run = st.detail && st.detail.run;
+      clear(diffHost);
+      if (!run) return;
+      const { patch, logicKeys } = currentPatch(run);
+      const keys = Object.keys(patch);
+      if (!keys.length) {
+        diffHost.appendChild(h('span', { class: 'dim3', text: '尚未修改任何字段' }));
+        saveBtn.disabled = true;
+        return;
+      }
+      const logic = keys.filter((k) => logicKeys.indexOf(k) >= 0);
+      diffHost.appendChild(h('span', { class: 'dim3', text: '待提交 ' + keys.length + ' 项：' }));
+      keys.forEach((k) => {
+        const from = run[k];
+        diffHost.appendChild(h('span', { class: 'chip' + (logicKeys.indexOf(k) >= 0 ? ' warn' : ' accent') }, [
+          h('span', { text: fieldLabel(k) + ' ' + fmtVal(from) + ' → ' + fmtVal(patch[k]) }),
+        ]));
+      });
+      if (logic.length && !adjustState.reset) {
+        saveBtn.disabled = true;
+        diffHost.appendChild(h('span', { class: 'chip warn', text: '需勾选「重置并重新回溯」后才能提交' }));
+      } else {
+        saveBtn.disabled = false;
+      }
+    }
+
+    async function saveAdjust() {
+      const run = st.detail && st.detail.run;
+      if (!run) return;
+      const { patch, logicKeys } = currentPatch(run);
+      const keys = Object.keys(patch);
+      if (!keys.length) { ctx.toast('没有检测到变更', 'warn'); return; }
+      const logic = keys.some((k) => logicKeys.indexOf(k) >= 0);
+      if (logic && !adjustState.reset) {
+        ctx.toast('策略、参数、周期、资金、观察期窗口会改变统计口径，请勾选「重置并重新回溯」', 'err');
+        return;
+      }
+      if (logic && !window.confirm('这将清空该任务已有的交易与权益记录，并按新配置重新回溯历史，确认继续？')) return;
+      saveBtn.disabled = true;
+      saveBtn.textContent = logic ? '重置并回溯中…' : '保存中…';
+      try {
+        const res = await api.strategyUpdate(run.id, patch, logic);
+        ctx.toast('已调整：' + (res.changed || []).map(fieldLabel).join('、') +
+          (res.reset ? '（已重置并重新回溯）' : '（仅影响后续成交）'), 'ok');
+        adjustState.reset = false;
+        await refreshAll(true);
+        if (st.detail && st.detail.run) {
+          buildAdjust(st.detail.run, true);
+          renderDetail();
+        }
+      } catch (e) {
+        ctx.toast('调整失败：' + e.message, 'err');
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = '保存调整';
+        updateDiff();
+      }
+    }
+    saveBtn.addEventListener('click', saveAdjust);
+
+    function buildAdjust(run, force) {
+      if (!force && adjustState.forId === run.id && adjustHost.children.length) {
+        updateDiff();
+        return;
+      }
+      adjustState.forId = run.id;
+      adjustState.showLogic = false;
+      adjustState.reset = false;
+      adjustState.vals = {
+        name: run.name || run.code, note: run.note || '', targetDays: run.targetDays,
+        fee: run.fee, slippage: run.slippage, stopLoss: run.stopLoss, takeProfit: run.takeProfit,
+      };
+      adjustState.logic = {
+        strategy: run.strategy, period: run.period, fq: run.fq === undefined ? 1 : run.fq,
+        params: Object.assign({}, run.params || {}), initial: run.initial,
+        lot: run.lot, startDate: run.startDate,
+      };
+
+      const meta = st.meta || { strategies: {}, periods: [], windows: [], targets: [90] };
+      clear(adjustHost);
+      const v = adjustState.vals;
+
+      const txt = (key, label, ph, title) => {
+        const inp = h('input', { class: 'inp', value: String(v[key] === undefined ? '' : v[key]), placeholder: ph || '', title: title || '' });
+        inp.addEventListener('input', () => { v[key] = inp.value; updateDiff(); });
+        return h('div', { class: 'field' }, [h('label', { text: label }), inp]);
+      };
+      const num = (key, label, step, title) => {
+        const inp = h('input', { class: 'inp', value: String(v[key]), step: step || 'any', title: title || '' });
+        inp.addEventListener('input', () => { v[key] = inp.value; updateDiff(); });
+        return h('div', { class: 'field' }, [h('label', { text: label }), inp]);
+      };
+
+      const targetSel = h('select', { class: 'inp' });
+      const targets = (meta.targets || [90]).slice();
+      if (targets.indexOf(Number(run.targetDays)) < 0) targets.push(Number(run.targetDays));
+      targets.sort((a, b) => a - b).forEach((t) => targetSel.appendChild(h('option', { value: String(t), text: t + ' 个交易日' })));
+      targetSel.value = String(v.targetDays);
+      targetSel.addEventListener('change', () => { v.targetDays = Number(targetSel.value); updateDiff(); });
+
+      const safeGrid = h('div', { class: 'run-form' }, [
+        txt('name', '任务名称', run.code),
+        txt('note', '备注', '如：验证 5/20 均线在茅台上的表现'),
+        h('div', { class: 'field' }, [h('label', { text: '观察目标' }), targetSel]),
+        num('fee', '手续费率', 'any', '小数，0.0003 = 万三'),
+        num('slippage', '滑点', 'any', '小数，0.001 = 千一'),
+        num('stopLoss', '止损 %', 'any', '0 表示不启用'),
+        num('takeProfit', '止盈 %', 'any', '0 表示不启用'),
+      ]);
+
+      /* 高级：会改变统计口径的字段 */
+      const logicGrid = h('div', { class: 'run-form' });
+      const lv = adjustState.logic;
+
+      const stratSel = h('select', { class: 'inp' });
+      Object.keys(meta.strategies || {}).forEach((k) => {
+        stratSel.appendChild(h('option', { value: k, text: meta.strategies[k].name }));
+      });
+      stratSel.value = lv.strategy;
+      const paramHost = h('div', { class: 'filter-grid', style: { gridColumn: '1 / -1', marginTop: '4px' } });
+      const renderParams = () => {
+        clear(paramHost);
+        const sp = (meta.strategies[lv.strategy] || {}).params || [];
+        sp.forEach((pd) => {
+          const cur = lv.params[pd.key] !== undefined ? lv.params[pd.key] : pd.def;
+          const inp = h('input', { class: 'inp', value: String(cur), min: pd.min, max: pd.max });
+          inp.addEventListener('input', () => {
+            const n = Number(inp.value);
+            if (!isNaN(n)) { lv.params[pd.key] = n; updateDiff(); }
+          });
+          paramHost.appendChild(h('div', { class: 'field' }, [h('label', { text: pd.label }), inp]));
+        });
+      };
+      stratSel.addEventListener('change', () => {
+        lv.strategy = stratSel.value;
+        const sp = (meta.strategies[lv.strategy] || {}).params || [];
+        lv.params = {};
+        sp.forEach((pd) => { lv.params[pd.key] = pd.def; });
+        renderParams();
+        updateDiff();
+      });
+      renderParams();
+
+      const periodSel = h('select', { class: 'inp' });
+      (meta.periods || []).forEach((p) => periodSel.appendChild(h('option', { value: p.value, text: p.label })));
+      periodSel.value = lv.period;
+      periodSel.addEventListener('change', () => { lv.period = periodSel.value; updateDiff(); });
+
+      const fqSel = h('select', { class: 'inp' }, [
+        h('option', { value: '1', text: '前复权' }), h('option', { value: '0', text: '不复权' }),
+        h('option', { value: '2', text: '后复权' }),
+      ]);
+      fqSel.value = String(lv.fq);
+      fqSel.addEventListener('change', () => { lv.fq = Number(fqSel.value); updateDiff(); });
+
+      const initInp = h('input', { class: 'inp', value: String(lv.initial) });
+      initInp.addEventListener('input', () => { lv.initial = initInp.value; updateDiff(); });
+      const lotInp = h('input', { class: 'inp', value: String(lv.lot), title: 'A股为 100 股/手，美股为 1 股' });
+      lotInp.addEventListener('input', () => { lv.lot = lotInp.value; updateDiff(); });
+
+      const winSel = h('select', { class: 'inp' });
+      (meta.windows || []).forEach((p) => winSel.appendChild(h('option', { value: p.value, text: p.label })));
+      winSel.appendChild(h('option', { value: 'custom', text: '自定义日期' }));
+      winSel.value = '3m';
+      const dateInp = h('input', { class: 'inp', value: run.startDate, title: '观察期起点（YYYY-MM-DD）' });
+      dateInp.addEventListener('change', () => { lv.startDate = dateInp.value; updateDiff(); });
+      winSel.addEventListener('change', () => {
+        if (winSel.value === 'custom') { dateInp.style.display = ''; return; }
+        const days = { '1m': 30, '3m': 92, '6m': 183, '1y': 365 }[winSel.value] || 92;
+        const d = new Date(Date.now() - days * 86400000);
+        const p = (n) => String(n).padStart(2, '0');
+        lv.startDate = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+        dateInp.value = lv.startDate;
+        dateInp.style.display = '';
+        updateDiff();
+      });
+      dateInp.style.display = '';   // 默认展示日期，便于直接微调
+
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '策略' }), stratSel]));
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '周期' }), periodSel]));
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '复权方式' }), fqSel]));
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '初始资金' }), initInp]));
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '最小交易单位' }), lotInp]));
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '回溯窗口' }), winSel]));
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '观察期起点' }), dateInp]));
+      logicGrid.appendChild(paramHost);
+
+      const resetChk = h('input', { type: 'checkbox' });
+      resetChk.addEventListener('change', () => { adjustState.reset = resetChk.checked; updateDiff(); });
+      const resetRow = h('label', { class: 'legend-inline', style: { marginTop: '10px', cursor: 'pointer' } }, [
+        resetChk,
+        h('span', { class: 'chip warn', text: '重置并重新回溯' }),
+        h('span', { text: '清空已有交易与权益记录（观察期内统计口径保持一致）' }),
+      ]);
+
+      const logicBox = h('div', { class: 'adjust-box' }, [
+        h('div', { class: 'legend-inline', style: { marginBottom: '10px' } }, [
+          h('span', { class: 'chip warn', text: '会改变统计口径' }),
+          '策略 / 参数 / 周期 / 复权 / 初始资金 / 最小单位 / 观察期窗口，改动后需重新回溯',
+        ]),
+        logicGrid,
+        resetRow,
+      ]);
+      logicBox.style.display = 'none';
+      logicBoxRef = logicBox;
+      logicToggle.textContent = '显示会改变统计口径的字段';
+      logicToggle.classList.remove('active');
+
+      adjustHost.appendChild(h('div', { class: 'adjust-box' }, [
+        h('div', { class: 'legend-inline', style: { marginBottom: '10px' } }, [
+          h('span', { class: 'chip accent', text: '即时生效' }),
+          '名称、备注、观察目标、手续费、滑点、止损止盈：不影响已产生的统计，只作用于后续成交',
+        ]),
+        safeGrid,
+      ]));
+      adjustHost.appendChild(logicBox);
+      adjustHost.appendChild(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '12px' } }, [
+        saveBtn,
+        logicToggle,
+        h('button', {
+          class: 'btn sm ghost', text: '放弃修改',
+          on: {
+            click: () => {
+              if (!st.detail || !st.detail.run) return;
+              buildAdjust(st.detail.run, true);
+              ctx.toast('已放弃未保存的修改', 'info');
+            },
+          },
+        }),
+      ]));
+      adjustHost.appendChild(diffHost);
+      updateDiff();
+    }
+
+    function renderRevisions(run) {
+      clear(revHost);
+      const revs = (run.revisions || []);
+      if (!revs.length) {
+        revHost.appendChild(h('div', { class: 'legend-inline' }, ['该任务创建后尚未调整过配置']));
+        return;
+      }
+      revs.forEach((rev) => {
+        const rows = Object.keys(rev.fields || {}).map((k) => h('div', { class: 'legend-inline monospaced' }, [
+          h('span', { class: 'chip', text: fieldLabel(k) }),
+          h('span', { class: 'dim3', text: fmtVal(rev.fields[k].from) + ' → ' }),
+          h('span', { text: fmtVal(rev.fields[k].to) }),
+        ]));
+        revHost.appendChild(h('div', { class: 'news-item' }, [
+          h('div', { class: 'time', text: F.clock(rev.ts) }),
+          h('div', { class: 'body' }, [
+            h('div', { class: 'txt' }, [
+              h('strong', { text: '调整 ' + Object.keys(rev.fields || {}).length + ' 项' }),
+              rev.reset ? '　' : '　仅影响后续成交　',
+              rev.reset ? h('span', { class: 'chip warn', text: '已重置并重新回溯' }) : null,
+            ]),
+            h('div', { style: { marginTop: '6px', display: 'grid', gap: '3px' } }, rows),
+          ]),
+        ]));
+      });
+    }
+
     /* ----------------------------------------------------- 任务详情 */
 
     function renderDetail() {
@@ -461,10 +784,14 @@
             ]),
           ])),
         ]),
+        ui.section('调整任务', '手续费 / 滑点 / 止损止盈 / 观察目标即时生效；策略类字段需重置并重新回溯', [], adjustHost),
         ui.section('月度盈亏', '按自然月拆解：月末权益变动 + 已实现盈亏', [], monthlyHost),
         ui.section('逐笔交易', '信号次日开盘成交，含手续费与滑点', [], tradesHost),
         ui.section('最近信号', '引擎识别到的买卖信号（含因资金不足被跳过的信号）', [], signalsHost),
+        ui.section('变更记录', '该任务的配置调整历史（最近 30 次）', [], revHost),
       ]));
+      buildAdjust(run);
+      renderRevisions(run);
 
       /* 权益曲线 */
       const eq = d.equity || [];

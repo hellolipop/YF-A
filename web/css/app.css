@@ -502,3 +502,15 @@ input.inp::placeholder { color: var(--text-3); }
 .run-detail-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
 .run-detail-head h3 { margin: 0; font-size: 15px; }
 .mono-sm { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); }
+
+/* 调整任务面板 */
+.adjust-box {
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r);
+  padding: 12px 14px;
+  background: var(--surface);
+  margin-bottom: 10px;
+}
+.adjust-box .run-form { margin-top: 2px; }
+.adjust-box .legend-inline { line-height: 1.7; }
+.monospaced { font-family: var(--mono); font-size: 11.5px; }

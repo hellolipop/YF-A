@@ -330,6 +330,34 @@ def new_id():
     return "s" + str(int(time.time() * 1000))[-9:] + str(int(time.time() * 7919) % 97).zfill(2)
 
 
+# 调整任务时可修改的字段：
+#   SAFE  —— 只影响后续成交与展示口径，已产生的交易与统计保持不变
+#   LOGIC —— 会改变策略逻辑或资金规模，必须重置并重新回溯，否则统计口径失效
+SAFE_FIELDS = ("name", "note", "targetDays", "fee", "slippage", "stopLoss", "takeProfit")
+LOGIC_FIELDS = ("strategy", "params", "period", "fq", "initial", "lot", "startDate", "lookback")
+
+FIELD_LABELS = {
+    "name": "任务名称", "note": "备注", "targetDays": "观察目标", "fee": "手续费率",
+    "slippage": "滑点", "stopLoss": "止损%", "takeProfit": "止盈%", "strategy": "策略",
+    "params": "策略参数", "period": "周期", "fq": "复权方式", "initial": "初始资金",
+    "lot": "最小交易单位", "startDate": "观察期起点", "lookback": "回溯窗口",
+}
+
+
+def _resolve_start_date(lookback, start_date=None):
+    if start_date:
+        return str(start_date)
+    days = {"1m": 30, "3m": 92, "6m": 183, "1y": 365}.get(str(lookback or "3m"), 92)
+    return (datetime.now(CN_TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _clip(v, lo, hi):
+    try:
+        return max(lo, min(hi, float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
 def create_run(cfg):
     market = (cfg.get("market") or "cn").lower()
     code = str(cfg.get("code") or "").strip().upper()
@@ -349,11 +377,7 @@ def create_run(cfg):
 
     period = cfg.get("period") or "day"
     target_days = int(cfg.get("targetDays") or 90)
-    lookback = str(cfg.get("lookback") or "3m")
-    start_date = cfg.get("startDate")
-    if not start_date:
-        days = {"1m": 30, "3m": 92, "6m": 183, "1y": 365}.get(lookback, 92)
-        start_date = (datetime.now(CN_TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+    start_date = _resolve_start_date(cfg.get("lookback"), cfg.get("startDate"))
 
     run = {
         "id": new_id(),
@@ -394,6 +418,7 @@ def create_run(cfg):
         "signals": [],
         "monthly": {},
         "skippedBuys": 0,
+        "revisions": [],
         "benchmarkStart": None,
         "lastPrice": None,
         "lastBarTime": None,
@@ -828,6 +853,159 @@ def api_detail(rid):
     }
 
 
+def _reset_records(run):
+    """原地清空明细记录并回到未建仓状态（保持对象同一性，避免旧引用失效）"""
+    run.update({
+        "barProcessed": 0, "startedFromIdx": 0, "pending": None, "cash": run["initial"],
+        "qty": 0, "entryPrice": None, "entryDate": None, "entryIdx": 0, "entryFee": 0,
+        "entryPhase": None, "entryReason": None, "executedOnDate": None,
+        "trades": [], "equity": [], "signals": [], "monthly": {}, "skippedBuys": 0,
+        "benchmarkStart": None, "benchmarkStartDate": None,
+        "lastPrice": None, "lastBarTime": None, "lastTick": None, "lastError": None,
+        "tickCount": 0,
+    })
+
+
+def _apply_safe_field(run, key, value, changes):
+    """校验并写入「不影响统计口径」的字段（只影响后续成交与展示）"""
+    if key in ("name", "note"):
+        v = str(value or "").strip()[:40 if key == "name" else 120]
+        if key == "name" and not v:
+            v = run["code"]
+        if v != (run.get(key) or ""):
+            changes[key] = [run.get(key), v]
+            run[key] = v
+    elif key == "targetDays":
+        v = _clip(value, 5, 500)
+        if v is None:
+            raise RuntimeError("观察目标需为 5 ~ 500 之间的交易日数")
+        v = int(v)
+        if v != run.get("targetDays"):
+            changes[key] = [run.get("targetDays"), v]
+            run[key] = v
+    elif key in ("fee", "slippage", "stopLoss", "takeProfit"):
+        limits = {"fee": (0, 0.02, "手续费率需为 0 ~ 0.02（0% ~ 2%）"),
+                  "slippage": (0, 0.05, "滑点需为 0 ~ 0.05（0% ~ 5%）"),
+                  "stopLoss": (0, 50, "止损需为 0 ~ 50（0 表示不启用）"),
+                  "takeProfit": (0, 300, "止盈需为 0 ~ 300（0 表示不启用）")}
+        lo, hi, msg = limits[key]
+        v = _clip(value, lo, hi)
+        if v is None:
+            raise RuntimeError(msg)
+        if abs(v - (run.get(key) or 0)) > 1e-9:
+            changes[key] = [run.get(key), v]
+            run[key] = v
+
+
+def _apply_logic_field(run, key, value, changes):
+    """校验并写入「会改变统计口径」的字段（调用方需重置记录）"""
+    if key == "strategy":
+        v = str(value)
+        if v not in STRATEGIES:
+            raise RuntimeError("未知策略：%s" % v)
+        if v != run.get("strategy"):
+            changes[key] = [run.get("strategy"), v]
+            run["strategy"] = v
+            run["strategyName"] = STRATEGIES[v]["name"]
+            defaults = {pd["key"]: float(pd["def"]) for pd in STRATEGIES[v]["params"]}
+            changes["params"] = [run.get("params"), defaults]
+            run["params"] = defaults
+    elif key == "params":
+        base = dict(run.get("params") or {})
+        parsed = {}
+        for pd in STRATEGIES[run["strategy"]]["params"]:
+            raw = (value or {}).get(pd["key"], base.get(pd["key"], pd["def"]))
+            parsed[pd["key"]] = float(_clip(raw, pd["min"], pd["max"]) or pd["def"])
+        if parsed != run.get("params"):
+            changes["params"] = [run.get("params"), parsed]
+            run["params"] = parsed
+    elif key == "period":
+        v = str(value)
+        if v not in ("day", "week", "month", "5m", "15m", "30m", "60m"):
+            raise RuntimeError("不支持的周期：%s" % v)
+        if v != run.get("period"):
+            changes[key] = [run.get("period"), v]
+            run[key] = v
+    elif key == "fq":
+        v = int(_clip(value, 0, 2) or 1)
+        if v != (run.get("fq") if run.get("fq") is not None else 1):
+            changes[key] = [run.get("fq"), v]
+            run[key] = v
+    elif key == "initial":
+        v = _clip(value, 1000, 1e10)
+        if v is None:
+            raise RuntimeError("初始资金需为 1000 以上")
+        if abs(v - (run.get("initial") or 0)) > 1e-6:
+            changes[key] = [run.get("initial"), v]
+            run["initial"] = v
+    elif key == "lot":
+        v = int(_clip(value, 1, 100000) or 1)
+        if v != run.get("lot"):
+            changes[key] = [run.get("lot"), v]
+            run[key] = v
+    elif key == "startDate":
+        v = _resolve_start_date(None, value)
+        if v != run.get("startDate"):
+            changes["startDate"] = [run.get("startDate"), v]
+            run["startDate"] = v
+    elif key == "lookback":
+        v = _resolve_start_date(value, None)
+        if v != run.get("startDate"):
+            changes["startDate"] = [run.get("startDate"), v]
+            run["startDate"] = v
+
+
+def revise_run(rid, patch, reset=False):
+    """在详情里调整跟踪任务。
+
+    · 仅调整 SAFE_FIELDS（名称/备注/观察目标/手续费/滑点/止损/止盈）：
+      已产生的交易、权益与统计保持不变，只影响后续成交与展示口径；
+    · 涉及 LOGIC_FIELDS（策略、参数、周期、复权、初始资金、最小单位、观察期窗口）：
+      必须 reset=True，此时清空明细并重新回溯，保证观察期内统计口径统一。
+    """
+    run = get_run(rid)
+    if not run:
+        raise RuntimeError("任务不存在")
+    patch = patch or {}
+    logic_keys = [k for k in LOGIC_FIELDS if k in patch]
+    safe_keys = [k for k in SAFE_FIELDS if k in patch]
+    if not logic_keys and not safe_keys:
+        raise RuntimeError("没有需要调整的字段")
+
+    with LOCK:
+        # 先在深拷贝上校验与试算：任何校验失败都不会污染原任务
+        draft = json.loads(json.dumps(run, ensure_ascii=False))
+        changes = {}
+        for k in logic_keys:
+            _apply_logic_field(draft, k, patch[k], changes)
+        logic_changed = bool(changes)
+        if logic_keys and not reset and logic_changed:
+            raise RuntimeError("修改「%s」会改变统计口径，请勾选「重置并重新回溯」后提交"
+                               % "、".join(FIELD_LABELS.get(k, k) for k in logic_keys))
+        for k in safe_keys:
+            _apply_safe_field(draft, k, patch[k], changes)
+        if logic_changed:
+            _reset_records(draft)
+        if changes:
+            rev = {
+                "ts": int(time.time() * 1000),
+                "reset": bool(logic_changed),
+                "fields": {k: {"from": v[0], "to": v[1]} for k, v in changes.items()},
+            }
+            draft.setdefault("revisions", []).insert(0, rev)
+            del draft["revisions"][30:]
+        # 校验全部通过后，原地整体提交（保持对象同一性，RUNS 中的引用依然有效）
+        run.clear()
+        run.update(draft)
+    if logic_changed:
+        tick_run(run, backfill=True)
+    save(force=True)
+    return {
+        "ok": True, "id": rid, "reset": bool(logic_changed),
+        "changed": sorted(changes.keys()), "run": get_run(rid, detail=True),
+    }
+
+
 def action(rid, act):
     run = get_run(rid)
     if not run:
@@ -846,20 +1024,8 @@ def action(rid, act):
         tick_run(run)
     elif act == "reset":
         with LOCK:
-            keep = {k: run[k] for k in ("id", "createdAt", "market", "code", "name", "strategy",
-                                        "strategyName", "params", "period", "fq", "initial", "lot",
-                                        "fee", "slippage", "stopLoss", "takeProfit", "targetDays",
-                                        "startDate", "status", "mode", "note")}
-        keep.update({
-            "barProcessed": 0, "startedFromIdx": 0, "pending": None, "cash": run["initial"],
-            "qty": 0, "entryPrice": None, "entryDate": None, "entryIdx": 0, "entryFee": 0,
-            "trades": [], "equity": [], "signals": [], "monthly": {}, "benchmarkStart": None,
-            "lastPrice": None, "lastBarTime": None, "lastTick": None, "lastError": None,
-            "tickCount": 0, "skippedBuys": 0,
-        })
-        with LOCK:
-            RUNS[RUNS.index(run)] = keep
-        tick_run(keep, backfill=True)
+            _reset_records(run)
+        tick_run(run, backfill=True)
     else:
         raise RuntimeError("未知操作：%s" % act)
     save(force=True)

@@ -89,6 +89,7 @@
     strategyRun: (id) => get('strategy/run', { id }, { noDedupe: true }),
     strategyCreate: (body) => post('strategy/create', body),
     strategyAction: (id, action) => post('strategy/action', { id, action }),
+    strategyUpdate: (id, patch, reset) => post('strategy/update', { id, patch, reset: !!reset }),
   };
 
   window.AD = window.AD || {};

@@ -1282,6 +1282,11 @@ def api_strategy_meta():
             {"value": "6m", "label": "近 6 个月"}, {"value": "1y", "label": "近 1 年"},
         ],
         "targets": [30, 60, 90, 180],
+        "editable": {
+            "safe": list(strategy_engine.SAFE_FIELDS),
+            "logic": list(strategy_engine.LOGIC_FIELDS),
+            "labels": strategy_engine.FIELD_LABELS,
+        },
         "engine": strategy_engine.engine_status(),
         "store": strategy_engine.STORE_FILE,
     }
@@ -1319,6 +1324,31 @@ def api_strategy_action(body):
     if not rid or not act:
         raise RuntimeError("缺少 id 或 action")
     return strategy_engine.action(rid, act)
+
+
+def api_strategy_update(body):
+    """在详情里调整跟踪任务（安全字段即时生效；策略/参数/资金等需 reset=True 重新回溯）"""
+    body = body or {}
+    rid = body.get("id")
+    if not rid:
+        raise RuntimeError("缺少 id")
+    patch = body.get("patch") or {}
+    if not isinstance(patch, dict) or not patch:
+        raise RuntimeError("缺少需要调整的字段")
+    res = strategy_engine.revise_run(rid, patch, bool(body.get("reset")))
+    price, min_cap = None, None
+    try:
+        run = res.get("run") or {}
+        q = _strategy_fetch_quote(run.get("market") or "cn", run.get("code"))
+        price = q.get("price")
+        lot = run.get("lot") or 100
+        if price:
+            min_cap = price * lot * 1.01
+    except Exception:  # noqa: BLE001
+        pass
+    res["price"] = price
+    res["minCapital"] = min_cap
+    return res
 
 
 
@@ -1470,6 +1500,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_strategy_create(body))
             if path == "/api/strategy/action":
                 return self.send_json(api_strategy_action(body))
+            if path == "/api/strategy/update":
+                return self.send_json(api_strategy_update(body))
             return self.send_json({"error": True, "message": "未知接口: %s" % path}, 404)
         except Exception as exc:  # noqa: BLE001
             return self.send_json({"error": True, "message": str(exc)[:300]}, 502)
