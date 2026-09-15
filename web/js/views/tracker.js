@@ -187,12 +187,29 @@
       const noteInput = h('input', { class: 'inp', value: f.note, placeholder: '如：验证 5/20 均线在茅台上的表现' });
       noteInput.addEventListener('input', () => { f.note = noteInput.value; });
 
+      const fillSel = h('select', { class: 'inp' });
+      Object.keys(meta.fillModels || { nextOpen: { name: '次根开盘价（默认）' } }).forEach((k) => {
+        fillSel.appendChild(h('option', { value: k, text: meta.fillModels[k].name }));
+      });
+      fillSel.value = f.fillModel || 'nextOpen';
+      fillSel.addEventListener('change', () => { f.fillModel = fillSel.value; });
+
+      const modeSel = h('select', { class: 'inp' });
+      (meta.metricsModes || [{ value: 'compound', label: '几何累乘（复利口径）' },
+        { value: 'simple', label: '算术累加（单利口径）' }]).forEach((m) => {
+        modeSel.appendChild(h('option', { value: m.value, text: m.label }));
+      });
+      modeSel.value = f.metricsMode || 'compound';
+      modeSel.addEventListener('change', () => { f.metricsMode = modeSel.value; });
+
       formHost.appendChild(h('div', {}, [
         h('div', { class: 'run-form' }, [
           h('div', { class: 'field' }, [h('label', { text: '市场' }), marketSeg]),
           h('div', { class: 'field wide' }, [h('label', { text: '标的' }), codeInput, nameBox]),
           h('div', { class: 'field' }, [h('label', { text: '策略' }), stratSel]),
           h('div', { class: 'field' }, [h('label', { text: '周期' }), periodSel]),
+          h('div', { class: 'field' }, [h('label', { text: '成交模型' }), fillSel]),
+          h('div', { class: 'field' }, [h('label', { text: '累计口径' }), modeSel]),
           h('div', { class: 'field' }, [h('label', { text: '回溯窗口' }), lookbackSel]),
           h('div', { class: 'field' }, [h('label', { text: '观察目标' }), targetSel]),
           numField('initial', '初始资金'),
@@ -239,6 +256,8 @@
         initial: Number(f.initial) || 100000, lot: Number(f.lot) || 1,
         fee: Number(f.fee), slippage: Number(f.slippage),
         stopLoss: Number(f.stopLoss) || 0, takeProfit: Number(f.takeProfit) || 0,
+        fillModel: f.fillModel || 'nextOpen', metricsMode: f.metricsMode || 'compound',
+        participation: Number(f.participation) || 0.05,
         note: f.note,
       };
       ctx.toast('正在创建并回溯历史…', 'info');
@@ -404,6 +423,11 @@
       if (Math.abs(Number(v.slippage) - Number(run.slippage)) > 1e-9) patch.slippage = Number(v.slippage);
       if (Math.abs(Number(v.stopLoss) - Number(run.stopLoss)) > 1e-9) patch.stopLoss = Number(v.stopLoss);
       if (Math.abs(Number(v.takeProfit) - Number(run.takeProfit)) > 1e-9) patch.takeProfit = Number(v.takeProfit);
+      if (v.participation !== undefined && Math.abs(Number(v.participation) - Number(run.participation || 0.05)) > 1e-9) {
+        patch.participation = Number(v.participation);
+      }
+      if (v.metricsMode && v.metricsMode !== (run.metricsMode || 'compound')) patch.metricsMode = v.metricsMode;
+      if ((v.notify || '') !== (run.notify || '')) patch.notify = v.notify || '';
       if (adjustState.showLogic) {
         const lv = adjustState.logic;
         if (lv.strategy !== run.strategy) {
@@ -412,6 +436,7 @@
           patch.params = lv.params;
         }
         if (lv.period !== run.period) patch.period = lv.period;
+        if (lv.fillModel !== (run.fillModel || 'nextOpen')) patch.fillModel = lv.fillModel;
         if (Number(lv.fq) !== Number(run.fq)) patch.fq = Number(lv.fq);
         if (Math.abs(Number(lv.initial) - Number(run.initial)) > 1e-6) patch.initial = Number(lv.initial);
         if (Number(lv.lot) !== Number(run.lot)) patch.lot = Number(lv.lot);
@@ -504,11 +529,15 @@
       adjustState.vals = {
         name: run.name || run.code, note: run.note || '', targetDays: run.targetDays,
         fee: run.fee, slippage: run.slippage, stopLoss: run.stopLoss, takeProfit: run.takeProfit,
+        participation: run.participation === undefined ? 0.05 : run.participation,
+        metricsMode: run.metricsMode || 'compound',
+        notify: run.notify || '',
       };
       adjustState.logic = {
         strategy: run.strategy, period: run.period, fq: run.fq === undefined ? 1 : run.fq,
         params: Object.assign({}, run.params || {}), initial: run.initial,
         lot: run.lot, startDate: run.startDate,
+        fillModel: run.fillModel || 'nextOpen',
       };
 
       const meta = st.meta || { strategies: {}, periods: [], windows: [], targets: [90] };
@@ -526,6 +555,17 @@
         return h('div', { class: 'field' }, [h('label', { text: label }), inp]);
       };
 
+      const modeSelField = () => {
+        const sel = h('select', { class: 'inp' });
+        ((meta.metricsModes) || [{ value: 'compound', label: '几何累乘（复利口径）' },
+          { value: 'simple', label: '算术累加（单利口径）' }]).forEach((m) => {
+          sel.appendChild(h('option', { value: m.value, text: m.label }));
+        });
+        sel.value = v.metricsMode || 'compound';
+        sel.addEventListener('change', () => { v.metricsMode = sel.value; updateDiff(); });
+        return h('div', { class: 'field' }, [h('label', { text: '累计口径' }), sel]);
+      };
+
       const targetSel = h('select', { class: 'inp' });
       const targets = (meta.targets || [90]).slice();
       if (targets.indexOf(Number(run.targetDays)) < 0) targets.push(Number(run.targetDays));
@@ -541,6 +581,9 @@
         num('slippage', '滑点', 'any', '小数，0.001 = 千一'),
         num('stopLoss', '止损 %', 'any', '0 表示不启用'),
         num('takeProfit', '止盈 %', 'any', '0 表示不启用'),
+        num('participation', '参与度上限', 'any', '深度加权成交模型使用，0.005 ~ 0.5'),
+        modeSelField(),
+        txt('notify', '通知 Webhook', '留空则用全局设置', '事件发生时 POST JSON 到此地址'),
       ]);
 
       /* 高级：会改变统计口径的字段 */
@@ -613,6 +656,13 @@
 
       logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '策略' }), stratSel]));
       logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '周期' }), periodSel]));
+      const fillSel = h('select', { class: 'inp' });
+      Object.keys((meta.fillModels) || { nextOpen: { name: '次根开盘价（默认）' } }).forEach((k) => {
+        fillSel.appendChild(h('option', { value: k, text: meta.fillModels[k].name }));
+      });
+      fillSel.value = lv.fillModel || 'nextOpen';
+      fillSel.addEventListener('change', () => { lv.fillModel = fillSel.value; updateDiff(); });
+      logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '成交模型' }), fillSel]));
       logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '复权方式' }), fqSel]));
       logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '初始资金' }), initInp]));
       logicGrid.appendChild(h('div', { class: 'field' }, [h('label', { text: '最小交易单位' }), lotInp]));
@@ -726,6 +776,16 @@
         statCard('交易次数', s.trades + ' 笔（' + s.wins + ' 胜 / ' + s.losses + ' 负）'),
         statCard('盈亏比', s.profitFactor >= 99 ? '∞（无亏损）' : F.num(s.profitFactor, 2)),
         statCard('最大回撤', '-' + F.num(s.maxDrawdown, 2) + '%', 'down'),
+        statCard('夏普比率', F.num(s.sharpe, 2), s.sharpe > 1 ? 'up' : ''),
+        statCard('索提诺', F.num(s.sortino, 2), s.sortino > 1 ? 'up' : ''),
+        statCard('卡玛比率', F.num(s.calmar, 2), s.calmar > 1 ? 'up' : ''),
+        statCard('年化波动', F.num(s.annualizedVol, 2) + '%'),
+        statCard('Alpha / Beta', F.num(s.alpha, 3) + ' / ' + F.num(s.beta, 2)),
+        statCard('单日 VaR(95%)', F.num(s.var95, 2) + '%', 'down'),
+        statCard('期望值 / 笔', F.amt(s.expectancy, run.market), F.dir(s.expectancy)),
+        statCard('持仓占比', F.num(s.exposure, 1) + '%'),
+        statCard('交易成本合计', F.amt(s.costTotal, run.market), 'down'),
+        statCard('其中手续费 / 滑点', F.num(s.feeTotal, 0) + ' / ' + F.num(s.slippageTotal, 0)),
         statCard('平均持仓', F.num(s.avgHoldBars, 1) + ' 根K线'),
         statCard('基准（买入持有）', s.benchmarkPct === null ? '—' : F.pct(s.benchmarkPct), F.dir(s.benchmarkPct)),
         statCard('超额收益', s.excessPct === null ? '—' : F.pct(s.excessPct), F.dir(s.excessPct)),
@@ -849,6 +909,24 @@
             { key: 'pnlPct', label: '收益率', cls: 'n', value: (t) => t.pnlPct, render: (t) => pct(t.pnlPct) },
             { key: 'pnl', label: '盈亏', cls: 'n', value: (t) => t.pnl, render: (t) => h('span', { class: 'num ' + F.dir(t.pnl), text: F.amt(t.pnl, run.market) }) },
             { key: 'bars', label: '持仓', cls: 'n', value: (t) => t.bars, render: (t) => h('span', { class: 'num', text: t.bars + ' 根' }) },
+            {
+              key: 'cost', label: '成本', cls: 'n', noSort: true,
+              render: (t) => {
+                const cost = (t.fee || 0) + (t.slippage || 0);
+                const est = t.costEstimated ? h('span', { class: 'dim3', text: t.costEstimated ? '（估算）' : '' }) : null;
+                return h('span', { class: 'num', title: '手续费 ' + F.num(t.fee || 0, 2) + ' + 滑点 ' + F.num(t.slippage || 0, 2) }, [
+                  h('span', { text: F.num(cost, 2) }), est,
+                ]);
+              },
+            },
+            {
+              key: 'slipBps', label: '实现滑点', cls: 'n', noSort: true,
+              render: (t) => {
+                if (!t.signalPrice || !t.fillPrice) return h('span', { class: 'num dim3', text: '—' });
+                const bps = (t.fillPrice / t.signalPrice - 1) * 10000;
+                return h('span', { class: 'num', text: F.num(bps, 1) + ' bp' });
+              },
+            },
             { key: 'reason', label: '平仓原因', noSort: true },
             {
               key: 'phase', label: '阶段', noSort: true,

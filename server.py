@@ -30,10 +30,20 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import engine as strategy_engine
+import datetime
+
+from core import fills as core_fills
+from core import logs as core_logs
+from core import metrics as core_metrics
+from core import notify as core_notify
+from core import runner as core_runner
+from core import storage as core_storage
+from core import strategies as core_strategies
+from providers import features as feat_provider
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(BASE_DIR, "web")
+_BOOT_TS = time.time()
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
@@ -1248,66 +1258,124 @@ def now_ms():
 
 def api_health():
     return {"ok": True, "serverTime": now_ms(), "cacheKeys": len(_CACHE),
-            "tz": "Asia/Shanghai", "version": "1.1",
-            "engine": strategy_engine.engine_status()}
+            "tz": "Asia/Shanghai", "version": "2.0",
+            "engine": (RUNNER.status() if RUNNER is not None else {"running": False})}
 
 
 # --------------------------------------------------------------------------- #
-# 策略持续跟踪（Paper Trading）—— 引擎在 server 启动时常驻运行
+# 策略跟踪 / 回测 / 参数寻优（服务端统一引擎）
+#   分层见 core/runner.py：数据源 → 策略 → 撮合 → 账户 → 绩效 → 持久
+#   回测与跟踪共用同一份实现，避免出现两份口径（对标调研报告 A1/A2 项）
 # --------------------------------------------------------------------------- #
 
-def _strategy_fetch_bars(market, code, period, limit):
+RUNNER = None
+
+
+def _runner_fetch_bars(market, code, period, limit):
     res = api_kline(market, code, period or "day", 1, limit or 800)
     return res.get("bars") or []
 
 
-def _strategy_fetch_quote(market, code):
+def _runner_fetch_quote(market, code):
+    rows = quotes(market, [code])
+    return rows[0] if rows else {}
+
+
+def _runner_fetch_orderbook(market, code):
+    """盘口（深度加权成交模型需要）；美股只有一档，取不到就返回空由模型降级"""
     try:
-        rows = quotes(market, [code])
-        return rows[0] if rows else {}
+        st = api_stock(market, code)
     except Exception:  # noqa: BLE001
         return {}
+    return {"bids": st.get("bids") or [], "asks": st.get("asks") or []}
+
+
+def init_runner():
+    """初始化引擎：SQLite 存储 + 结构化日志 + 通知器 + 数据抓取器注入"""
+    global RUNNER
+    if RUNNER is not None:
+        return RUNNER
+    data_dir = os.path.join(BASE_DIR, "data")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    db_path = os.environ.get("AD_DB") or os.path.join(data_dir, "alphadesk.db")
+    legacy = os.path.join(data_dir, "strategy_runs.json")
+    try:
+        core_logs.configure(os.path.join(data_dir, "alphadesk.log"))
+    except Exception:  # noqa: BLE001
+        pass
+    RUNNER = core_runner.Runner(db_path, data_dir=data_dir, legacy_json=legacy)
+    RUNNER.notifier = core_notify.Notifier(store=RUNNER.store,
+                                          echo=bool(os.environ.get("AD_VERBOSE")))
+    RUNNER.configure(_runner_fetch_bars, _runner_fetch_quote, _runner_fetch_orderbook)
+    try:
+        RUNNER.backfill_costs()
+    except Exception:  # noqa: BLE001
+        pass
+    return RUNNER
+
+
+def runner():
+    return RUNNER if RUNNER is not None else init_runner()
 
 
 def api_strategy_meta():
+    meta = core_strategies.meta()
+    today = datetime.date.today()
+    windows = []
+    for key, label, days in (("1m", "近 1 个月", 30), ("3m", "近 3 个月（推荐）", 92),
+                             ("6m", "近 6 个月", 183), ("1y", "近 1 年", 365)):
+        start = today - datetime.timedelta(days=days)
+        windows.append({"value": key, "label": label, "startDate": start.strftime("%Y-%m-%d")})
     return {
-        "strategies": strategy_engine.strategy_meta(),
-        "periods": [
-            {"value": "day", "label": "日K"}, {"value": "week", "label": "周K"},
-            {"value": "60m", "label": "60分钟"}, {"value": "30m", "label": "30分钟"},
-            {"value": "15m", "label": "15分钟"}, {"value": "5m", "label": "5分钟"},
-        ],
-        "windows": [
-            {"value": "1m", "label": "近 1 个月"}, {"value": "3m", "label": "近 3 个月（推荐）"},
-            {"value": "6m", "label": "近 6 个月"}, {"value": "1y", "label": "近 1 年"},
-        ],
+        "strategies": meta,
+        "periods": [{"value": v, "label": lb} for v, lb in
+                    (("day", "日K"), ("week", "周K"), ("month", "月K"), ("60m", "60分钟"),
+                     ("30m", "30分钟"), ("15m", "15分钟"), ("5m", "5分钟"))],
+        "windows": windows,
         "targets": [30, 60, 90, 180],
+        "fillModels": core_fills.meta(),
+        "metricsModes": [
+            {"value": "compound", "label": "几何累乘（复利口径）"},
+            {"value": "simple", "label": "算术累加（单利口径）"},
+        ],
+        "metrics": [
+            {"key": "total_return", "label": "累计收益"},
+            {"key": "annualized_return", "label": "年化收益"},
+            {"key": "sharpe", "label": "夏普比率"},
+            {"key": "calmar", "label": "卡玛比率"},
+            {"key": "max_drawdown", "label": "最大回撤"},
+        ],
         "editable": {
-            "safe": list(strategy_engine.SAFE_FIELDS),
-            "logic": list(strategy_engine.LOGIC_FIELDS),
-            "labels": strategy_engine.FIELD_LABELS,
+            "safe": list(core_runner.SAFE_FIELDS),
+            "logic": list(core_runner.LOGIC_FIELDS),
+            "labels": core_runner.FIELD_LABELS,
         },
-        "engine": strategy_engine.engine_status(),
-        "store": strategy_engine.STORE_FILE,
+        "engine": runner().status(),
+        "storage": runner().store.meta_get("db_path", None) or "sqlite",
+        "store": os.path.join(BASE_DIR, "data", "alphadesk.db"),
     }
 
 
 def api_strategy_overview():
-    return strategy_engine.api_overview()
+    return runner().overview()
 
 
 def api_strategy_detail(rid):
-    data = strategy_engine.api_detail(rid)
+    data = runner().detail(rid)
     if not data:
         raise RuntimeError("任务不存在：%s" % rid)
     return data
 
 
 def api_strategy_create(body):
-    run = strategy_engine.create_run(body or {})
+    r = runner()
+    run = r.create_run(body or {})
     price, min_cap = None, None
     try:
-        q = _strategy_fetch_quote(run["market"], run["code"])
+        q = _runner_fetch_quote(run["market"], run["code"])
         price = q.get("price")
         lot = run.get("lot") or 100
         if price:
@@ -1317,17 +1385,7 @@ def api_strategy_create(body):
     return {"ok": True, "run": run, "price": price, "minCapital": min_cap}
 
 
-def api_strategy_action(body):
-    body = body or {}
-    rid = body.get("id")
-    act = body.get("action")
-    if not rid or not act:
-        raise RuntimeError("缺少 id 或 action")
-    return strategy_engine.action(rid, act)
-
-
 def api_strategy_update(body):
-    """在详情里调整跟踪任务（安全字段即时生效；策略/参数/资金等需 reset=True 重新回溯）"""
     body = body or {}
     rid = body.get("id")
     if not rid:
@@ -1335,11 +1393,11 @@ def api_strategy_update(body):
     patch = body.get("patch") or {}
     if not isinstance(patch, dict) or not patch:
         raise RuntimeError("缺少需要调整的字段")
-    res = strategy_engine.revise_run(rid, patch, bool(body.get("reset")))
+    res = runner().revise(rid, patch, bool(body.get("reset")))
     price, min_cap = None, None
     try:
         run = res.get("run") or {}
-        q = _strategy_fetch_quote(run.get("market") or "cn", run.get("code"))
+        q = _runner_fetch_quote(run.get("market") or "cn", run.get("code"))
         price = q.get("price")
         lot = run.get("lot") or 100
         if price:
@@ -1350,6 +1408,143 @@ def api_strategy_update(body):
     res["minCapital"] = min_cap
     return res
 
+
+def api_strategy_action(body):
+    body = body or {}
+    rid = body.get("id")
+    act = body.get("action")
+    if not rid or not act:
+        raise RuntimeError("缺少 id 或 action")
+    return runner().action(rid, act)
+
+
+def api_backtest(body):
+    """服务端统一回测（前端只负责画图，不再自行计算信号）"""
+    return runner().backtest(body or {})
+
+
+def api_params_search(body):
+    """参数网格寻优"""
+    return runner().grid_search(body or {})
+
+
+# --------------------------------------------------------------------------- #
+# A股新数据（集合竞价 / 分笔 / 龙虎榜 / 涨停梯队）
+# --------------------------------------------------------------------------- #
+
+def api_feature(kind, q):
+    if kind == "auction":
+        code = (q.get("code") or "").strip()
+        if not code:
+            raise RuntimeError("缺少 code")
+        return feat_provider.auction(code)
+    if kind == "ticks":
+        code = (q.get("code") or "").strip()
+        if not code:
+            raise RuntimeError("缺少 code")
+        limit = int(num(q.get("limit"), 60) or 60)
+        return feat_provider.ticks(code, limit=limit)
+    if kind == "dragon_tiger":
+        return feat_provider.dragon_tiger(q.get("date") or None)
+    if kind == "limit_up":
+        return feat_provider.limit_up_ladder(q.get("date") or None)
+    raise RuntimeError("未知数据接口：%s" % kind)
+
+
+def api_features_index():
+    return {
+        "items": [
+            {"key": "auction", "name": "集合竞价", "desc": "09:15~09:25 委托与撮合快照（A股）"},
+            {"key": "ticks", "name": "分笔成交", "desc": "当日逐笔成交明细（A股，仅当日）"},
+            {"key": "dragon_tiger", "name": "龙虎榜", "desc": "当日上榜个股与席位明细"},
+            {"key": "limit_up", "name": "涨停梯队", "desc": "涨停池与连板高度"},
+        ],
+        "note": "数据来自东方财富 / 腾讯公开接口，仅当日或近 20 个交易日有效",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 可观测性：日志端点与运行摘要
+# --------------------------------------------------------------------------- #
+
+def api_logs(limit=100, level=None):
+    r = runner()
+    out = []
+    try:
+        out = r.logger.ring(limit=limit, level=level)
+    except Exception:  # noqa: BLE001
+        out = []
+    if not out:
+        try:
+            out = r.store.list_logs(limit=limit, min_level=level)
+        except Exception:  # noqa: BLE001
+            out = []
+    return {"rows": out, "count": len(out), "level": level, "updated": now_ms()}
+
+
+def api_sysinfo():
+    r = runner()
+    info = api_health()
+    info.update({
+        "storage": {
+            "engine": "sqlite",
+            "path": os.path.join(BASE_DIR, "data", "alphadesk.db"),
+            "journal": safe_call(r.store.journal_mode),
+            "schemaVersion": safe_call(r.store.schema_version),
+            "counts": safe_call(r.store.counts) or {},
+        },
+        "cache": {"keys": len(_CACHE), "bytes": cache_bytes()},
+        "providers": {
+            "quote": "腾讯行情 → 新浪财经",
+            "kline": "腾讯行情 → 东方财富",
+            "market": "东方财富 → 新浪财经 → 本地快照",
+            "features": "东方财富 / 腾讯（集合竞价、分笔、龙虎榜、涨停梯队）",
+        },
+        "notify": r.notifier.settings() if r.notifier else {},
+        "uptimeSec": int(time.time() - _BOOT_TS),
+    })
+    return info
+
+
+def safe_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cache_bytes():
+    try:
+        total = 0
+        for val in _CACHE.values():
+            total += len(json.dumps(val[1], ensure_ascii=False, default=str))
+        return total
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# --------------------------------------------------------------------------- #
+# 通知设置
+# --------------------------------------------------------------------------- #
+
+def api_notify_settings():
+    r = runner()
+    return r.notifier.settings() if r.notifier else {"enabled": False}
+
+
+def api_notify_update(body):
+    r = runner()
+    if not r.notifier:
+        raise RuntimeError("通知器未初始化")
+    return r.notifier.save_settings(body or {})
+
+
+def api_notify_test(body):
+    r = runner()
+    if not r.notifier:
+        raise RuntimeError("通知器未初始化")
+    url = (body or {}).get("webhook")
+    return r.notifier.test(url)
 
 
 # --------------------------------------------------------------------------- #
@@ -1478,6 +1673,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_strategy_overview())
             if path == "/api/strategy/run":
                 return self.send_json(api_strategy_detail(q.get("id")))
+            if path == "/api/features":
+                return self.send_json(api_features_index())
+            if path.startswith("/api/features/"):
+                return self.send_json(api_feature(path.rsplit("/", 1)[-1], q))
+            if path == "/api/logs":
+                return self.send_json(api_logs(int(fnum("limit", 100) or 100), q.get("level")))
+            if path == "/api/sysinfo":
+                return self.send_json(api_sysinfo())
+            if path == "/api/notify":
+                return self.send_json(api_notify_settings())
             return self.send_json({"error": True, "message": "未知接口: %s" % path}, 404)
         except Exception as exc:  # noqa: BLE001
             if os.environ.get("AD_VERBOSE"):
@@ -1502,6 +1707,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_strategy_action(body))
             if path == "/api/strategy/update":
                 return self.send_json(api_strategy_update(body))
+            if path == "/api/backtest":
+                return self.send_json(api_backtest(body))
+            if path == "/api/search/params":
+                return self.send_json(api_params_search(body))
+            if path == "/api/notify":
+                return self.send_json(api_notify_update(body))
+            if path == "/api/notify/test":
+                return self.send_json(api_notify_test(body))
             return self.send_json({"error": True, "message": "未知接口: %s" % path}, 404)
         except Exception as exc:  # noqa: BLE001
             return self.send_json({"error": True, "message": str(exc)[:300]}, 502)
@@ -1511,23 +1724,27 @@ def main():
     ap = argparse.ArgumentParser(description="AlphaDesk 行情数据服务")
     ap.add_argument("--port", type=int, default=8848)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--no-engine", action="store_true", help="不启动常驻策略跟踪引擎")
     args = ap.parse_args()
     ensure_ssl()
-    # 策略持续跟踪引擎：注入行情抓取器并启动常驻线程（关闭浏览器后仍继续运行）
-    strategy_engine.configure(_strategy_fetch_bars, _strategy_fetch_quote, None)
+    # 服务端统一引擎：SQLite 存储 + 分层撮合/账户/绩效 + 常驻推进线程
+    r = init_runner()
     tick = int(os.environ.get("AD_STRATEGY_TICK", "60") or 60)
-    strategy_engine.start_loop(tick)
+    if not args.no_engine:
+        r.start_loop(tick)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print("AlphaDesk 行情服务已启动:  http://%s:%d" % (args.host, args.port))
     print("数据源: 腾讯行情 / 东方财富 / 新浪财经（公开接口，仅供参考，不构成投资建议）")
-    print("策略跟踪引擎: 已启动，推进间隔 %d 秒，任务文件 %s"
-          % (tick, os.path.join(BASE_DIR, "data", "strategy_runs.json")))
+    st = r.status()
+    print("策略跟踪引擎: %s，推进间隔 %d 秒，任务数 %d（SQLite: data/alphadesk.db）"
+          % ("已启动" if st.get("running") else "未启动", tick, st.get("runs") or 0))
+    print("日志端点: /api/logs    运行摘要: /api/sysinfo    回测: POST /api/backtest")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
-        strategy_engine.stop_loop()
+        r.stop_loop()
         srv.shutdown()
 
 

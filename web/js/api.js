@@ -27,8 +27,13 @@
       .then((r) => r.json().then((j) => ({ ok: r.ok, status: r.status, json: j })))
       .then(({ ok, status, json }) => {
         if (!ok || json.error) {
-          const err = new Error((json && json.message) || ('请求失败 HTTP ' + status));
+          /* features/* 等接口在失败（ok=false）时仍会返回「空实现」形状与中文原因：
+             message 优先取服务端说明，原始响应体挂在 err.json 上供视图做降级展示 */
+          const msg = (json && (json.message || (typeof json.error === 'string' ? json.error : '')))
+            || ('请求失败 HTTP ' + status);
+          const err = new Error(msg);
           err.url = url;
+          err.json = json;
           throw err;
         }
         return json;
@@ -90,6 +95,15 @@
     strategyCreate: (body) => post('strategy/create', body),
     strategyAction: (id, action) => post('strategy/action', { id, action }),
     strategyUpdate: (id, patch, reset) => post('strategy/update', { id, patch, reset: !!reset }),
+    backtest: (body) => post('backtest', body),
+    searchParams: (body) => post('search/params', body),
+    featuresIndex: () => get('features'),
+    feature: (kind, params) => get('features/' + kind, params),
+    logs: (params) => get('logs', params),
+    sysinfo: () => get('sysinfo'),
+    notifyGet: () => get('notify'),
+    notifySave: (body) => post('notify', body),
+    notifyTest: (body) => post('notify/test', body || {}),
   };
 
   window.AD = window.AD || {};
