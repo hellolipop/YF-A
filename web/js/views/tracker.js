@@ -104,6 +104,8 @@
       clear(formHost);
       const f = st.form;
       const meta = st.meta || { strategies: {}, periods: [], windows: [], targets: [] };
+      /* 记录所有输入框引用，提交时以 DOM 为唯一真源（见 syncFromDom） */
+      st.fields = {};
 
       const marketSeg = ui.seg([{ value: 'cn', label: 'A股' }, { value: 'us', label: '美股' }], f.market, (v) => {
         f.market = v;
@@ -115,6 +117,11 @@
       });
 
       const codeInput = h('input', { class: 'inp', value: f.code, placeholder: '如 600519 / AAPL' });
+      st.fields.code = codeInput;
+      /* 输入即同步：不能只依赖 blur（macOS Safari 点击按钮不会让输入框失焦） */
+      codeInput.addEventListener('input', () => {
+        f.code = codeInput.value.trim().toUpperCase();
+      });
       const nameBox = h('span', { class: 'dim3', text: f.name || '—' });
 
       async function probe() {
@@ -162,6 +169,7 @@
 
       const numField = (key, label, step, title) => {
         const inp = h('input', { class: 'inp', value: String(f[key]), step: step || 'any', title: title || '' });
+        st.fields[key] = inp;
         inp.addEventListener('input', () => {
           f[key] = inp.value;
           if (key === 'lot') {
@@ -185,6 +193,7 @@
       });
 
       const noteInput = h('input', { class: 'inp', value: f.note, placeholder: '如：验证 5/20 均线在茅台上的表现' });
+      st.fields.note = noteInput;
       noteInput.addEventListener('input', () => { f.note = noteInput.value; });
 
       const fillSel = h('select', { class: 'inp' });
@@ -246,10 +255,41 @@
       hintHost.appendChild(h('span', { text: bits.join(' · ') }));
     }
 
+    /** 提交前从输入框读回表单状态：以 DOM 为唯一真源。
+
+    两个真实踩过的坑：
+      1) macOS Safari 点击按钮不会让输入框失焦，只靠 blur 同步会导致
+         「输入框明明有值，点创建却提示要填写」；
+      2) 创建成功后如果只清空状态而不重绘表单，输入框仍显示旧代码，
+         再次点击就会拿不到代码。
+    所以提交前一律以输入框内容为准。
+    */
+    function syncFromDom() {
+      const f = st.form;
+      const fl = st.fields || {};
+      if (fl.code) {
+        const code = (fl.code.value || '').trim().toUpperCase();
+        if (code) f.code = code;
+      }
+      ['initial', 'lot', 'fee', 'slippage', 'stopLoss', 'takeProfit', 'participation'].forEach((k) => {
+        if (fl[k] && String(fl[k].value).trim() !== '') f[k] = fl[k].value;
+      });
+      if (fl.note) f.note = fl.note.value;
+      return f.code || '';
+    }
+
     async function create() {
       const f = st.form;
-      const code = (f.code || '').trim().toUpperCase();
+      const code = syncFromDom();
       if (!code) { ctx.toast('请先填写标的代码', 'warn'); return; }
+      /* 名称未知时即时解析，避免任务名退化成代码 */
+      if (!f.name || f.name === code) {
+        try {
+          const s = await api.search(code);
+          const hit = (s.rows || []).find((r) => String(r.code).toUpperCase() === code) || (s.rows || [])[0];
+          if (hit && hit.name) f.name = hit.name;
+        } catch (e) { /* 名称可选 */ }
+      }
       const body = {
         market: f.market, code, name: f.name || code, strategy: f.strategy, period: f.period,
         params: f.params, lookback: f.lookback, targetDays: f.targetDays,
@@ -260,13 +300,21 @@
         participation: Number(f.participation) || 0.05,
         note: f.note,
       };
+      const label = f.name || code;
       ctx.toast('正在创建并回溯历史…', 'info');
       try {
         const res = await api.strategyCreate(body);
         st.selected = res.run && res.run.id;
-        ctx.toast('跟踪任务已创建：' + (f.name || code), 'ok');
+        ctx.toast('跟踪任务已创建：' + label, 'ok');
         f.code = '';
         f.name = '';
+        f.params = {};
+        f.note = '';
+        f.price = null;
+        f.minCapital = null;
+        /* 手续费 / 滑点 / 止损止盈 属于成本假设，保留给下一个任务 */
+        renderForm();              /* 重绘表单，使界面与状态一致（输入框同时被清空） */
+        renderHint();
         await refreshAll();
         if (st.selected) await loadDetail();
       } catch (e) {
