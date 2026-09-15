@@ -1,5 +1,11 @@
 /* ==========================================================================
    视图 · 个股详情（行情 / 盘口 / K线 / 资金流 / 信号雷达）
+
+   实时推送：GET /api/stream/quotes?market=cn&symbols=<code>&interval=3（web/js/stream.js）
+     · quotes 事件只就地刷新页头的现价 / 涨跌 / 开高低 / 成交量额与「行情时间」标注，
+       不动 K 线、不动 AI 叠加层，也不整块重绘页头；
+     · 连不上或断线会自动降级为轮询（用页面既有的 6 秒定时器兜底），只影响状态 chip；
+     · destroy() 时关闭订阅。
    ========================================================================== */
 (function () {
   'use strict';
@@ -9,6 +15,10 @@
   const ui = window.AD.ui;
   const api = window.AD.api;
   const isNum = window.AD.isNum;
+
+  const QUOTE_PUSH_SEC = 3;            /* 行情推送 interval（秒） */
+  const QUOTE_FALLBACK_MS = 15000;     /* 降级轮询间隔 */
+  const QUOTE_FALLBACK_MIN_GAP = 5000; /* 降级轮询与既有定时器的最小间隔，避免重复请求 */
 
   const PERIODS = [
     { value: 'trend', label: '分时' }, { value: '5m', label: '5分' }, { value: '15m', label: '15分' },
@@ -140,6 +150,9 @@
     let flowChart = null;
     let timer = null;
     let advisorTimer = null;
+    let quoteStream = null;      /* 行情推送句柄 */
+    let updHost = null;          /* 「行情时间 …」标注节点，推送时只改它的文本 */
+    let lastQuoteAt = 0;         /* 最近一次行情请求时间（含既有定时器），给降级轮询去重 */
 
     const headHost = h('div');
     const legendHost = h('div', { class: 'chart-legend' });
@@ -159,10 +172,15 @@
 
     /* ---------------------------------------------------------- 头部 */
 
+    function updText(q) {
+      return '行情时间 ' + ((q && q.updated) || '—') + (q && q.stale ? ' · 数据可能延迟' : '');
+    }
+
     function renderHead() {
       const q = st.quote || {};
       const d = F.dir(q.changePct);
       clear(headHost);
+      updHost = h('span', { text: updText(q) });
       const stat = (k, v, cls) => h('div', { class: 'qh-stat' }, [
         h('div', { class: 'k', text: k }),
         h('div', { class: 'v ' + (cls || ''), text: v }),
@@ -208,12 +226,103 @@
         ]),
       ]));
       const upd = h('div', { class: 'legend-inline', style: { marginTop: '8px' } }, [
-        '行情时间 ' + (q.updated || '—') + (q.stale ? ' · 数据可能延迟' : ''),
+        updHost,                       /* 「行情时间 …」，推送时就地更新这一个节点 */
         q.week52High ? '52周最高 ' + F.price(q.week52High, market) : '',
         q.week52Low ? '52周最低 ' + F.price(q.week52Low, market) : '',
         q.avgPrice ? '均价 ' + F.price(q.avgPrice, market) : '',
       ]);
       headHost.appendChild(upd);
+    }
+
+    /* ------------------------------------------------------ 实时行情推送 */
+
+    /* 连接状态 chip：放在页头（AI 研判区块的提示行旁边同款文案，共用 stream.js 的 chip 工厂） */
+    const quoteChipHost = h('span');
+
+    function paintQuoteChip(state, title) {
+      clear(quoteChipHost);
+      const s = window.AD.stream;
+      if (!state || !s || typeof s.chip !== 'function') return;
+      quoteChipHost.appendChild(s.chip(state, title || (
+        '数据来自 /api/stream/quotes（本标的行情推送，interval=' + QUOTE_PUSH_SEC + ' 秒）；'
+        + '无实质性变化时不重复推送，断线会自动降级为页面既有的定时轮询。')));
+    }
+
+    /* 推送行情落到页头：只改文本与涨跌色 class，不重绘页头 */
+    function paintQuoteLive() {
+      const q = st.quote || {};
+      const d = F.dir(q.changePct);
+      const big = headHost.querySelector('.qh-px .big');
+      if (big) {
+        big.className = 'big ' + d;
+        big.textContent = F.price(q.price, market);
+      }
+      const chg = headHost.querySelector('.qh-px .chg');
+      if (chg && chg.children.length >= 2) {
+        chg.className = 'chg ' + d;
+        chg.children[0].textContent = F.signed(q.change, 2);
+        chg.children[1].textContent = F.pct(q.changePct);
+      }
+      /* 今开 / 最高 / 最低 / 昨收 / 成交量 / 成交额：顺序与 renderHead 里的 stat() 一致 */
+      const stats = headHost.querySelectorAll('.qh-stats .qh-stat .v');
+      const vals = [
+        F.price(q.open, market), F.price(q.high, market), F.price(q.low, market),
+        F.price(q.prevClose, market), F.vol(q.volume, market), F.amt(q.amount, market),
+      ];
+      vals.forEach((v, i) => {
+        const el = stats[i];
+        if (!el) return;
+        if (i === 0) el.className = 'v ' + F.dir((q.open || 0) - (q.prevClose || 0));
+        if (el.textContent !== v) el.textContent = v;
+      });
+      if (updHost) updHost.textContent = updText(q);
+    }
+
+    /* 只覆盖推送里真的带了的字段，其余沿用 REST 结果（避免把接口独有字段冲空） */
+    function applyLiveQuote(row) {
+      const next = Object.assign({}, st.quote || {});
+      ['price', 'change', 'changePct', 'open', 'high', 'low', 'prevClose',
+        'volume', 'amount', 'updated', 'source'].forEach((k) => {
+        if (row[k] !== undefined && row[k] !== null) next[k] = row[k];
+      });
+      st.quote = next;
+      paintQuoteLive();
+    }
+
+    /* 降级轮询：既有定时器就是兜底，这里只在它刚拉过时跳过，避免重复请求 */
+    function fallbackQuoteTick() {
+      if (st.destroyed || !root.isConnected) return;
+      if (Date.now() - lastQuoteAt < QUOTE_FALLBACK_MIN_GAP) return;
+      return loadQuote();
+    }
+
+    function stopQuoteStream() {
+      if (quoteStream && typeof quoteStream.close === 'function') quoteStream.close();
+      quoteStream = null;                     /* close() 幂等，之后不会再有任何回调 */
+    }
+
+    function startQuoteStream() {
+      const s = window.AD.stream;
+      if (!s || typeof s.quotes !== 'function' || st.destroyed) return;
+      stopQuoteStream();
+      quoteStream = s.quotes({
+        market: market,
+        symbols: [code],
+        interval: QUOTE_PUSH_SEC,
+        onQuotes: (payload) => {
+          if (st.destroyed) return;
+          const rows = (payload && Array.isArray(payload.rows)) ? payload.rows : [];
+          const want = String(code).toUpperCase();
+          /* 只认本标的（代码一致），推送里出现别的代码一律忽略，避免串行情 */
+          const hit = rows.find((r) => String((r && r.code) || '').toUpperCase() === want);
+          if (hit) applyLiveQuote(hit);
+        },
+        /* 推送出错不打扰用户：既有定时器仍在拉行情，状态 chip 会说明已降级 */
+        onError: () => {},
+        onStatus: (state) => { if (!st.destroyed) paintQuoteChip(state); },
+        fallbackMs: QUOTE_FALLBACK_MS,
+        fallbackTick: fallbackQuoteTick,
+      });
     }
 
     /* ---------------------------------------------------------- 盘口 */
@@ -940,6 +1049,7 @@
     root.appendChild(h('div', { class: 'page' }, [
       ui.pageHead('个股详情', '实时行情 · 五档盘口 · 多周期K线 · 技术信号雷达 · 资金流', [
         metaHost,
+        quoteChipHost,
         h('button', {
           class: 'btn sm', text: '刷新',
           on: { click: () => { loadQuote(); loadChart(); loadFlow(); } },
@@ -969,6 +1079,7 @@
     ]));
 
     async function loadQuote() {
+      lastQuoteAt = Date.now();          /* 记录请求时间：降级轮询据此避免与定时器重复拉取 */
       try {
         const q = await api.stock(market, code);
         st.quote = q;
@@ -1002,10 +1113,14 @@
       });
     }, Math.max(6000, ctx.state.pollMs));
 
+    /* 建立行情推送订阅（无 stream.js / 无 EventSource 时自动变为轮询，页面功能不受影响） */
+    startQuoteStream();
+
     return {
       refresh: () => { loadQuote(); loadChart(); loadFlow(); },
       destroy() {
         st.destroyed = true;                       /* 标记离开页面：在途的 AI 研判结果不再回填 */
+        stopQuoteStream();                         /* 关闭推送：之后不会再有任何回调 */
         if (timer) clearInterval(timer);
         if (advisorTimer) { clearTimeout(advisorTimer); advisorTimer = null; }
         if (chart) chart.destroy();

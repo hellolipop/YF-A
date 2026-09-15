@@ -142,7 +142,7 @@
   const VIEWS = {
     market: '市场总览', watchlist: '自选股', detail: '个股详情', screener: '选股器',
     features: '盘口事件', backtest: '策略回测', tracker: '策略跟踪', system: '运行状态',
-    alerts: '预警中心', news: '资讯快讯', advisor: 'AI 选股',
+    alerts: '预警中心', news: '资讯快讯', advisor: 'AI 选股', trade: '模拟交易',
   };
 
   function switchView(name) {
@@ -273,8 +273,8 @@
     const tag = (e.target.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
     /* 数字键顺序与左侧导航栏一致；超过 9 个的视图没有快捷键（单键只能到 9） */
-    const order = ['market', 'watchlist', 'detail', 'screener', 'advisor', 'features',
-      'backtest', 'tracker', 'system', 'alerts', 'news'];
+    const order = ['market', 'watchlist', 'detail', 'screener', 'advisor', 'trade',
+      'features', 'backtest', 'tracker', 'system', 'alerts', 'news'];
     const n = Number(e.key);
     if (n >= 1 && n <= order.length) switchView(order[n - 1]);
     if (e.key === 'r' || e.key === 'R') { if (state.active && state.active.refresh) state.active.refresh(); }

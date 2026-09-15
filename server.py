@@ -40,6 +40,8 @@ from core import notify as core_notify
 from core import runner as core_runner
 from core import storage as core_storage
 from core import strategies as core_strategies
+from core import stream as core_stream
+from core import trader as core_trader
 from providers import features as feat_provider
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1637,6 +1639,441 @@ def api_advisor_prune(body):
 
 
 # --------------------------------------------------------------------------- #
+# 实时推送中枢（SSE：行情 / 研判变化 / 交易事件）
+# --------------------------------------------------------------------------- #
+
+STREAM = None
+
+
+def _stream_recommend(symbols, **kwargs):
+    """给推送中枢用的研判入口：与 /api/advisor/recommend 共用同一份实现（单一口径）"""
+    return core_advisor.recommend(symbols, fetch_bars=_runner_fetch_bars,
+                                 fetch_quote=_runner_fetch_quote, **kwargs)
+
+
+def _post_json(url, body, timeout=6):
+    """外发 webhook：失败只记日志，绝不向上抛。
+
+    对接方（用户自己的券商桥接）挂掉、超时、返回 500 都不该影响本地下单与推送，
+    因此这里吞掉全部异常并留一条结构化日志便于排查。
+    """
+    try:
+        payload = json.dumps(sanitize_json(body), ensure_ascii=False,
+                             allow_nan=False, default=str).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code = getattr(resp, "status", 200)
+        try:
+            runner().logger.info("trade.webhook_sent", event=body.get("event"), status=code)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        try:
+            runner().logger.error("trade.webhook_failed", event=body.get("event"),
+                                  error=str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _stream_hook(kind, event, data):
+    """推送旁路：交易事件按配置外发到 webhook（**与有没有浏览器订阅者无关**）"""
+    if kind != core_stream.KIND_TRADE:
+        return
+    try:
+        cfg = core_trader.get_config(advisor_store())
+    except Exception:  # noqa: BLE001
+        return
+    url = cfg.get("webhook")
+    if not url:
+        return
+    events = cfg.get("webhookEvents") or []
+    if events and event not in events:
+        return
+    body = {"source": "alphadesk", "kind": kind, "event": event, "ts": now_ms(), "data": data}
+    # 不阻塞发布线程：外发走后台线程（推送节奏不该被对接方的响应时间拖住）
+    try:
+        threading.Thread(target=_post_json, args=(url, body), daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def init_stream():
+    """初始化推送中枢：注入批量报价与 AI 研判，两者都复用既有实现"""
+    global STREAM
+    if STREAM is not None:
+        return STREAM
+    STREAM = core_stream.StreamHub(fetch_quotes=quotes, recommend=_stream_recommend,
+                                  publish_hook=_stream_hook)
+    return STREAM
+
+
+def stream():
+    return STREAM if STREAM is not None else init_stream()
+
+
+def api_stream_status():
+    """推送中枢状态（JSON）：订阅者数、各通道节拍与上游调用量、被丢弃事件数"""
+    return stream().status()
+
+
+def api_stream_test(q):
+    """推送自检：按通道类型取一次真实上游结果，用于排查「为什么没推送」。
+
+    不改动任何订阅状态：只做一次同步调用并返回结果摘要，便于区分「上游拿不到数据」
+    与「推送链路有问题」。
+    """
+    kind = str((q or {}).get("kind") or "quotes").strip()
+    params = core_stream.parse_params(kind, q)
+    if kind == core_stream.KIND_QUOTES:
+        codes = params.get("symbols") or []
+        if not codes:
+            raise RuntimeError("请提供 symbols")
+        rows = quotes(params.get("market") or "cn", codes)
+        return {"ok": True, "kind": kind, "market": params.get("market"),
+                "requested": codes, "received": len(rows),
+                "sample": rows[0] if rows else None}
+    if kind == core_stream.KIND_ADVISOR:
+        codes = params.get("symbols") or []
+        if not codes:
+            raise RuntimeError("请提供 symbols")
+        res = _stream_recommend([{"code": c, "market": params.get("market")} for c in codes],
+                                market=params.get("market"),
+                                horizon=params.get("horizon"), capital=params.get("capital"),
+                                kelly_fraction=params.get("kellyFraction"),
+                                max_weight=params.get("maxWeight"))
+        return {"ok": True, "kind": kind, "analyzed": res.get("analyzed"),
+                "actions": {r.get("code"): r.get("action") for r in (res.get("rows") or [])},
+                "note": "仅自检，不落库、不推送"}
+    raise RuntimeError("trade 通道是事件驱动的，没有可自检的上游；请查看 /api/trade/orders")
+
+
+# --------------------------------------------------------------------------- #
+# 模拟交易 / 自动交易接口
+# --------------------------------------------------------------------------- #
+#: 自动交易的三条硬约束（写在接口说明与前端提示里，避免用户误解成真实下单）：
+#: ① 默认关闭（enabled=False），且默认 dryrun（只出计划、不成交，不改账户）；
+#: ② 不连接任何券商通道 —— 成交只发生在本地模拟账户里；
+#: ③ 对外只提供「下单指令」的导出与回执：真正的报单由用户自己的桥接系统完成。
+
+def trade_store():
+    """自动交易与策略跟踪、AI 选股共用同一个 SQLite 库"""
+    return runner().store
+
+
+def trade_cfg(store=None):
+    """当前交易配置（合并默认值后的完整字段集）"""
+    return core_trader.get_config(store if store is not None else trade_store())
+
+
+def trade_quotes(codes, market):
+    """批量取报价（成交定价用）。取不到就返回空列表，由 trader 记 rejected 而不是抛异常。"""
+    codes = [str(c).strip().upper() for c in (codes or []) if str(c).strip()]
+    if not codes:
+        return []
+    try:
+        return quotes(market, codes) or []
+    except Exception as exc:  # noqa: BLE001  行情源故障不该让接口 500
+        try:
+            runner().logger.error("trade.quote_failed", market=market, error=str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+
+
+def _trade_publish(event, data):
+    """把交易事件推给所有 trade 订阅者（同时触发外发钩子）"""
+    try:
+        return stream().publish_trade(event, data)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _trade_account_event(cfg, market, quotes_list=None):
+    """推一次账户快照（下单/成交/重置后都推，前端总览才能跟上）"""
+    try:
+        view = core_trader.account_view(trade_store(), cfg, quotes_list)
+    except Exception:  # noqa: BLE001
+        return None
+    _trade_publish("account", dict(view, ts=now_ms()))
+    return view
+
+
+def api_trade_config_get():
+    """交易配置 + 生效风控快照 + 账户概览（前端进页面第一个请求）"""
+    st = trade_store()
+    cfg = core_trader.get_config(st)
+    snap = core_trader.trade_snapshot(st, cfg)
+    return {
+        "ok": True,
+        "config": snap.get("config") or cfg,
+        "gates": snap.get("gates") or {},
+        "account": snap.get("account") or {},
+        "accountId": (snap.get("account") or {}).get("accountId"),
+        "counts": snap.get("counts") or {},
+        "note": ("自动交易默认关闭；dryrun 模式只生成计划、不产生任何成交与账户变动。"
+                 "confirmToken 是**防误触口令**，不是安全边界：本工具面向本机单用户，"
+                 "请勿把端口暴露到公网。"),
+    }
+
+
+def api_trade_config_set(body):
+    """更新交易配置（局部更新，未传字段保持不变）"""
+    body = body or {}
+    patch = body.get("patch") if isinstance(body.get("patch"), dict) else body
+    st = trade_store()
+    cfg = core_trader.save_config(st, patch)
+    try:
+        runner().logger.info("trade.config_updated",
+                             enabled=cfg.get("enabled"), mode=cfg.get("mode"),
+                             market=cfg.get("market"),
+                             keys=sorted(k for k in (patch or {}) if k != "confirmToken"))
+    except Exception:  # noqa: BLE001
+        pass
+    _trade_publish("config", dict(cfg, ts=now_ms()))
+    return {"ok": True, "config": cfg, "gates": core_trader.trade_snapshot(st, cfg).get("gates") or {},
+            "note": "配置已保存；enabled 与 mode 变更会立即生效。"}
+
+
+def api_trade_account(q):
+    """账户概览（现金 / 持仓 / 市值 / 权益 / 盈亏 + 生效风控）"""
+    q = q or {}
+    market = str(q.get("market") or "").strip().lower() or None
+    st = trade_store()
+    cfg = core_trader.get_config(st)
+    if market:
+        cfg = dict(cfg, market="us" if market.startswith("us") else "cn")
+    codes = []
+    try:
+        acc = core_trader.ensure_account(st, cfg, cfg["market"])
+        codes = [p.get("code") for p in (acc.get("positions") or []) if p.get("code")]
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("账户初始化失败：%s" % str(exc)[:160])
+    ql = trade_quotes(codes, cfg["market"])
+    snap = core_trader.trade_snapshot(st, cfg, ql)
+    return {"ok": True, "account": snap.get("account") or {}, "gates": snap.get("gates") or {},
+            "counts": snap.get("counts") or {}, "updated": now_ms()}
+
+
+def api_trade_orders(q):
+    """委托单列表（支持 status/market/code/side/since 过滤与分页）"""
+    q = q or {}
+    found = trade_store().list_trade_orders(
+        status=(q.get("status") or "").strip() or None,
+        market=(q.get("market") or "").strip().lower() or None,
+        code=(q.get("code") or "").strip().upper() or None,
+        side=(q.get("side") or "").strip().lower() or None,
+        since=int(num(q.get("since"), 0) or 0) or None,
+        limit=int(num(q.get("limit"), 100) or 100),
+        offset=int(num(q.get("offset"), 0) or 0))
+    found["ok"] = True
+    found["updated"] = now_ms()
+    return found
+
+
+def api_trade_export(q):
+    """导出待执行意图（给外部桥接系统消费的稳定结构）"""
+    q = q or {}
+    res = core_trader.export_intents(trade_store(),
+                                     since=int(num(q.get("since"), 0) or 0) or None,
+                                     limit=int(num(q.get("limit"), 200) or 200))
+    res["generatedAt"] = now_ms()
+    res["markdown"] = ("外部系统执行后请调用 POST /api/trade/ack（body: "
+                       "{id, extRef}）回执；未回执的委托会一直留在待执行列表里。")
+    return res
+
+
+def _trade_symbols(body, cfg):
+    """计划标的：优先用请求里的 symbols，其次用配置里的 universe / whitelist"""
+    raw = (body or {}).get("symbols")
+    if isinstance(raw, (list, tuple)) and raw:
+        return core_trader._codes(raw) or []
+    return list(cfg.get("universe") or []) or list(cfg.get("whitelist") or [])
+
+
+def api_trade_plan(body):
+    """生成交易计划：研判 → 风控闸门 → 落库为 pending 委托（默认不成交）。
+
+    ``execute`` 为真且模式是 paper 时立即按最新报价成交；dryrun 下**永不成交**。
+    """
+    body = body or {}
+    st = trade_store()
+    cfg = core_trader.get_config(st)
+    market = str(body.get("market") or cfg.get("market") or "cn").lower()
+    market = "us" if market.startswith("us") else "cn"
+    symbols = _trade_symbols(body, cfg)
+    cfg = dict(cfg, market=market)
+    if symbols:
+        cfg = dict(cfg, universe=symbols)
+    res = core_trader.scan(st, cfg, _stream_recommend, market=market,
+                           execute=bool(body.get("execute")))
+    # 逐个新委托推事件：外部系统与前端都按 order 事件增量更新，不必轮询
+    for order in res.get("orders") or []:
+        _trade_publish("order", dict(order, ts=now_ms()))
+    if res.get("filled"):
+        for order in res.get("orders") or []:
+            if order.get("status") == "filled":
+                _trade_publish("fill", {
+                    "orderId": order.get("id"), "code": order.get("code"),
+                    "side": order.get("side"), "qty": order.get("qty"),
+                    "fillPrice": order.get("fillPrice"), "fee": order.get("fee"),
+                    "amount": order.get("amount"), "ts": now_ms()})
+    _trade_account_event(cfg, market)
+    res["ok"] = True
+    res["updated"] = now_ms()
+    res["note"] = (res.get("note") or "") + ("｜计划已落库为 pending 委托；"
+                  "dryrun 模式不会成交，paper 模式需再调 /api/trade/execute 或带 execute=true。")
+    return res
+
+
+def _confirm_ok(body):
+    """校验确认口令：`X-Trade-Confirm` 请求头或 body.confirm 任一匹配即可。
+
+    再次强调这是**防误触**而不是鉴权：本工具面向本机单用户，口令会随配置接口返回。
+    真正的安全边界是「不要把这个端口暴露给不可信网络」。
+    """
+    cfg = core_trader.get_config(trade_store())
+    token = str(cfg.get("confirmToken") or "")
+    got = str((body or {}).get("confirm") or "").strip()
+    if not got:
+        try:
+            got = str(self_confirmation_header()).strip()
+        except Exception:  # noqa: BLE001
+            got = ""
+    if not token or got != token:
+        raise RuntimeError("确认口令不正确或缺失：请在配置区复制 confirmToken，"
+                           "或通过请求头 %s 传入" % core_trader.CONFIRM_HEADER)
+    return True
+
+
+#: 当前请求的确认头（由 do_POST 在执行前写入，避免把 handler 传进业务函数）
+_CONFIRM_HEADERS = threading.local()
+
+
+def set_confirm_header(value):
+    _CONFIRM_HEADERS.value = value
+
+
+def self_confirmation_header():
+    return getattr(_CONFIRM_HEADERS, "value", "")
+
+
+def api_trade_execute(body):
+    """执行委托：需要确认口令；只处理 pending 委托，逐单重算报价与可成交性"""
+    body = body or {}
+    _confirm_ok(body)
+    st = trade_store()
+    cfg = core_trader.get_config(st)
+    market = str(body.get("market") or cfg.get("market") or "cn").lower()
+    market = "us" if market.startswith("us") else "cn"
+    ids = body.get("ids")
+    if isinstance(ids, (list, tuple)) and ids:
+        orders = []
+        for oid in ids:
+            order = st.get_trade_order(str(oid))
+            if order is None:
+                raise RuntimeError("委托不存在：%s" % oid)
+            orders.append(order)
+    else:
+        orders = st.list_trade_orders(status="pending", market=market, limit=500).get("rows") or []
+    codes = [o.get("code") for o in orders if o.get("code")]
+    ql = trade_quotes(codes, market)
+    cfg = dict(cfg, market=market)
+    res = core_trader.execute_orders(st, cfg, orders, ql)
+    for order in res.get("orders") or []:
+        _trade_publish("order", dict(order, ts=now_ms()))
+        if order.get("status") == "filled":
+            _trade_publish("fill", {
+                "orderId": order.get("id"), "code": order.get("code"),
+                "side": order.get("side"), "qty": order.get("qty"),
+                "fillPrice": order.get("fillPrice"), "fee": order.get("fee"),
+                "amount": order.get("amount"), "ts": now_ms()})
+    res["account"] = _trade_account_event(cfg, market, ql)
+    try:
+        runner().logger.info("trade.executed", mode=cfg.get("mode"),
+                             filled=res.get("filled"), rejected=res.get("rejected"))
+    except Exception:  # noqa: BLE001
+        pass
+    res["ok"] = True
+    res["updated"] = now_ms()
+    return res
+
+
+def api_trade_cancel(body):
+    """撤单：只能撤 pending 委托"""
+    oid = str((body or {}).get("id") or "").strip()
+    if not oid:
+        raise RuntimeError("缺少 id")
+    order = core_trader.cancel_order(trade_store(), oid,
+                                     reason=str((body or {}).get("reason") or "用户撤单"))
+    if order is None:
+        raise RuntimeError("委托不存在：%s" % oid)
+    _trade_publish("order", dict(order, ts=now_ms()))
+    return {"ok": True, "order": order}
+
+
+def api_trade_close(body):
+    """手动平仓（不受 enabled 限制：这是用户的显式意图），按最新报价成交"""
+    body = body or {}
+    code = str(body.get("code") or "").strip().upper()
+    if not code:
+        raise RuntimeError("缺少 code")
+    st = trade_store()
+    cfg = core_trader.get_config(st)
+    market = str(body.get("market") or cfg.get("market") or "cn").lower()
+    market = "us" if market.startswith("us") else "cn"
+    ql = trade_quotes([code], market)
+    res = core_trader.close_position(st, dict(cfg, market=market), code, ql,
+                                     qty=body.get("qty"))
+    order = res.get("order") if isinstance(res, dict) else None
+    if order:
+        _trade_publish("order", dict(order, ts=now_ms()))
+        if order.get("status") == "filled":
+            _trade_publish("fill", {"orderId": order.get("id"), "code": code, "side": "sell",
+                                    "qty": order.get("qty"), "fillPrice": order.get("fillPrice"),
+                                    "fee": order.get("fee"), "amount": order.get("amount"),
+                                    "ts": now_ms()})
+    if isinstance(res, dict):
+        res["account"] = _trade_account_event(dict(cfg, market=market), market, ql)
+        res["ok"] = True
+    return res
+
+
+def api_trade_reset(body):
+    """重置模拟账户（不删除历史委托单：审计需要）"""
+    market = str((body or {}).get("market") or "").strip().lower() or None
+    st = trade_store()
+    cfg = core_trader.get_config(st)
+    if market:
+        cfg = dict(cfg, market="us" if market.startswith("us") else "cn")
+    view = core_trader.reset_account(st, cfg, cfg["market"])
+    _trade_publish("account", dict(core_trader.account_view(st, cfg), ts=now_ms()))
+    # 统一成 {ok, account, note}：前端按 account 字段取账户视图，
+    # 不要让它去猜「这一次返回的是账户对象本身还是包了一层」
+    if isinstance(view, dict) and isinstance(view.get("account"), dict):
+        account = view["account"]
+    else:
+        account = view if isinstance(view, dict) else {}
+    return {"ok": True, "account": account,
+            "note": "账户已重置；历史委托单保留（审计用），可用 /api/trade/orders 查询。"}
+
+
+def api_trade_ack(body):
+    """外部系统回执：把委托标记为已由外部系统接手"""
+    body = body or {}
+    oid = str(body.get("id") or "").strip()
+    if not oid:
+        raise RuntimeError("缺少 id")
+    order = core_trader.ack_order(trade_store(), oid,
+                                  ext_ref=str(body.get("extRef") or ""),
+                                  status=str(body.get("status") or "") or None)
+    if order is None:
+        raise RuntimeError("委托不存在：%s" % oid)
+    _trade_publish("order", dict(order, ts=now_ms()))
+    return {"ok": True, "order": order}
+
+
+# --------------------------------------------------------------------------- #
 # A股新数据（集合竞价 / 分笔 / 龙虎榜 / 涨停梯队）
 # --------------------------------------------------------------------------- #
 
@@ -1778,6 +2215,21 @@ def sanitize_json(obj):
     return obj
 
 
+def _log_api_error(method, path, exc):
+    """把接口异常写进结构化日志：/api/logs 能看到，否则只能靠猜。
+
+    这个洞是实测踩到的：一个 502 响应里只有一句中文提示，服务端日志一片安静，
+    排查时无法区分「参数错」「上游挂」「代码 bug」。现在连类型与堆栈末行一起记。
+    """
+    try:
+        import traceback
+        tail = traceback.format_exception_only(type(exc), exc)[-1].strip()
+        runner().logger.error("api.error", method=method, path=path,
+                              kind=type(exc).__name__, detail=str(exc)[:300], at=tail[:200])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AlphaDesk/1.0"
     protocol_version = "HTTP/1.1"
@@ -1785,6 +2237,94 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # noqa: A003
         if os.environ.get("AD_VERBOSE"):
             sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
+
+    # ----------------------------------------------------------- SSE 长连接 --
+    #: 心跳间隔（秒）：空闲超过这个时间就发一个注释帧，让代理与浏览器都知道连接还活着，
+    #: 也让服务端能及时发现「客户端已经走了」（写失败即断开）
+    SSE_HEARTBEAT = 10
+
+    def _sse_chunk(self, payload):
+        """按 HTTP/1.1 分块传输写一帧。
+
+        本项目 protocol_version 是 HTTP/1.1，而长连接响应没有 Content-Length，因此必须
+        自己分块，否则严格按 RFC 的客户端无法判断帧边界。每个 SSE 帧写成一个 chunk。
+        """
+        self.wfile.write(b"%x\r\n" % len(payload) + payload + b"\r\n")
+        self.wfile.flush()
+
+    def _sse_send(self, event, data, eid=None, retry=None):
+        lines = []
+        if retry:
+            lines.append("retry: %d" % int(retry))
+        if eid:
+            lines.append("id: %s" % eid)
+        lines.append("event: %s" % event)
+        # 严格 JSON：与 send_json 同一套清洗，绝不让 Infinity / NaN 漏进浏览器
+        body = json.dumps(sanitize_json(data if data is not None else {}),
+                          ensure_ascii=False, allow_nan=False, default=str)
+        payload = ("\n".join(lines) + "\ndata: " + body + "\n\n").encode("utf-8")
+        self._sse_chunk(payload)
+
+    def _sse_comment(self, text="ping"):
+        self._sse_chunk((": %s\n\n" % text).encode("utf-8"))
+
+    def sse_stream(self, kind, q):
+        """推送端点：首帧 ready → 补发重放 → 按订阅队列推送 → 空闲发心跳。
+
+        连接的生命周期与订阅一一对应：客户端断开（写失败）或队列被关闭时立刻退订，
+        不会留下「有人订阅但没人收」的僵尸通道把上游请求一直打下去。
+        """
+        params = core_stream.parse_params(kind, q)
+        # 参数不合格时**快速失败**（400 JSON）而不是开一条只会推 error 的长连接：
+        # 客户端能立刻知道自己少传了标的，审计脚本 / 桥接系统也不会被挂住的流卡死
+        if kind in (core_stream.KIND_QUOTES, core_stream.KIND_ADVISOR) and not params.get("symbols"):
+            return self.send_json({"error": True,
+                                   "message": "请提供 symbols（逗号分隔的代码列表，"
+                                              "支持 600519:贵州茅台 这种带名称写法）"}, status=400)
+        try:
+            hub = stream()
+            sub, replay = hub.subscribe(kind, params, self.headers.get("Last-Event-ID"))
+        except Exception as exc:  # noqa: BLE001  订阅失败按普通 JSON 错误返回，便于排查
+            return self.send_json({"error": True, "message": str(exc)}, status=400)
+
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            hub.unsubscribe(sub)
+            return
+        try:
+            self._sse_send("ready", sub.ready, retry=3000)
+            for item in replay:
+                self._sse_send(item["event"], item["data"], eid=item["id"])
+            while True:
+                item = sub.get(timeout=self.SSE_HEARTBEAT)
+                if item is None:
+                    if sub.closed:
+                        break
+                    self._sse_comment()
+                    continue
+                self._sse_send(item["event"], item["data"], eid=item["id"])
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                      # 客户端走了，属正常结束
+        except Exception as exc:  # noqa: BLE001  推送线程内的异常不能让服务端挂掉
+            try:
+                self._sse_send("error", {"message": "推送中断：%s" % str(exc)[:120]})
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            hub.unsubscribe(sub)
+            try:
+                self.wfile.write(b"0\r\n\r\n")     # 分块结束标记
+                self.wfile.flush()
+            except Exception:  # noqa: BLE001
+                pass
 
     def send_json(self, obj, status=200):
         # 严格 JSON：先清洗非有限浮点数，再以 allow_nan=False 序列化作为兜底断言，
@@ -1910,6 +2450,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_features_index())
             if path.startswith("/api/features/"):
                 return self.send_json(api_feature(path.rsplit("/", 1)[-1], q))
+            if path == "/api/stream/quotes":
+                return self.sse_stream(core_stream.KIND_QUOTES, q)
+            if path == "/api/stream/advisor":
+                return self.sse_stream(core_stream.KIND_ADVISOR, q)
+            if path == "/api/stream/trade":
+                return self.sse_stream(core_stream.KIND_TRADE, q)
+            if path == "/api/stream/status":
+                return self.send_json(api_stream_status())
+            if path == "/api/stream/test":
+                return self.send_json(api_stream_test(q))
+            if path == "/api/trade/config":
+                return self.send_json(api_trade_config_get())
+            if path == "/api/trade/account":
+                return self.send_json(api_trade_account(q))
+            if path == "/api/trade/orders":
+                return self.send_json(api_trade_orders(q))
+            if path == "/api/trade/export":
+                return self.send_json(api_trade_export(q))
             if path == "/api/advisor/history":
                 return self.send_json(api_advisor_history(q))
             if path == "/api/advisor/record":
@@ -1927,6 +2485,7 @@ class Handler(BaseHTTPRequestHandler):
             if os.environ.get("AD_VERBOSE"):
                 import traceback
                 traceback.print_exc()
+            _log_api_error("GET", path, exc)
             return self.send_json({"error": True, "message": str(exc)[:300]}, 502)
 
     def do_POST(self):  # noqa: N802
@@ -1939,6 +2498,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(length).decode("utf-8", errors="ignore"))
         except Exception:  # noqa: BLE001
             body = {}
+        # 确认口令可以走请求头（curl / 桥接系统更方便），也可以走 body.confirm。
+        # 放在线程局部里而不是层层传参：业务函数不必知道 HTTP 细节。
+        set_confirm_header(self.headers.get(core_trader.CONFIRM_HEADER))
         try:
             if path == "/api/strategy/create":
                 return self.send_json(api_strategy_create(body))
@@ -1958,12 +2520,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_advisor_note(body))
             if path == "/api/advisor/prune":
                 return self.send_json(api_advisor_prune(body))
+            if path == "/api/trade/config":
+                return self.send_json(api_trade_config_set(body))
+            if path == "/api/trade/plan":
+                return self.send_json(api_trade_plan(body))
+            if path == "/api/trade/execute":
+                return self.send_json(api_trade_execute(body))
+            if path == "/api/trade/cancel":
+                return self.send_json(api_trade_cancel(body))
+            if path == "/api/trade/close":
+                return self.send_json(api_trade_close(body))
+            if path == "/api/trade/reset":
+                return self.send_json(api_trade_reset(body))
+            if path == "/api/trade/ack":
+                return self.send_json(api_trade_ack(body))
             if path == "/api/notify":
                 return self.send_json(api_notify_update(body))
             if path == "/api/notify/test":
                 return self.send_json(api_notify_test(body))
             return self.send_json({"error": True, "message": "未知接口: %s" % path}, 404)
         except Exception as exc:  # noqa: BLE001
+            _log_api_error("POST", path, exc)
             return self.send_json({"error": True, "message": str(exc)[:300]}, 502)
 
 

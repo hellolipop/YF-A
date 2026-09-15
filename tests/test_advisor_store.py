@@ -83,8 +83,10 @@ from core.storage import MIGRATIONS, SCHEMA_VERSION, Store      # noqa: E402
 # --------------------------------------------------------------------------- #
 # 常量：把「被测代码的契约」集中在这里，避免散落在断言里
 # --------------------------------------------------------------------------- #
-#: 本文件锁定 v3 结构；若将来 schema 再升级，下面的迁移断言需要同步更新
-EXPECTED_SCHEMA_VERSION = 3
+#: 本文件锁定**当前** schema 版本，不写死数字。
+#: 这是实测踩过的坑：v4 加了自动交易四张表后，这里写死的 3 立刻让两个迁移用例变红，
+#: 而失败原因与被测的选股记录逻辑毫无关系 —— 断言应该跟着 SCHEMA_VERSION 走。
+EXPECTED_SCHEMA_VERSION = SCHEMA_VERSION
 #: 基准K线在合成序列中的下标（=> 保存日 = 该根的日期）
 BASE_INDEX = 10
 #: 基准K线之后的根数（25 > 20：让 fwd[20] 与 sinceReturn 各自可控、互不遮挡）
@@ -265,11 +267,13 @@ class StoreCase(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestAdvisorSchema(StoreCase):
 
-    def test_schema_version_is_3_with_advisor_tables(self):
-        """建库即 v3，且 advisor_runs / advisor_items 已在 counts() 里（v3 的核心交付）。"""
-        self.assertEqual(SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION,
-                         "本文件的迁移断言按 v3 书写，schema 升级后需同步更新")
-        self.assertEqual(self.store.schema_version(), 3)
+    def test_schema_version_matches_constant_with_advisor_tables(self):
+        """建库即最新版，且 advisor_runs / advisor_items 已在 counts() 里（v3 的核心交付）。
+
+        版本号一律对着 ``SCHEMA_VERSION`` 断言，**不写死数字**：本文件原本写死 3，
+        v4（自动交易四表）一落地这两个迁移用例立刻变红，而失败原因与选股记录毫无关系。
+        """
+        self.assertEqual(SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION)
         self.assertEqual(self.store.schema_version(), SCHEMA_VERSION)
 
         counts = self.store.counts()
@@ -285,17 +289,17 @@ class TestAdvisorSchema(StoreCase):
         # 级联删除依赖外键开关，删除语义是本模块的基础，必须真的是开的
         self.assertTrue(self.store.foreign_keys_enabled())
 
-        # MIGRATIONS 是结构升级的唯一入口：v3 那一步必须存在、版本号连续、描述与实现齐备，
+        # MIGRATIONS 是结构升级的唯一入口：版本号必须连续覆盖到最新，
+        # 且**引入 advisor 表的那一步**（v3）必须存在、描述与实现齐备，
         # 否则 init_schema(version=2) → migrate() 的演练会静默跳过新表
-        self.assertEqual([m["version"] for m in MIGRATIONS],
-                         list(range(1, EXPECTED_SCHEMA_VERSION + 1)))
-        step3 = MIGRATIONS[-1]
-        self.assertEqual(step3["version"], 3)
+        versions = [m["version"] for m in MIGRATIONS]
+        self.assertEqual(versions, list(range(1, EXPECTED_SCHEMA_VERSION + 1)))
+        step3 = [m for m in MIGRATIONS if m["version"] == 3][0]
         self.assertIn("advisor", step3["desc"])
         self.assertTrue(callable(step3["fn"]))
 
-    def test_v2_to_v3_migration_keeps_data_and_is_idempotent(self):
-        """v2 老库升到 v3：只补两张新表、老数据不动、重复调用是空操作。
+    def test_v2_migration_to_latest_keeps_data_and_is_idempotent(self):
+        """v2 老库直升级到最新版：补出新表、老数据不动、重复调用是空操作。
 
         为什么用 init_schema(version=2) 而不是手写 DDL：迁移演练要的正是「真实的历史
         结构」；手写 DDL 一旦与 MIGRATIONS 里的 v1/v2 定义漂移，测的就不是真东西了。
@@ -322,8 +326,9 @@ class TestAdvisorSchema(StoreCase):
         store.append_trade("run-legacy", {"side": "buy", "qty": 100})
 
         result = store.migrate()
-        self.assertEqual(result, {"from": 2, "to": 3, "applied": [3]})
-        self.assertEqual(store.schema_version(), 3)
+        self.assertEqual(result, {"from": 2, "to": SCHEMA_VERSION,
+                                  "applied": list(range(3, SCHEMA_VERSION + 1))})
+        self.assertEqual(store.schema_version(), SCHEMA_VERSION)
 
         # v3 两张表真的可用：能写能读（只判断「表存在」不够，列名/约束错了照样“存在”）
         rec = make_record([make_row("600519", action="buy")], ts=TS1)
@@ -338,9 +343,9 @@ class TestAdvisorSchema(StoreCase):
         self.assertEqual(store.get_run_column("run-legacy", "code"), "600519")
         self.assertEqual(len(store.list_trades("run-legacy")), 1)
 
-        # 幂等：已经是 v3，再迁移不应有步骤被应用，也不应丢数据
+        # 幂等：已经是最新版，再迁移不应有步骤被应用，也不应丢数据
         again = store.migrate()
-        self.assertEqual(again, {"from": 3, "to": 3, "applied": []})
+        self.assertEqual(again, {"from": SCHEMA_VERSION, "to": SCHEMA_VERSION, "applied": []})
         self.assertEqual(store.counts()["advisor_runs"], 1)
         self.assertEqual(store.get_run("run-legacy")["name"], "贵州茅台")
         self.assertIsNotNone(store.meta_get("schema_migrated_at"))

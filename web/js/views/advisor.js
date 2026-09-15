@@ -28,6 +28,14 @@
 
    约定：本视图只消费上述字段，任何字段缺失一律降级为「—」，绝不臆造数值；
         自动刷新默认 60 秒，且仅在「提交过标的」之后才开始轮询。
+
+   实时推送（web/js/stream.js）：
+     提交研判成功后建立两条订阅（默认开启，界面上有开关）：
+       · /api/stream/quotes  interval=3   → 就地刷新主表「现价 / 涨跌」与组合分配金额
+       · /api/stream/advisor interval=30  → snapshot / change / pulse 就地刷新研判结论
+     推送连不上或断了会自动降级为 15 秒轮询（轮询体里 save 恒为 false，不会刷爆历史记录）；
+     原有的 60 秒自动刷新保留为独立兜底。
+     查看历史记录（st.history 非空）时订阅一律关闭，退出历史视图后按开关状态重新订阅。
    ========================================================================== */
 (function () {
   'use strict';
@@ -40,6 +48,11 @@
   const MARKET_LABEL = window.AD.MARKET_LABEL || { cn: 'A股', us: '美股' };
 
   const AUTO_MS = 60000;              /* 自动刷新间隔 */
+  const PUSH_QUOTES_SEC = 3;          /* 行情推送 interval（秒） */
+  const PUSH_ADVISOR_SEC = 30;        /* 研判推送 interval（秒） */
+  const PUSH_FALLBACK_MS = 15000;     /* 推送降级为轮询后的间隔 */
+  const FLASH_MS = 2000;              /* 推送变更行的高亮时长 */
+  const PUSH_NOTE_MAX = 120;          /* 「最近变化」提示行最大展示字符数 */
   const MAX_SYMBOLS = 30;             /* 单次批量上限，避免一次性打爆服务端 */
   const SEP = /[\s,，、;；|]+/;         /* 逗号 / 空格 / 换行 / 分号分隔 */
   const FACTOR_MAX = 3;               /* 因子 chips 最多展示数量 */
@@ -228,8 +241,17 @@
       live: null,
       /* 复盘面板数据（null 表示未展开） */
       review: null,
+      /* 实时推送（SSE）：on=开关（默认开启）；quotes/advisor=订阅句柄；
+         states/sig 用于 chip 合成与「同一批标的 + 同一组参数」判定 */
+      push: {
+        on: true, quotes: null, advisor: null, sig: '',
+        states: { quotes: '', advisor: '' },
+        lastChange: null, lastPulse: null, lastQuoteAt: null,
+        lastError: '', errToasted: false,
+      },
     };
     let timer = null;
+    const flashTimers = [];        /* 推送行高亮的延时器，destroy 时统一清理 */
 
     const statHost = h('span', { class: 'hint', text: '待提交标的' });
     const formHint = h('span', { class: 'dim3', text: '已输入 0 个标的' });
@@ -246,6 +268,15 @@
     const histTableHost = h('div');
     /* 复盘回看区块 */
     const reviewHost = h('div');
+    /* 实时推送：状态 chip / 提示行（最近变化 / 上次检查 / 行情推送 / 异常） */
+    const pushChipHost = h('span');
+    const pushChangeHost = h('span', { class: 'dim3' });
+    const pushPulseHost = h('span', { class: 'dim3' });
+    const pushQuoteHost = h('span', { class: 'dim3' });
+    const pushErrHost = h('span', { class: 'dim3' });
+    const pushNoteHost = h('div', {
+      class: 'legend-inline', style: { lineHeight: '1.8', marginTop: '4px' },
+    }, [pushChangeHost, pushPulseHost, pushQuoteHost, pushErrHost]);
 
     /* ------------------------------------------------- 标的 / 参数表单 */
 
@@ -346,6 +377,22 @@
       },
     });
 
+    /* 实时推送开关：默认开启（提交研判成功后开始订阅） */
+    const pushToggle = h('button', {
+      class: 'btn ghost sm active', text: '实时推送',
+      title: '开启后：提交研判成功后自动订阅 /api/stream/quotes（推送行情）与 '
+        + '/api/stream/advisor（研判变化）；连接失败会自动降级为 15 秒轮询，不弹错、不影响页面。',
+      on: { click: (e) => togglePush(e.currentTarget) },
+    });
+
+    /* 生成交易计划：只生成计划，不在本页下单 */
+    const planBtn = h('button', {
+      class: 'btn ghost sm', text: '生成交易计划',
+      title: 'POST /api/trade/plan { market, symbols }：按当前输入的标的生成交易计划，到模拟交易页执行；'
+        + '接口未就绪时仅提示失败',
+      on: { click: () => genTradePlan() },
+    });
+
     function renderForm() {
       clear(formHost);
       formHost.appendChild(h('div', { class: 'run-form' }, [
@@ -360,6 +407,7 @@
                 class: 'btn ghost sm', text: '清空',
                 on: { click: () => { codeInput.value = ''; renderCodeHint(); } },
               }),
+              planBtn,
             ]),
           ]),
         ]),
@@ -368,6 +416,13 @@
         h('div', { class: 'field' }, [h('label', { text: '凯利折扣' }), kellySel]),
         numField('maxWeight', '单只权重上限', 0.25, '0.05', '小数或百分数：0.25 与 25 都表示 25%'),
         h('div', { class: 'field' }, [h('label', { text: '历史记录' }), saveToggle]),
+        h('div', { class: 'field wide' }, [
+          h('label', { text: '实时推送' }),
+          h('div', { style: { flex: '1 1 auto', minWidth: '0' } }, [
+            h('div', { class: 'legend-inline', style: { alignItems: 'center' } }, [pushToggle, pushChipHost]),
+            pushNoteHost,
+          ]),
+        ]),
       ]));
     }
 
@@ -426,53 +481,121 @@
       ctx.toast('已带入「' + name + '」到策略跟踪，选择策略即可创建跟踪任务', 'info');
     }
 
+    /* ---- 单列渲染 ----
+       抽成独立函数是为了让「实时推送就地更新」与「整表渲染」共用同一套口径：
+       推送只替换某一列，绝不能出现两套渲染逻辑导致同一列前后样式/文案不一致。 */
+
+    function nameCell(r) {
+      const nm = rowName(r);
+      const code = text(r.code);
+      /* 用户只输入代码时名称会回落到代码本身，此时不再重复显示一行代码 */
+      const same = String(nm) === String(code);
+      return h('span', {}, [
+        h('span', { class: 'name', text: nm }),
+        same ? null : h('span', { class: 'code', text: (rowMarket(r) === 'us' ? 'US:' : '') + code }),
+      ]);
+    }
+
+    function priceCell(r) {
+      return h('span', { class: 'num ' + F.dir(r.changePct) }, [
+        h('span', { text: F.price(r.price, rowMarket(r)) }),
+        h('span', { class: 'code', text: isNum(r.changePct) ? ' ' + F.pct(r.changePct) : ' —' }),
+      ]);
+    }
+
+    function actionCell(r) {
+      const a = String(r.action || '').toLowerCase();
+      const label = ACTION_LABEL[a] || text(r.actionText, '—');
+      /* 推送带来的原因摘要挂在 title 上，不占列宽 */
+      const reasons = Array.isArray(r.pushedReasons) ? r.pushedReasons.filter(Boolean) : [];
+      return h('span', {
+        class: ACTION_CLS[a] || 'chip',
+        title: reasons.length ? '推送变更：' + reasons.join('；') : text(r.actionText, label),
+        text: label,
+      });
+    }
+
+    function scoreCell(r) {
+      return h('span', {
+        class: 'num' + (isNum(r.score) ? '' : ' dim3'),
+        title: '综合评分（越高越积极）', text: F.num(r.score, 1),
+      });
+    }
+
+    function confidenceCell(r) {
+      const v = asPct(r.confidence);
+      return h('span', {
+        class: 'num' + (isNum(v) ? '' : ' dim3'),
+        title: '模型对该结论的置信度',
+        text: isNum(v) ? F.num(v, 0) + '%' : '—',
+      });
+    }
+
+    function forecastCell(r) {
+      const f = r.forecast || {};
+      if (!isNum(f.expectedReturn) && !isNum(f.upProb) && !isNum(f.bandLow) && !isNum(f.bandHigh)) return dash();
+      const mkt = rowMarket(r);
+      const up = asPct(f.upProb);
+      const lo = isNum(f.bandLow) ? F.price(f.bandLow, mkt) : '—';
+      const hi = isNum(f.bandHigh) ? F.price(f.bandHigh, mkt) : '—';
+      return h('span', {
+        class: 'num',
+        title: text(f.note, '预测窗口内的期望收益 / 上涨概率 / 价格区间'),
+      }, [
+        h('span', { class: isNum(f.expectedReturn) ? F.dir(f.expectedReturn) : 'flat', text: '期望 ' + F.pct(f.expectedReturn) }),
+        h('span', { class: 'dim3', text: ' · 概率 ' + (isNum(up) ? F.num(up, 0) + '%' : '—') }),
+        h('span', { class: 'dim3', text: ' · 区间 ' + lo + '~' + hi }),
+      ]);
+    }
+
+    function kellyCell(r) {
+      const k = r.kelly || {};
+      const w = asPct(k.weight);
+      if (!isNum(w) && !isNum(k.amount) && !isNum(k.shares)) return dash();
+      const mkt = rowMarket(r);
+      const tip = '凯利 f* ' + F.num(k.fStar, 3) + ' · 折扣系数 ' + F.num(k.fraction, 2) +
+        (k.note ? ' · ' + k.note : '');
+      return h('span', { class: 'num', title: tip }, [
+        h('span', { text: isNum(w) ? F.num(w, 1) + '%' : '—' }),
+        h('span', {
+          class: 'dim3',
+          text: ' · ' + (isNum(k.amount) ? F.amt(k.amount, mkt) : '—') +
+            (isNum(k.shares) ? ' / ' + F.num(k.shares, 0) + ' 股' : ''),
+        }),
+      ]);
+    }
+
+    function planCell(r) {
+      const p = r.plan || {};
+      if (!isNum(p.entry) && !isNum(p.stop) && !isNum(p.target1) && !isNum(p.target2)) return dash();
+      const mkt = rowMarket(r);
+      const bits = '入 ' + F.price(p.entry, mkt) + ' · 损 ' + F.price(p.stop, mkt) +
+        ' · 标 ' + F.price(p.target1, mkt) + ' / ' + F.price(p.target2, mkt) +
+        (isNum(p.riskReward) ? ' · 盈亏比 ' + F.num(p.riskReward, 2) : '');
+      return h('span', { class: 'num', title: '入场 / 止损 / 目标位由服务端模型给出，仅作计划参考', text: bits });
+    }
+
     function buildCols() {
       return [
         {
           key: 'name', label: '标的', cls: 'name', noSort: true,
-          render: (r) => {
-            const nm = rowName(r);
-            const code = text(r.code);
-            /* 用户只输入代码时名称会回落到代码本身，此时不再重复显示一行代码 */
-            const same = String(nm) === String(code);
-            return h('span', {}, [
-              h('span', { class: 'name', text: nm }),
-              same ? null : h('span', { class: 'code', text: (rowMarket(r) === 'us' ? 'US:' : '') + code }),
-            ]);
-          },
+          render: nameCell,
         },
         {
           key: 'price', label: '现价 / 涨跌', cls: 'n', value: (r) => r.changePct,
-          render: (r) => h('span', { class: 'num ' + F.dir(r.changePct) }, [
-            h('span', { text: F.price(r.price, rowMarket(r)) }),
-            h('span', { class: 'code', text: isNum(r.changePct) ? ' ' + F.pct(r.changePct) : ' —' }),
-          ]),
+          render: priceCell,
         },
         {
           key: 'action', label: '建议', width: '104px', noSort: true,
-          render: (r) => {
-            const a = String(r.action || '').toLowerCase();
-            const label = ACTION_LABEL[a] || text(r.actionText, '—');
-            return h('span', { class: ACTION_CLS[a] || 'chip', title: text(r.actionText, label), text: label });
-          },
+          render: actionCell,
         },
         {
           key: 'score', label: '评分', cls: 'n', value: (r) => r.score,
-          render: (r) => h('span', {
-            class: 'num' + (isNum(r.score) ? '' : ' dim3'),
-            title: '综合评分（越高越积极）', text: F.num(r.score, 1),
-          }),
+          render: scoreCell,
         },
         {
           key: 'confidence', label: '置信度', cls: 'n', value: (r) => asPct(r.confidence),
-          render: (r) => {
-            const v = asPct(r.confidence);
-            return h('span', {
-              class: 'num' + (isNum(v) ? '' : ' dim3'),
-              title: '模型对该结论的置信度',
-              text: isNum(v) ? F.num(v, 0) + '%' : '—',
-            });
-          },
+          render: confidenceCell,
         },
         {
           key: 'ensemble', label: '策略共识', noSort: true, width: '196px',
@@ -506,53 +629,15 @@
         },
         {
           key: 'forecast', label: '预测（窗口内）', noSort: true, width: '288px',
-          render: (r) => {
-            const f = r.forecast || {};
-            if (!isNum(f.expectedReturn) && !isNum(f.upProb) && !isNum(f.bandLow) && !isNum(f.bandHigh)) return dash();
-            const mkt = rowMarket(r);
-            const up = asPct(f.upProb);
-            const lo = isNum(f.bandLow) ? F.price(f.bandLow, mkt) : '—';
-            const hi = isNum(f.bandHigh) ? F.price(f.bandHigh, mkt) : '—';
-            return h('span', {
-              class: 'num',
-              title: text(f.note, '预测窗口内的期望收益 / 上涨概率 / 价格区间'),
-            }, [
-              h('span', { class: isNum(f.expectedReturn) ? F.dir(f.expectedReturn) : 'flat', text: '期望 ' + F.pct(f.expectedReturn) }),
-              h('span', { class: 'dim3', text: ' · 概率 ' + (isNum(up) ? F.num(up, 0) + '%' : '—') }),
-              h('span', { class: 'dim3', text: ' · 区间 ' + lo + '~' + hi }),
-            ]);
-          },
+          render: forecastCell,
         },
         {
           key: 'kelly', label: '凯利仓位', noSort: true, value: (r) => asPct((r.kelly || {}).weight), width: '196px',
-          render: (r) => {
-            const k = r.kelly || {};
-            const w = asPct(k.weight);
-            if (!isNum(w) && !isNum(k.amount) && !isNum(k.shares)) return dash();
-            const mkt = rowMarket(r);
-            const tip = '凯利 f* ' + F.num(k.fStar, 3) + ' · 折扣系数 ' + F.num(k.fraction, 2) +
-              (k.note ? ' · ' + k.note : '');
-            return h('span', { class: 'num', title: tip }, [
-              h('span', { text: isNum(w) ? F.num(w, 1) + '%' : '—' }),
-              h('span', {
-                class: 'dim3',
-                text: ' · ' + (isNum(k.amount) ? F.amt(k.amount, mkt) : '—') +
-                  (isNum(k.shares) ? ' / ' + F.num(k.shares, 0) + ' 股' : ''),
-              }),
-            ]);
-          },
+          render: kellyCell,
         },
         {
           key: 'plan', label: '交易计划', noSort: true, width: '252px',
-          render: (r) => {
-            const p = r.plan || {};
-            if (!isNum(p.entry) && !isNum(p.stop) && !isNum(p.target1) && !isNum(p.target2)) return dash();
-            const mkt = rowMarket(r);
-            const bits = '入 ' + F.price(p.entry, mkt) + ' · 损 ' + F.price(p.stop, mkt) +
-              ' · 标 ' + F.price(p.target1, mkt) + ' / ' + F.price(p.target2, mkt) +
-              (isNum(p.riskReward) ? ' · 盈亏比 ' + F.num(p.riskReward, 2) : '');
-            return h('span', { class: 'num', title: '入场 / 止损 / 目标位由服务端模型给出，仅作计划参考', text: bits });
-          },
+          render: planCell,
         },
         {
           key: 'signals', label: '关键因子', noSort: true, width: '246px',
@@ -815,6 +900,9 @@
           ctx.toast('已保存记录 #' + res.recordId, 'ok');
           loadHistory();
         }
+        /* 拿到结果：建立/续订实时推送（同标的同参数时保持既有连接；
+           历史视图下 startPush 会自行拒绝） */
+        if (st.push.on && st.rows.length) startPush(b);
       } catch (e) {
         if (st.destroyed) return;
         st.rows = [];
@@ -831,17 +919,9 @@
       }
     }
 
-    /* 提交：解析标的（代码直接识别，中文名走本地搜索接口）-> 组装 body -> 取数 */
-    async function submit() {
-      if (st.loading) return;
-      const raw = readCodes();
-      if (!raw.length) { ctx.toast('请先输入标的：代码或中文名，逗号 / 空格 / 换行分隔', 'warn'); return; }
-      let tokens = raw;
-      if (tokens.length > MAX_SYMBOLS) {
-        tokens = tokens.slice(0, MAX_SYMBOLS);
-        ctx.toast('单次最多分析 ' + MAX_SYMBOLS + ' 只，已截断为前 ' + MAX_SYMBOLS + ' 个', 'warn');
-      }
-
+    /* 标的解析：代码直接识别，中文名走本地搜索接口。
+       submit() 与「生成交易计划」共用，保证两处识别口径完全一致 */
+    async function resolveSymbols(tokens) {
       const list = [];
       const seen = {};
       const unknown = [];
@@ -868,6 +948,23 @@
         });
         nameTokens.slice(10).forEach((t) => unknown.push(t));
       }
+      return { list, unknown };
+    }
+
+    /* 提交：解析标的 -> 组装 body -> 取数 */
+    async function submit() {
+      if (st.loading) return;
+      const raw = readCodes();
+      if (!raw.length) { ctx.toast('请先输入标的：代码或中文名，逗号 / 空格 / 换行分隔', 'warn'); return; }
+      let tokens = raw;
+      if (tokens.length > MAX_SYMBOLS) {
+        tokens = tokens.slice(0, MAX_SYMBOLS);
+        ctx.toast('单次最多分析 ' + MAX_SYMBOLS + ' 只，已截断为前 ' + MAX_SYMBOLS + ' 个', 'warn');
+      }
+
+      const res = await resolveSymbols(tokens);
+      const list = res.list;
+      const unknown = res.unknown;
 
       if (unknown.length) ctx.toast('未识别的输入：' + unknown.join('、'), 'warn');
       if (!list.length) { ctx.toast('没有识别出有效标的，请检查代码格式', 'err'); return; }
@@ -900,6 +997,557 @@
         trigger: 'list',
       };
       await load(body, true);
+    }
+
+    /* 生成交易计划：把当前输入的标的交给 /api/trade/plan（模拟交易页负责执行）。
+       这里只生成计划，绝不下单；接口未就绪时只 toast，不改动页面其它状态。 */
+    async function genTradePlan() {
+      const raw = readCodes();
+      if (!raw.length) { ctx.toast('请先输入标的：代码或中文名，逗号 / 空格 / 换行分隔', 'warn'); return; }
+      if (planBtn.disabled) return;
+      if (typeof api.post !== 'function') { ctx.toast('生成交易计划失败：api.post 未接入', 'err'); return; }
+      planBtn.disabled = true;
+      try {
+        const tokens = raw.length > MAX_SYMBOLS ? raw.slice(0, MAX_SYMBOLS) : raw;
+        const rs = await resolveSymbols(tokens);
+        if (st.destroyed) return;
+        if (!rs.list.length) {
+          ctx.toast('没有识别出有效标的，无法生成交易计划', 'err');
+          return;
+        }
+        const res = await api.post('trade/plan', {
+          market: ctx.state.market,
+          symbols: rs.list.map((x) => x.code),
+        });
+        if (st.destroyed) return;
+        const n = planCount(res, rs.list.length);
+        ctx.toast('已生成 ' + n + ' 笔交易计划（模拟交易页可执行）', 'ok');
+      } catch (e) {
+        if (st.destroyed) return;
+        ctx.toast('生成交易计划失败：' + e.message, 'err');
+      } finally {
+        if (!st.destroyed) planBtn.disabled = false;
+      }
+    }
+
+    /* 计划条数：接口返回体字段未定，按常见字段兜底，取不到就用标的不数 */
+    function planCount(res, fallback) {
+      if (!res) return fallback;
+      if (isNum(res.count)) return res.count;
+      if (isNum(res.total)) return res.total;
+      const arr = res.plans || res.orders || res.rows || res.items;
+      if (Array.isArray(arr)) return arr.length;
+      return fallback;
+    }
+
+    /* ==================================================== 实时推送（SSE） */
+
+    /* 连接状态文案（与 stream.js 里的 chip 文案保持一致，这里只用于 title 说明） */
+    const STATE_TEXT = {
+      open: '已连接', connecting: '连接中', fallback: '已降级为轮询',
+      unsupported: '浏览器不支持推送', closed: '已关闭',
+    };
+    /* chip 合成优先级：任一路处于更差状态就按更差的显示 */
+    const STATE_RANK = ['unsupported', 'fallback', 'connecting', 'open'];
+    let pushChipState = null;      /* 当前 chip 显示的状态，避免推送每 3 秒重建节点 */
+
+    function tsText(ts) {
+      const s = window.AD.stream;
+      return s && typeof s.tsText === 'function' ? s.tsText(ts) : String(ts === undefined ? '—' : ts);
+    }
+
+    function pushTitle() {
+      const parts = [];
+      ['quotes', 'advisor'].forEach((k) => {
+        const stt = st.push.states[k];
+        if (stt) parts.push((k === 'quotes' ? '行情 ' : '研判 ') + (STATE_TEXT[stt] || stt));
+      });
+      return '数据来自 /api/stream/advisor（研判变化）与 /api/stream/quotes（推送行情）；'
+        + '无实质性变化时不重复推送（服务端只发 pulse 心跳）。'
+        + (parts.length ? ' 当前：' + parts.join(' · ') : '');
+    }
+
+    function combinedState() {
+      const list = [st.push.states.quotes, st.push.states.advisor].filter(Boolean);
+      if (!list.length) return null;
+      for (let i = 0; i < STATE_RANK.length; i++) {
+        if (list.indexOf(STATE_RANK[i]) >= 0) return STATE_RANK[i];
+      }
+      return list[0];
+    }
+
+    function paintPushChip(state, title) {
+      const s = window.AD.stream;
+      if (!state || !s || typeof s.chip !== 'function') {
+        clear(pushChipHost);
+        pushChipState = null;
+        return;
+      }
+      const t = title || pushTitle();
+      /* 状态没变就只刷新 title：行情推送每 3 秒都会走到这里，不该反复重建节点 */
+      if (pushChipState === state && pushChipHost.firstChild) {
+        pushChipHost.firstChild.title = t;
+        return;
+      }
+      pushChipState = state;
+      clear(pushChipHost);
+      pushChipHost.appendChild(s.chip(state, t));
+    }
+
+    function setNote(el, s) {
+      el.textContent = s || '';
+      el.style.display = s ? '' : 'none';
+    }
+
+    function renderPushNote() {
+      const lc = st.push.lastChange;
+      const lp = st.push.lastPulse;
+      if (!st.push.on) {
+        setNote(pushChangeHost, '实时推送已关闭：仍保留 60 秒自动刷新兜底，可点「刷新」立即更新。');
+        setNote(pushPulseHost, '');
+      } else if (st.history) {
+        setNote(pushChangeHost, '历史视图：已暂停实时推送与自动刷新，退出历史视图后自动恢复。');
+        setNote(pushPulseHost, '');
+      } else if (!st.push.quotes && !st.push.advisor) {
+        setNote(pushChangeHost, '提交一次「开始 AI 分析」后开始订阅实时推送（行情 3 秒 / 研判 30 秒）。');
+        setNote(pushPulseHost, '');
+      } else if (lc) {
+        const parts = lc.changes.map((c) => {
+          const nm = text(c.name, text(c.code));
+          const act = ACTION_LABEL[String(c.action || '').toLowerCase()] || text(c.actionText, '—');
+          const rs = (Array.isArray(c.reasons) ? c.reasons.filter(Boolean) : []).join('；');
+          return nm + ' ' + act + (rs ? '（' + rs + '）' : '');
+        });
+        const full = '最近变化 ' + tsText(lc.ts) + ' · ' + lc.n + ' 只：' + parts.join('；');
+        setNote(pushChangeHost, full.length > PUSH_NOTE_MAX ? full.slice(0, PUSH_NOTE_MAX) + '…' : full);
+        pushChangeHost.title = full;
+        setNote(pushPulseHost, lp
+          ? '上次检查 ' + tsText(lp.ts) + ' · 无变化（已检查 ' + text(lp.checked, '—') + ' 只）'
+          : '');
+      } else {
+        setNote(pushChangeHost, '已订阅实时推送：服务端仅在结论变化时推送，其余时间发 pulse 心跳。');
+        setNote(pushPulseHost, lp
+          ? '上次检查 ' + tsText(lp.ts) + ' · 无变化（已检查 ' + text(lp.checked, '—') + ' 只）'
+          : '');
+      }
+      if (st.push.lastQuoteAt && !st.history) {
+        setNote(pushQuoteHost, '行情推送 ' + tsText(st.push.lastQuoteAt));
+      } else {
+        setNote(pushQuoteHost, '');
+      }
+      if (st.push.lastError && st.push.on && !st.history) {
+        setNote(pushErrHost, '推送异常：' + st.push.lastError + '（已自动降级为轮询，不影响页面）');
+      } else {
+        setNote(pushErrHost, '');
+      }
+    }
+
+    /* ---- 行定位：按 code 匹配（表头排序会重排行，不能用行号） ---- */
+
+    function tableRowsIn(host) {
+      return Array.prototype.slice.call(host.querySelectorAll('table.tbl tbody tr'));
+    }
+
+    function trCode(tr) {
+      if (!tr || !tr.cells || !tr.cells.length) return '';
+      const cell = tr.cells[0];
+      const codeEl = cell.querySelector ? cell.querySelector('.code') : null;
+      const raw = codeEl ? codeEl.textContent : cell.textContent;
+      return String(raw === null || raw === undefined ? '' : raw).replace(/^US:/i, '').trim().toUpperCase();
+    }
+
+    function findTr(host, code) {
+      const want = String(code || '').toUpperCase();
+      if (!want) return null;
+      const rows = tableRowsIn(host);
+      for (let i = 0; i < rows.length; i++) {
+        if (trCode(rows[i]) === want) return rows[i];
+      }
+      return null;
+    }
+
+    function rowData(code) {
+      const want = String(code || '').toUpperCase();
+      return st.rows.find((r) => String((r && r.code) || '').toUpperCase() === want) || null;
+    }
+
+    /* 主表列序（与 buildCols 一一对应） */
+    const COL = {
+      name: 0, price: 1, action: 2, score: 3, confidence: 4, ensemble: 5,
+      edge: 6, forecast: 7, kelly: 8, plan: 9, signals: 10, risk: 11, act: 12,
+    };
+
+    /* 只替换单个单元格：整表重绘会打断用户的选择与滚动位置 */
+    function replaceCell(tr, idx, node) {
+      const td = tr && tr.cells ? tr.cells[idx] : null;
+      if (!td || !node) return false;
+      clear(td);
+      td.appendChild(node);
+      return true;
+    }
+
+    /* 现价 / 涨跌：结构一致时只改文本与涨跌色 class，不重建节点 */
+    function paintPriceCell(tr, r) {
+      const td = tr && tr.cells ? tr.cells[COL.price] : null;
+      if (!td) return false;
+      const span = td.firstElementChild;
+      const t1 = F.price(r.price, rowMarket(r));
+      const t2 = isNum(r.changePct) ? ' ' + F.pct(r.changePct) : ' —';
+      if (span && span.children && span.children.length === 2) {
+        span.className = 'num ' + F.dir(r.changePct);
+        span.children[0].textContent = t1;
+        span.children[1].textContent = t2;
+        return true;
+      }
+      return replaceCell(tr, COL.price, priceCell(r));
+    }
+
+    /* 短暂高亮：项目 CSS 里没有 .flash，用 inline 过渡做 1.2s 淡黄背景，
+       同时挂上 class 以便将来接入 CSS（不改 CSS 文件） */
+    function flashRow(tr) {
+      if (!tr) return;
+      tr.classList.add('flash');
+      tr.style.transition = 'background-color 1.2s ease';
+      tr.style.backgroundColor = 'rgba(245, 165, 36, .20)';
+      flashTimers.push(setTimeout(() => {
+        if (st.destroyed) return;
+        tr.style.backgroundColor = '';        /* 清掉 inline 值，恢复 CSS 的 hover 效果 */
+      }, 1200));
+      flashTimers.push(setTimeout(() => {
+        if (st.destroyed) return;
+        tr.classList.remove('flash');
+        tr.style.transition = '';
+      }, FLASH_MS));
+    }
+
+    /* ---- 组合分配区：按 code 就地更新「权重 / 金额 / 占比」与汇总指标 ---- */
+
+    function setNumCell(td, s) {
+      if (!td) return;
+      const sp = td.firstElementChild;
+      if (sp && typeof sp.className === 'string' && sp.className.indexOf('num') >= 0) {
+        if (sp.textContent !== s) {
+          sp.textContent = s;
+          sp.classList.toggle('dim3', s === '—');
+        }
+        return;
+      }
+      if (td.textContent !== s) td.textContent = s;
+    }
+
+    /* 汇总指标的顺序与 renderPortfolio 里的 metricList 一致：
+       纳入标的 / 总仓位 / 现金·未分配 / 资金合计 / 本金 / 单只上限 */
+    function syncAllocMetrics() {
+      const p = st.portfolio || {};
+      const rows = Array.isArray(p.rows) ? p.rows : [];
+      const cap = (st.lastBody && isNum(st.lastBody.capital)) ? st.lastBody.capital : null;
+      const mkt = (st.history && st.history.market) || ctx.state.market;
+      const ws = rows.map((r) => asPct(r.weight)).filter(isNum);
+      const sumW = isNum(p.totalWeight) ? asPct(p.totalWeight) : (ws.length ? ws.reduce((a, b) => a + b, 0) : null);
+      const amts = rows.map((r) => r.amount).filter(isNum);
+      const sumAmt = amts.length ? amts.reduce((a, b) => a + b, 0) : null;
+      const cash = isNum(p.cash) ? p.cash : (isNum(cap) && sumAmt !== null ? Math.max(0, cap - sumAmt) : null);
+      const vals = [
+        rows.length ? rows.length + ' 只' : null,
+        isNum(sumW) ? F.num(sumW, 1) + '%' : null,
+        isNum(cash) ? F.amt(cash, mkt) : null,
+        isNum(sumAmt) ? F.amt(sumAmt, mkt) : null,
+      ];
+      const cells = portfolioHost.querySelectorAll('.metric-list .metric .v');
+      vals.forEach((v, i) => {
+        if (v === null || !cells[i]) return;
+        if (cells[i].textContent !== v) cells[i].textContent = v;
+      });
+    }
+
+    /**
+     * 组合分配就地刷新。
+     * patchRows：推送带来的新分配明细（按 code 合并进 st.portfolio.rows）。
+     * 全部为 null 时只按现有权重重算金额，不臆造新数据。
+     */
+    function syncAllocAmounts(patchRows) {
+      if (st.destroyed || st.history || !st.submitted) return;
+      const p = st.portfolio || {};
+      const rows = Array.isArray(p.rows) ? p.rows : [];
+      if (!rows.length) return;
+      const cap = (st.lastBody && isNum(st.lastBody.capital)) ? st.lastBody.capital : null;
+
+      if (Array.isArray(patchRows) && patchRows.length) {
+        patchRows.forEach((nr) => {
+          if (!nr || !nr.code) return;
+          const hit = rows.find((x) => String((x && x.code) || '').toUpperCase() === String(nr.code).toUpperCase());
+          if (!hit) return;
+          if (isNum(nr.weight)) hit.weight = nr.weight;
+          if (isNum(nr.amount)) hit.amount = nr.amount;
+          if (nr.name && !hit.name) hit.name = nr.name;
+          /* 权重变了但推送没带金额：按「本金 × 权重」重算，否则金额列与权重列自相矛盾
+             （与「组合分配由服务端按权重折算」的口径一致，不是凭空造数） */
+          if (isNum(nr.weight) && !isNum(nr.amount) && isNum(cap)) {
+            hit.amount = cap * (asPct(nr.weight) || 0) / 100;
+          }
+        });
+      }
+
+      const trs = tableRowsIn(portfolioHost);
+      if (!trs.length) return;                 /* 分配明细表尚未渲染：交由整表渲染处理 */
+      const maxW = Math.max.apply(null, rows.map((r) => asPct(r.weight)).filter(isNum).concat([1]));
+      rows.forEach((r) => {
+        const code = String((r && r.code) || '').toUpperCase();
+        const tr = trs.find((x) => trCode(x) === code);
+        if (!tr) return;                       /* 找不到对应行就跳过 */
+        const w = asPct(r.weight);
+        const amt = isNum(r.amount) ? r.amount : (isNum(cap) && isNum(w) ? cap * w / 100 : null);
+        setNumCell(tr.cells[1], isNum(w) ? F.num(w, 1) + '%' : '—');
+        setNumCell(tr.cells[2], isNum(amt) ? F.amt(amt, r.market || ctx.state.market) : '—');
+        const bar = tr.cells[3] ? tr.cells[3].querySelector('.prog-bar > i') : null;
+        if (bar) bar.style.width = (isNum(w) ? Math.min(100, (w / maxW) * 100) : 0).toFixed(1) + '%';
+      });
+      syncAllocMetrics();
+    }
+
+    /* ---- 各类推送事件的处理 ---- */
+
+    function applyQuotes(payload) {
+      if (st.destroyed || st.history) return;
+      const rows = (payload && Array.isArray(payload.rows)) ? payload.rows : [];
+      rows.forEach((q) => {
+        if (!q || !q.code) return;
+        const r = rowData(q.code);
+        if (!r) return;                        /* 推送里出现本地没有的标的：跳过 */
+        if (isNum(q.price)) r.price = q.price;
+        if (isNum(q.changePct)) r.changePct = q.changePct;
+        if (isNum(q.change)) r.change = q.change;
+        if (q.updated) r.updated = q.updated;
+        if (q.source) r.source = q.source;
+        const tr = findTr(tableHost, q.code);
+        if (tr) paintPriceCell(tr, r);          /* 表格里没有这一行（历史/空态）就只更新数据 */
+      });
+      if (rows.length) {
+        st.push.lastQuoteAt = (payload && payload.ts) || Date.now();
+        syncAllocAmounts();
+        paintPushChip(combinedState());
+        renderPushNote();
+      }
+    }
+
+    function mergeChange(r, c) {
+      if (c.action) r.action = c.action;
+      if (c.actionText !== undefined) r.actionText = c.actionText;
+      if (isNum(c.score)) r.score = c.score;
+      if (isNum(c.confidence)) r.confidence = c.confidence;
+      if (isNum(c.price)) r.price = c.price;
+      if (isNum(c.changePct)) r.changePct = c.changePct;
+      /* 推送体的子对象只带部分字段（kelly 无 fStar/fraction/note，plan 无 riskReward，
+         forecast 无 bandLow/bandHigh）：逐字段合并，推送没给的继续沿用上一次已知值，
+         两次都没有的字段仍由渲染函数降级为「—」 */
+      if (c.kelly) r.kelly = Object.assign({}, r.kelly || {}, c.kelly);
+      if (c.plan) r.plan = Object.assign({}, r.plan || {}, c.plan);
+      if (c.forecast) r.forecast = Object.assign({}, r.forecast || {}, c.forecast);
+      if (c.prevAction) r.prevAction = c.prevAction;
+      if (Array.isArray(c.reasons) && c.reasons.length) r.pushedReasons = c.reasons.slice();
+    }
+
+    function applyChanges(payload) {
+      if (st.destroyed || st.history) return;   /* 历史视图：忽略推送回调 */
+      const list = Array.isArray(payload && payload.changes) ? payload.changes : [];
+      const applied = [];
+      list.forEach((c) => {
+        if (!c || !c.code) return;
+        const r = rowData(c.code);
+        const tr = findTr(tableHost, c.code);
+        if (!r || !tr) return;                  /* 找不到对应行就跳过 */
+        mergeChange(r, c);
+        replaceCell(tr, COL.action, actionCell(r));
+        replaceCell(tr, COL.score, scoreCell(r));
+        replaceCell(tr, COL.confidence, confidenceCell(r));
+        replaceCell(tr, COL.forecast, forecastCell(r));
+        replaceCell(tr, COL.kelly, kellyCell(r));
+        replaceCell(tr, COL.plan, planCell(r));
+        if (isNum(c.price) || isNum(c.changePct)) paintPriceCell(tr, r);
+        flashRow(tr);
+        applied.push(c);
+      });
+      if (!applied.length) return;
+      st.push.lastChange = {
+        ts: (payload && payload.ts) || Date.now(),
+        n: applied.length,
+        changes: applied,
+      };
+      const port = payload && payload.portfolio;
+      syncAllocAmounts(Array.isArray(port && port.rows) ? port.rows : null);
+      renderPushNote();
+    }
+
+    /* snapshot：整表快照。仅在本地没有结果时（例如刷新页面后）才拿来渲染，
+       否则会把用户刚提交的结果覆盖掉 */
+    function applySnapshot(payload) {
+      if (st.destroyed || st.history) return;
+      if (st.submitted && st.rows.length) return;
+      const res = payload && payload.result;
+      if (!res || res.ok === false) return;
+      const rows = Array.isArray(res.rows) ? res.rows : [];
+      if (!rows.length) return;
+      st.rows = rows;
+      st.portfolio = res.portfolio || null;
+      st.disclaimer = res.disclaimer || st.disclaimer;
+      st.submitted = true;
+      st.symbolMap = {};
+      rows.forEach((r) => {
+        if (r && r.code) {
+          st.symbolMap[String(r.code).toUpperCase()] = {
+            market: r.market || ctx.state.market, name: r.name || r.code,
+          };
+        }
+      });
+      renderDisclaimer();
+      renderTable();
+      renderPortfolio();
+      statHost.textContent = '服务端推送快照 · ' + rows.length + ' 只 · 更新 ' + tsText(payload.ts);
+    }
+
+    function applyPulse(payload) {
+      if (st.destroyed || st.history) return;
+      st.push.lastPulse = {
+        ts: (payload && payload.ts) || Date.now(),
+        checked: payload && payload.checked,
+      };
+      st.push.lastError = '';
+      renderPushNote();
+    }
+
+    function onPushStatus(channel, state) {
+      if (st.destroyed) return;
+      st.push.states[channel] = state;
+      if (state === 'open') st.push.lastError = '';
+      paintPushChip(combinedState());
+      renderPushNote();
+    }
+
+    function onPushError(info) {
+      if (st.destroyed) return;
+      const msg = (info && info.message) || '未知错误';
+      st.push.lastError = msg;
+      /* 最多弹一次：降级为轮询是预期行为，不能刷屏 */
+      if (!st.push.errToasted) {
+        st.push.errToasted = true;
+        ctx.toast('实时推送不可用，已自动降级为轮询：' + msg, 'warn');
+      }
+      renderPushNote();
+    }
+
+    /* ---- 订阅生命周期 ---- */
+
+    function pushSignature(body) {
+      return [body.market, (body.codes || []).join(','), body.horizon, body.capital,
+        body.kellyFraction, body.maxWeight].join('|');
+    }
+
+    function closePush() {
+      ['quotes', 'advisor'].forEach((k) => {
+        const hd = st.push[k];
+        if (hd && typeof hd.close === 'function') hd.close();
+        st.push[k] = null;
+      });
+      st.push.sig = '';
+      st.push.states = { quotes: '', advisor: '' };
+    }
+
+    function stopPush(why) {
+      closePush();
+      paintPushChip('closed', why || pushTitle());
+      renderPushNote();
+    }
+
+    function startPush(body) {
+      const s = window.AD.stream;
+      if (!s || typeof s.quotes !== 'function') return;
+      if (!st.push.on || st.destroyed) return;
+      if (st.history) return;                                      /* 历史视图：绝不订阅 */
+      if (!body || !Array.isArray(body.codes) || !body.codes.length) return;
+      const sig = pushSignature(body);
+      if (st.push.quotes && st.push.advisor && st.push.sig === sig) return;   /* 同标的同参数，保持现有连接 */
+      closePush();
+      st.push.sig = sig;
+      st.push.errToasted = false;
+      st.push.lastChange = null;
+      st.push.lastPulse = null;
+      const base = {
+        market: body.market,
+        symbols: body.codes,
+        fallbackMs: PUSH_FALLBACK_MS,
+        onError: onPushError,
+      };
+      st.push.quotes = s.quotes(Object.assign({}, base, {
+        interval: PUSH_QUOTES_SEC,
+        onReady: () => { /* ready 只表示订阅已受理，无需额外处理 */ },
+        onQuotes: applyQuotes,
+        onStatus: (state) => onPushStatus('quotes', state),
+        fallbackTick: quoteFallbackTick,
+      }));
+      st.push.advisor = s.advisor(Object.assign({}, base, {
+        interval: PUSH_ADVISOR_SEC,
+        horizon: body.horizon,
+        capital: body.capital,
+        kellyFraction: body.kellyFraction,
+        maxWeight: body.maxWeight,
+        onReady: () => { /* 同上 */ },
+        onSnapshot: applySnapshot,
+        onChange: applyChanges,
+        onPulse: applyPulse,
+        onStatus: (state) => onPushStatus('advisor', state),
+        fallbackTick: advisorFallbackTick,
+      }));
+      /* 构造订阅时 onStatus 可能已经同步给出了 unsupported / fallback，
+         这里按合成后的真实状态收尾，别用 connecting 把它盖掉 */
+      paintPushChip(combinedState() || 'connecting',
+        '已订阅 /api/stream/quotes（行情）与 /api/stream/advisor（研判变化），等待服务端 ready…'
+        + '无实质性变化时不重复推送（只发 pulse 心跳）。');
+      renderPushNote();
+    }
+
+    /* 降级轮询 1（quotes 通道）：只拉批量报价，不重算模型 */
+    let quotePollBusy = false;
+    function quoteFallbackTick() {
+      const b = st.lastBody;
+      if (st.destroyed || st.history || !b || !Array.isArray(b.codes) || !b.codes.length) return;
+      if (quotePollBusy) return;
+      quotePollBusy = true;
+      return Promise.resolve()
+        .then(() => api.quote(b.market, b.codes))
+        .then((res) => {
+          if (!st.destroyed) applyQuotes({ rows: (res && res.rows) || [], ts: Date.now() });
+        })
+        .catch(() => { /* 轮询失败静默：等下一轮，界面已有 chip 提示 */ })
+        .then(() => { quotePollBusy = false; });
+    }
+
+    /* 降级轮询 2（advisor 通道）：复用现有刷新路径 load()。
+       注意 load(body) 不带 asSubmit 时 save 恒为 false，降级不会把历史记录刷爆 */
+    function advisorFallbackTick() {
+      if (st.destroyed || st.history || !root.isConnected) return;
+      if (!st.auto) return;                  /* 用户显式关了自动刷新：不代替他轮询模型 */
+      if (!st.submitted || !st.lastBody || st.loading) return;
+      return load(st.lastBody);
+    }
+
+    function togglePush(btn) {
+      st.push.on = !st.push.on;
+      if (btn) btn.classList.toggle('active', st.push.on);
+      if (!st.push.on) {
+        closePush();
+        paintPushChip('closed', '实时推送已关闭：数据仅靠 60 秒自动刷新（可点「刷新」手动更新）。');
+        ctx.toast('已关闭实时推送（保留 60 秒自动刷新兜底）', 'info');
+      } else if (st.history) {
+        paintPushChip('closed', '历史视图下不订阅推送；退出历史视图后自动恢复。');
+        ctx.toast('历史视图下不启用推送，退出历史视图后自动订阅', 'warn');
+      } else if (st.submitted && st.lastBody) {
+        startPush(st.lastBody);
+        ctx.toast('已开启实时推送', 'ok');
+      } else {
+        paintPushChip(null);
+        ctx.toast('已开启实时推送：提交一次「开始 AI 分析」后开始订阅', 'info');
+      }
+      renderPushNote();
     }
 
     /* ================================================= 历史记录（持久化） */
@@ -1213,6 +1861,8 @@
           };
         }
         st.history = rec;
+        /* 历史视图：关闭推送订阅（即使有回调漏进来，applyXxx 也会因 st.history 非空直接返回） */
+        stopPush('历史视图：已暂停实时推送与自动刷新，退出历史视图后自动恢复。');
         st.rows = Array.isArray(rec.rows) ? rec.rows : [];
         st.portfolio = rec.portfolio || null;
         st.disclaimer = rec.disclaimer || st.disclaimer;
@@ -1270,6 +1920,13 @@
       renderTable();
       renderPortfolio();
       renderHistory();
+      /* 退出历史视图：按开关状态恢复推送订阅（有实时结果才订阅） */
+      if (st.push.on && st.submitted && st.lastBody) startPush(st.lastBody);
+      else {
+        paintPushChip(st.push.on ? null : 'closed',
+          st.push.on ? null : '实时推送已关闭：数据仅靠 60 秒自动刷新。');
+      }
+      renderPushNote();
       if (!silent) {
         ctx.toast(live && live.submitted ? '已退出历史视图，恢复最近一次实时结果' : '已退出历史视图（暂无实时结果）', 'info');
       }
@@ -1685,6 +2342,7 @@
     renderHistStats();
     renderHistory();
     renderReview();
+    renderPushNote();       /* 初始提示（此时尚未订阅） */
     loadHistory();          /* 进入视图时拉取一次；之后仅在手动刷新 / 保存成功后刷新 */
 
     /* 自动刷新：默认 60 秒，仅在提交过标的后轮询；历史视图下整体暂停 */
@@ -1704,7 +2362,9 @@
       },
       destroy() {
         st.destroyed = true;
+        closePush();                                    /* 关闭两路推送订阅，之后不再有任何回调 */
         if (timer) { clearInterval(timer); timer = null; }
+        flashTimers.splice(0).forEach((t) => clearTimeout(t));
       },
     };
   }

@@ -45,7 +45,7 @@ from contextlib import contextmanager
 # --------------------------------------------------------------------------- #
 
 #: 当前 schema 版本（每次改表结构都要 +1，并在 MIGRATIONS 里补一条升级步骤）
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: schema 版本在 meta 表中的键名
 META_SCHEMA_VERSION = "schema_version"
@@ -553,11 +553,102 @@ def _apply_v3(conn):
         conn.execute(stmt)
 
 
+#: v4：自动交易的配置、账户状态、委托单与权益曲线
+#:
+#: 四张表各司其职，取舍与前面几张表一致（可查询的字段独立成列、其余进 payload）：
+#: · trade_config：单账户配置（JSON blob）。配置项会持续增加，逐项建列的迁移成本
+#:   远高于收益，因此整体存 JSON，只有 id/updated_at 是列；
+#: · trade_state：账户状态（现金、成本参数、持仓 JSON）。持仓跟随账户整体读写，
+#:   不存在「只查某一笔持仓」的场景，因此不单独建表；
+#: · trade_orders：委托单。这是要审计、要过滤、要对接外部系统的数据，因此把
+#:   代码/方向/状态/意图/金额/成交时间等提升为独立列并建索引；
+#: · trade_equity：权益曲线（只追加，用于算收益与回撤）。
+_DDL_V4 = (
+    """
+    CREATE TABLE IF NOT EXISTS trade_config (
+        id         TEXT PRIMARY KEY,
+        payload    TEXT NOT NULL,
+        updated_at INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS trade_state (
+        account_id TEXT PRIMARY KEY,
+        market     TEXT,
+        mode       TEXT,
+        cash       REAL,
+        initial    REAL,
+        lot        INTEGER,
+        fee_rate   REAL,
+        slippage   REAL,
+        positions  TEXT,
+        updated_at INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS trade_orders (
+        id             TEXT PRIMARY KEY,
+        created_at     INTEGER,
+        updated_at     INTEGER,
+        market         TEXT,
+        code           TEXT,
+        name           TEXT,
+        side           TEXT,
+        intent         TEXT,
+        action         TEXT,
+        mode           TEXT,
+        status         TEXT,
+        source         TEXT,
+        reason         TEXT,
+        confidence     REAL,
+        score          REAL,
+        kelly_weight   REAL,
+        target_weight  REAL,
+        qty            INTEGER,
+        lot            INTEGER,
+        limit_price    REAL,
+        signal_price   REAL,
+        fill_price     REAL,
+        fee            REAL,
+        slippage       REAL,
+        amount         REAL,
+        filled_at      INTEGER,
+        review_id      TEXT,
+        ext_ref        TEXT,
+        error          TEXT,
+        payload        TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_trade_orders_created ON trade_orders (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_orders_status ON trade_orders (status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_orders_code ON trade_orders (market, code)",
+    """
+    CREATE TABLE IF NOT EXISTS trade_equity (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id   TEXT NOT NULL,
+        ts           INTEGER,
+        cash         REAL,
+        market_value REAL,
+        equity       REAL,
+        pnl          REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_trade_equity_acct ON trade_equity (account_id, ts DESC)",
+)
+
+
+def _apply_v4(conn):
+    """v4 结构：自动交易的配置 / 账户状态 / 委托单 / 权益曲线"""
+    for stmt in _DDL_V4:
+        conn.execute(stmt)
+
+
 #: 迁移步骤表：version 为目标版本，fn 接收连接（在事务里执行）
 MIGRATIONS = (
     {"version": 1, "desc": "初始结构：runs / trades / equity / signals / logs / meta", "fn": _apply_v1},
     {"version": 2, "desc": "trades 增加 fee / slippage 交易成本列", "fn": _apply_v2},
     {"version": 3, "desc": "AI 选股记录：advisor_runs / advisor_items", "fn": _apply_v3},
+    {"version": 4, "desc": "自动交易：trade_config / trade_state / trade_orders / trade_equity", "fn": _apply_v4},
 )
 
 #: 建表语句按版本索引：init_schema(version=N) 可直接建出历史版本结构（迁移演练 / 测试用）
@@ -1370,12 +1461,260 @@ class Store:
             "keep": self.ADVISOR_KEEP,
         }
 
+    # ------------------------------------ 自动交易（配置 / 账户 / 委托 / 权益） --
+    #: 配置与账户都用固定主键（本项目是单机单账户工具，不做多账户隔离）
+    TRADE_CONFIG_ID = "default"
+
+    def get_trade_config(self):
+        """读取交易配置；从未写过时返回空 dict（默认值的唯一来源是 core/trader.py）"""
+        row = self._conn().execute(
+            "SELECT payload FROM trade_config WHERE id = ?",
+            (self.TRADE_CONFIG_ID,)).fetchone()
+        data = _loads(row["payload"], {}) if row is not None else {}
+        return data if isinstance(data, dict) else {}
+
+    def save_trade_config(self, config):
+        """整体写入交易配置（合并与校验由 core/trader.py 负责，这里只存）"""
+        if not isinstance(config, dict):
+            raise ValueError("config 必须是 dict")
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO trade_config (id, payload, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET payload = excluded.payload,"
+                " updated_at = excluded.updated_at",
+                (self.TRADE_CONFIG_ID, _dumps(config), now_ms()))
+        return config
+
+    def get_trade_state(self, account_id):
+        """读取账户状态（现金 / 成本参数 / 持仓），不存在返回 None"""
+        row = self._conn().execute(
+            "SELECT * FROM trade_state WHERE account_id = ?", (_s(account_id),)).fetchone()
+        if row is None:
+            return None
+        positions = _loads(row["positions"], []) or []
+        return {
+            "accountId": row["account_id"],
+            "market": _s(row["market"]),
+            "mode": _s(row["mode"]),
+            "cash": _f(row["cash"], 0.0),
+            "initial": _f(row["initial"], 0.0),
+            "lot": _i(row["lot"], 100),
+            "feeRate": _f(row["fee_rate"], 0.0003),
+            "slippage": _f(row["slippage"], 0.001),
+            "positions": positions if isinstance(positions, list) else [],
+            "updatedAt": _i(row["updated_at"]),
+        }
+
+    def save_trade_state(self, state):
+        """写入账户状态（整体覆盖：现金与持仓是一个事务内的原子状态）"""
+        if not isinstance(state, dict):
+            raise ValueError("state 必须是 dict")
+        aid = _s(state.get("accountId"))
+        if not aid:
+            raise ValueError("账户状态缺少 accountId")
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO trade_state (account_id, market, mode, cash, initial, lot,"
+                " fee_rate, slippage, positions, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(account_id) DO UPDATE SET"
+                "   market = excluded.market, mode = excluded.mode, cash = excluded.cash,"
+                "   initial = excluded.initial, lot = excluded.lot,"
+                "   fee_rate = excluded.fee_rate, slippage = excluded.slippage,"
+                "   positions = excluded.positions, updated_at = excluded.updated_at",
+                (aid, _s(state.get("market")), _s(state.get("mode")),
+                 _f(state.get("cash"), 0.0), _f(state.get("initial"), 0.0),
+                 _i(state.get("lot"), 100), _f(state.get("feeRate"), 0.0003),
+                 _f(state.get("slippage"), 0.001), _dumps(state.get("positions") or []),
+                 now_ms()))
+        return self.get_trade_state(aid)
+
+    #: trade_orders 的列顺序，Insert 与 Update 共用，避免两处字段列表漂移
+    _TRADE_ORDER_COLS = (
+        "id", "created_at", "updated_at", "market", "code", "name", "side", "intent",
+        "action", "mode", "status", "source", "reason", "confidence", "score",
+        "kelly_weight", "target_weight", "qty", "lot", "limit_price", "signal_price",
+        "fill_price", "fee", "slippage", "amount", "filled_at", "review_id", "ext_ref",
+        "error", "payload",
+    )
+
+    @classmethod
+    def _trade_order_row(cls, order):
+        """委托单 dict（camelCase）→ 数据库行（snake_case）"""
+        return (
+            _s(order.get("id")), _i(order.get("createdAt")) or now_ms(),
+            _i(order.get("updatedAt")) or now_ms(),
+            _s(order.get("market")), _s(order.get("code")), _s(order.get("name")),
+            _s(order.get("side")), _s(order.get("intent")), _s(order.get("action")),
+            _s(order.get("mode")), _s(order.get("status")), _s(order.get("source")),
+            _s(order.get("reason")), _f(order.get("confidence")), _f(order.get("score")),
+            _f(order.get("kellyWeight")), _f(order.get("targetWeight")),
+            _i(order.get("qty")), _i(order.get("lot")),
+            _f(order.get("limitPrice")), _f(order.get("signalPrice")),
+            _f(order.get("fillPrice")), _f(order.get("fee")), _f(order.get("slippage")),
+            _f(order.get("amount")), _i(order.get("filledAt")),
+            _s(order.get("reviewId")), _s(order.get("extRef")), _s(order.get("error")),
+            _dumps(order.get("payload") or {}),
+        )
+
+    @staticmethod
+    def _trade_order_view(row):
+        """数据库行 → 委托单视图（外部系统消费的稳定字段名）"""
+        payload = _loads(row["payload"], {}) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "id": row["id"], "createdAt": _i(row["created_at"]),
+            "updatedAt": _i(row["updated_at"]), "market": _s(row["market"]),
+            "code": _s(row["code"]), "name": _s(row["name"]), "side": _s(row["side"]),
+            "intent": _s(row["intent"]), "action": _s(row["action"]),
+            "mode": _s(row["mode"]), "status": _s(row["status"]),
+            "source": _s(row["source"]), "reason": _s(row["reason"]),
+            "confidence": _f(row["confidence"]), "score": _f(row["score"]),
+            "kellyWeight": _f(row["kelly_weight"]),
+            "targetWeight": _f(row["target_weight"]),
+            "qty": _i(row["qty"]), "lot": _i(row["lot"]),
+            "limitPrice": _f(row["limit_price"]), "signalPrice": _f(row["signal_price"]),
+            "fillPrice": _f(row["fill_price"]), "fee": _f(row["fee"]),
+            "slippage": _f(row["slippage"]), "amount": _f(row["amount"]),
+            "filledAt": _i(row["filled_at"]), "reviewId": _s(row["review_id"]),
+            "extRef": _s(row["ext_ref"]), "error": _s(row["error"]),
+            "payload": payload,
+        }
+
+    def save_trade_order(self, order):
+        """写入一条委托单（同 id 覆盖，用于状态流转）；返回 id"""
+        oid = _s((order or {}).get("id"))
+        if not oid:
+            raise ValueError("委托单缺少 id")
+        cols = ", ".join(self._TRADE_ORDER_COLS)
+        marks = ", ".join(["?"] * len(self._TRADE_ORDER_COLS))
+        updates = ", ".join("%s = excluded.%s" % (c, c)
+                            for c in self._TRADE_ORDER_COLS if c != "id")
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO trade_orders (%s) VALUES (%s)"
+                " ON CONFLICT(id) DO UPDATE SET %s" % (cols, marks, updates),
+                self._trade_order_row(order))
+        return oid
+
+    def get_trade_order(self, oid):
+        row = self._conn().execute(
+            "SELECT * FROM trade_orders WHERE id = ?", (_s(oid),)).fetchone()
+        return self._trade_order_view(row) if row is not None else None
+
+    def update_trade_order(self, oid, patch):
+        """只更新传入的字段（camelCase 键），返回更新后的委托单；不存在返回 None"""
+        if not isinstance(patch, dict) or not patch:
+            return self.get_trade_order(oid)
+        col_of = {"createdAt": "created_at", "updatedAt": "updated_at",
+                  "kellyWeight": "kelly_weight", "targetWeight": "target_weight",
+                  "limitPrice": "limit_price", "signalPrice": "signal_price",
+                  "fillPrice": "fill_price", "filledAt": "filled_at",
+                  "reviewId": "review_id", "extRef": "ext_ref"}
+        sets, params = [], []
+        for key, value in patch.items():
+            col = col_of.get(key, key)
+            if col not in self._TRADE_ORDER_COLS:
+                continue
+            sets.append("%s = ?" % col)
+            if col == "payload":
+                params.append(_dumps(value or {}))
+            elif col in ("qty", "lot", "filled_at", "created_at", "updated_at"):
+                params.append(_i(value))
+            elif col in ("confidence", "score", "kelly_weight", "target_weight",
+                         "limit_price", "signal_price", "fill_price", "fee",
+                         "slippage", "amount"):
+                params.append(_f(value))
+            else:
+                params.append(_s(value))
+        if "updated_at" not in [s.split(" = ")[0] for s in sets]:
+            sets.append("updated_at = ?")
+            params.append(now_ms())
+        with self._tx() as conn:
+            cur = conn.execute("UPDATE trade_orders SET %s WHERE id = ?" % ", ".join(sets),
+                               params + [_s(oid)])
+            if cur.rowcount <= 0:
+                return None
+        return self.get_trade_order(oid)
+
+    def list_trade_orders(self, status=None, market=None, code=None, side=None,
+                          since=None, limit=100, offset=0):
+        """委托单列表（时间倒序）。status 支持逗号分隔的多个状态。"""
+        where, params = [], []
+        if status:
+            items = [s.strip() for s in str(status).split(",") if s.strip()]
+            if items:
+                where.append("status IN (%s)" % ", ".join(["?"] * len(items)))
+                params.extend(items)
+        if market:
+            where.append("market = ?")
+            params.append(str(market))
+        if code:
+            where.append("code = ?")
+            params.append(str(code).upper())
+        if side:
+            where.append("side = ?")
+            params.append(str(side))
+        if since:
+            where.append("COALESCE(created_at, 0) > ?")
+            params.append(_i(since) or 0)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        conn = self._conn()
+        total = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM trade_orders" + clause, params).fetchone()["n"])
+        rows = conn.execute(
+            "SELECT * FROM trade_orders" + clause +
+            " ORDER BY COALESCE(created_at, 0) DESC, id DESC LIMIT ? OFFSET ?",
+            params + [max(1, int(limit or 100)), max(0, int(offset or 0))]).fetchall()
+        return {"rows": [self._trade_order_view(r) for r in rows], "total": total,
+                "limit": int(limit or 100), "offset": max(0, int(offset or 0))}
+
+    def count_trade_orders_today(self, market=None, ts=None):
+        """当日（本地自然日）委托数，用于每日下单上限风控"""
+        stamp = _i(ts) or now_ms()
+        day = time.strftime("%Y-%m-%d", time.localtime(stamp / 1000.0))
+        start = int(time.mktime(time.strptime(day + " 00:00:00", "%Y-%m-%d %H:%M:%S")) * 1000)
+        sql = "SELECT COUNT(*) AS n FROM trade_orders WHERE COALESCE(created_at, 0) >= ?"
+        params = [start]
+        if market:
+            sql += " AND market = ?"
+            params.append(str(market))
+        return int(self._conn().execute(sql, params).fetchone()["n"])
+
+    def append_trade_equity(self, row):
+        """追加一个权益点（只追加，不更新）"""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO trade_equity (account_id, ts, cash, market_value, equity, pnl)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (_s(row.get("accountId")), _i(row.get("ts")) or now_ms(),
+                 _f(row.get("cash"), 0.0), _f(row.get("marketValue"), 0.0),
+                 _f(row.get("equity"), 0.0), _f(row.get("pnl"), 0.0)))
+
+    def list_trade_equity(self, account_id, limit=500):
+        rows = self._conn().execute(
+            "SELECT * FROM trade_equity WHERE account_id = ? ORDER BY ts ASC LIMIT ?",
+            (_s(account_id), max(1, int(limit or 500)))).fetchall()
+        return [{"ts": _i(r["ts"]), "cash": _f(r["cash"]), "marketValue": _f(r["market_value"]),
+                 "equity": _f(r["equity"]), "pnl": _f(r["pnl"])} for r in rows]
+
+    def trade_counts(self):
+        """交易相关表行数 + 当日委托数（自检 / 前端概览用）"""
+        conn = self._conn()
+        out = {}
+        for table in ("trade_config", "trade_state", "trade_orders", "trade_equity"):
+            out[table] = int(conn.execute("SELECT COUNT(*) AS n FROM %s" % table).fetchone()["n"])
+        out["ordersToday"] = self.count_trade_orders_today()
+        return out
+
     # ------------------------------------------------- 计数辅助 --
     def counts(self):
         """各表行数（自检 / 测试用）"""
         out = {}
         for table in ("runs", "trades", "equity", "signals", "logs", "meta",
-                      "advisor_runs", "advisor_items"):
+                      "advisor_runs", "advisor_items",
+                      "trade_config", "trade_state", "trade_orders", "trade_equity"):
             row = self._conn().execute("SELECT COUNT(*) AS n FROM %s" % table).fetchone()
             out[table] = int(row["n"])
         return out

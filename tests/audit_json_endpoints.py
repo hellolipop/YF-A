@@ -102,6 +102,19 @@ except Exception as exc:  # noqa: BLE001
 
 hit("/api/notify", {"webhook": "", "events": ["on_fill", "on_exit", "on_skip", "on_error"]})
 
+print("=== 实时推送与自动交易（含权限门与 SSE 端点）===")
+hit("/api/stream/status")
+hit("/api/stream/test?kind=quotes&symbols=600519")
+hit("/api/stream/quotes?symbols=")                      # 缺标的：SSE 端点的错误分支也必须是严格 JSON
+hit("/api/trade/config")
+hit("/api/trade/account")
+hit("/api/trade/orders?limit=5")
+hit("/api/trade/export")
+hit("/api/trade/config", {"patch": {"enabled": False, "mode": "dryrun"}})   # 回到安全默认
+hit("/api/trade/execute", {"market": "cn"})             # 无口令：必须被拒且是严格 JSON
+hit("/api/trade/cancel", {})                            # 缺 id：错误分支
+hit("/api/trade/ack", {"id": "__MISSING__"})            # 不存在的委托
+
 print("\n已校验接口 %d 个" % len(checked))
 if bad:
     print("发现非严格 JSON 响应 %d 个：" % len(bad))
