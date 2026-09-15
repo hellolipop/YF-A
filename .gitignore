@@ -1,0 +1,20 @@
+# 运行时数据（本地行情缓存 + 策略跟踪状态，可自动重建，不入库）
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# 编辑器 / 工具
+.vscode/
+.idea/
+*.swp
+
+# 日志
+*.log
