@@ -8,6 +8,7 @@
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
+  const isNum = window.AD.isNum;
 
   const PERIODS = [
     { value: 'trend', label: '分时' }, { value: '5m', label: '5分' }, { value: '15m', label: '15分' },
@@ -15,6 +16,60 @@
     { value: 'day', label: '日K' }, { value: 'week', label: '周K' }, { value: 'month', label: '月K' },
   ];
   const SUBS = [{ value: 'MACD', label: 'MACD' }, { value: 'KDJ', label: 'KDJ' }, { value: 'RSI', label: 'RSI' }, { value: '', label: '关闭' }];
+
+  /* ------------------------------------------------------------------
+     AI 研判（个股接入）
+     接口：POST /api/advisor/recommend（api.advisorRecommend）
+     约定：字段缺失一律降级为「—」，绝不臆造数值；接口失败只提示，不影响原有功能
+     ------------------------------------------------------------------ */
+
+  /* 建议档位：文案与 chip 配色，只复用项目已有 chip 变体 */
+  const AD_ACTION_LABEL = {
+    buy: '买入', add: '增持', hold: '持有', reduce: '减仓', sell: '卖出', watch: '观望', avoid: '回避',
+  };
+  const AD_ACTION_CLS = {
+    buy: 'chip up', add: 'chip up', hold: 'chip', reduce: 'chip warn',
+    sell: 'chip down', watch: 'chip accent', avoid: 'chip warn',
+  };
+  /* 因子方向 -> 涨跌色（兼容服务端多种写法） */
+  const AD_DIR_CLS = {
+    up: 'up', bull: 'up', bullish: 'up', long: 'up', buy: 'up', pos: 'up', positive: 'up',
+    down: 'down', bear: 'down', bearish: 'down', short: 'down', sell: 'down', neg: 'down', negative: 'down',
+  };
+  const AD_PARAM_DEFAULT = { horizon: 20, capital: 100000, kellyFraction: 0.5, maxWeight: 0.25 };
+  const AD_FACTOR_MAX = 5;
+  const AD_AUTO_DELAY = 300;          /* 日线就绪后延迟一小段再自动研判，避开首屏渲染 */
+  const AD_DISCLAIMER = '本区结论由服务端统计模型基于公开行情数据自动计算，仅用于技术研究与学习，不构成任何投资建议；' +
+    '模型存在失效风险，历史统计不代表未来表现。';
+
+  function adText(v, d) {
+    if (v === null || v === undefined || v === '') return d === undefined ? '—' : d;
+    return String(v);
+  }
+  /* 百分比口径兼容：0.25 与 25 都按 25% 展示（服务端口径未定时不做臆造） */
+  function adPct(v) {
+    if (!isNum(v)) return null;
+    return Math.abs(v) <= 1.5 ? v * 100 : v;
+  }
+  /* 服务端有一部分字段**本身就是百分数**（risk.atrPct = 1.494 表示 1.494%），
+     绝不能走 adPct 的「0.25 → 25%」归一：阈值 1.5 会把 1.494% 当成小数再放大 100 倍，
+     实测详情页因此显示过「ATR% 149.40%」。这类字段一律用 rawPctText 原样格式化。
+     适用：risk.atrPct / risk.vol（risk.maxDrawdown、forecast.expectedReturn 同理，
+     它们各自已经在用 F.num / F.pct 原样输出）。 */
+  function rawPctText(v, d) {
+    return isNum(v) ? F.num(v, d === undefined ? 2 : d) + '%' : '—';
+  }
+  function adDirCls(d) { return AD_DIR_CLS[String(d || '').toLowerCase()] || ''; }
+    /* 服务端 updated 为时间戳 / 时间串时按其展示，缺失时退回本地时间 */
+    function adUpdatedText(v) {
+      if (isNum(v)) return F.clock(v);
+      if (typeof v === 'string' && v) return v.indexOf(':') >= 0 ? F.hhmmss(v) : v;
+      return F.clock(Date.now());
+    }
+  function adActionKey(r) { return String((r && r.action) || '').toLowerCase(); }
+  function adActionText(r) {
+    return AD_ACTION_LABEL[adActionKey(r)] || adText(r && r.actionText, '—');
+  }
 
   function scoreRing(score) {
     const r = 38, c = 2 * Math.PI * r;
@@ -67,10 +122,15 @@
     const st = {
       period: 'trend', fq: 1, showMA: true, showBOLL: false, sub: 'MACD',
       quote: null, kline: null, trends: null, orderbook: null, fundflow: null, analysis: null,
+      /* AI 研判：row 为服务端逐只结果，advisorChart 为 K 线叠加层数据 */
+      advisorRow: null, advisorChart: null, advisorOn: true, advisorLoaded: false,
+      advisorLoading: false, advisorParams: null, advisorDisclaimer: '', advisorUpdated: null,
+      destroyed: false,
     };
     let chart = null;
     let flowChart = null;
     let timer = null;
+    let advisorTimer = null;
 
     const headHost = h('div');
     const legendHost = h('div', { class: 'chart-legend' });
@@ -81,6 +141,10 @@
     const signalHost = h('div');
     const indHost = h('div', { class: 'metric-list' });
     const metaHost = h('span', { class: 'hint' });
+    const advisorBody = h('div');
+    const advisorParamHost = h('div');
+    const advisorHint = h('span', { class: 'dim3', text: '待研判' });
+    const advFields = {};
 
     /* ---------------------------------------------------------- 头部 */
 
@@ -262,6 +326,7 @@
             },
           });
           chart.setData(res.bars, {});
+          applyAdvisorToChart(res.bars);
           metaHost.textContent = res.bars.length + ' 根K线 · ' + (res.source || '') + ' · 复权方式 ' +
             (['不复权', '前复权', '后复权'][st.fq] || '—');
           if (st.period !== 'day') loadSignals();
@@ -331,6 +396,375 @@
           ]),
         ]),
       ]), signalHost.firstChild);
+      /* 日线数据就绪 -> 自动研判一次（仅一次，不轮询） */
+      ensureAdvisor();
+    }
+
+    /* ------------------------------------------------------- AI 研判 */
+
+    /* api.advisorRecommend 未接入时兜底直接 POST /api/advisor/recommend */
+    function recommend(body) {
+      if (typeof api.advisorRecommend === 'function') return api.advisorRecommend(body);
+      if (typeof api.post === 'function') return api.post('advisor/recommend', body);
+      return Promise.reject(new Error('api.advisorRecommend 未接入'));
+    }
+
+    /* 参数以输入框为唯一真源（点击按钮不一定触发 blur） */
+    function readAdvisorParams() {
+      const pick = (el, def, positive) => {
+        const v = el ? Number(String(el.value).trim()) : NaN;
+        if (!isFinite(v)) return def;
+        if (positive && v <= 0) return def;
+        return v;
+      };
+      let maxWeight = pick(advFields.maxWeight, AD_PARAM_DEFAULT.maxWeight, true);
+      if (maxWeight > 1.5) maxWeight = maxWeight / 100;      /* 允许直接填 25 表示 25% */
+      return {
+        horizon: Math.max(1, Math.round(pick(advFields.horizon, AD_PARAM_DEFAULT.horizon, true))),
+        capital: pick(advFields.capital, AD_PARAM_DEFAULT.capital, true),
+        kellyFraction: pick(advFields.kellyFraction, AD_PARAM_DEFAULT.kellyFraction, true),
+        maxWeight: Math.min(1, Math.max(0.01, maxWeight)),
+      };
+    }
+
+    function advNumField(key, label, value, step, title) {
+      const inp = h('input', {
+        class: 'inp num', type: 'number', value: String(value), step: step || 'any', title: title || '',
+        on: { keydown: (e) => { if (e.key === 'Enter') loadAdvisor(true); } },
+      });
+      advFields[key] = inp;
+      return h('div', { class: 'field' }, [h('label', { text: label }), inp]);
+    }
+
+    const advKellySel = h('select', { class: 'inp', title: '对凯利公式算出的 f* 打折，越小越保守' }, [
+      h('option', { value: '0.25', text: '¼ 凯利（保守）' }),
+      h('option', { value: '0.5', text: '半凯利（默认）' }),
+      h('option', { value: '0.75', text: '¾ 凯利' }),
+      h('option', { value: '1', text: '全凯利（激进）' }),
+    ]);
+    advKellySel.value = String(AD_PARAM_DEFAULT.kellyFraction);
+    advFields.kellyFraction = advKellySel;
+
+    const advisorBtn = h('button', {
+      class: 'btn sm', text: '重新研判',
+      title: '按当前参数重新请求 AI 研判',
+      on: { click: () => loadAdvisor(true) },
+    });
+
+    const advisorToggle = h('button', {
+      class: 'btn ghost sm active', text: '在K线上显示AI建议',
+      title: '在日K上叠加 AI 建议的买卖标记、交易计划线与预测带',
+      on: {
+        click: (e) => {
+          st.advisorOn = !st.advisorOn;
+          e.currentTarget.classList.toggle('active', st.advisorOn);
+          applyAdvisorToChart();
+        },
+      },
+    });
+
+    function renderAdvisorForm() {
+      clear(advisorParamHost);
+      advisorParamHost.appendChild(h('div', { class: 'run-form' }, [
+        advNumField('horizon', '预测窗口（交易日）', AD_PARAM_DEFAULT.horizon, '1', '模型对未来多少个交易日做预测，默认 20'),
+        advNumField('capital', '本金', AD_PARAM_DEFAULT.capital, 'any', '用于折算凯利仓位金额与股数，默认 100000'),
+        h('div', { class: 'field' }, [h('label', { text: '凯利折扣' }), advKellySel]),
+        advNumField('maxWeight', '单只权重上限', AD_PARAM_DEFAULT.maxWeight, '0.05', '小数或百分数：0.25 与 25 都表示 25%'),
+      ]));
+    }
+
+    /* 指标卡：复用 .metric-list / .metric / .k / .v */
+    function advMetrics(items) {
+      const wrap = h('div', { class: 'metric-list' });
+      items.forEach((it) => {
+        const cell = h('div', { class: 'metric', title: it[3] || '' }, [h('div', { class: 'k', text: it[0] })]);
+        const box = h('div', { class: 'v' + (it[2] ? ' ' + it[2] : '') });
+        const v = it[1];
+        if (v instanceof Node) box.appendChild(v);
+        else box.textContent = v === null || v === undefined || v === '' ? '—' : String(v);
+        cell.appendChild(box);
+        wrap.appendChild(cell);
+      });
+      return wrap;
+    }
+
+    function advGroup(label, hint, body) {
+      return h('div', { style: { marginTop: '10px' } }, [
+        h('div', { class: 'legend-inline', style: { marginBottom: '6px' } }, [
+          h('span', { class: 'chip', text: label }),
+          hint ? h('span', { class: 'dim3', text: hint }) : null,
+        ]),
+        body,
+      ]);
+    }
+
+    /* 策略共识：买 / 持 / 卖 票数（缺字段则降级为「—」） */
+    function advConsensus(r) {
+      const e = r.ensemble || {};
+      if (!isNum(e.buy) && !isNum(e.hold) && !isNum(e.sell)) return '—';
+      const votes = (e.votes || []).map((v) => adText(v.strategy, '?') + ' → ' + adText(v.signal, '?')).join('，');
+      const box = h('span', {
+        style: { display: 'inline-flex', gap: '4px' },
+        title: votes || '服务端未返回逐策略票数',
+      });
+      if (isNum(e.buy)) box.appendChild(h('span', { class: 'chip up', text: '买 ' + e.buy }));
+      if (isNum(e.hold)) box.appendChild(h('span', { class: 'chip', text: '持 ' + e.hold }));
+      if (isNum(e.sell)) box.appendChild(h('span', { class: 'chip down', text: '卖 ' + e.sell }));
+      return box;
+    }
+
+    /* 关键因子 chips */
+    function advFactors(r) {
+      const sigs = Array.isArray(r.signals) ? r.signals : [];
+      if (!sigs.length) return '—';
+      const box = h('span', { style: { display: 'inline-flex', gap: '4px', flexWrap: 'wrap' } });
+      sigs.slice(0, AD_FACTOR_MAX).forEach((s) => {
+        box.appendChild(h('span', {
+          class: 'chip ' + adDirCls(s.dir),
+          title: adText(s.brief, adText(s.label, '')),
+          text: adText(s.label, adText(s.key, '因子')),
+        }));
+      });
+      if (sigs.length > AD_FACTOR_MAX) {
+        box.appendChild(h('span', {
+          class: 'chip',
+          text: '+' + (sigs.length - AD_FACTOR_MAX),
+          title: sigs.slice(AD_FACTOR_MAX).map((s) => adText(s.label, s.key)).join('、'),
+        }));
+      }
+      return box;
+    }
+
+    function renderAdvisor() {
+      clear(advisorBody);
+      const r = st.advisorRow;
+      if (!r) {
+        advisorBody.appendChild(ui.empty('暂无 AI 研判结果：可调整参数后点击「重新研判」重试'));
+        return;
+      }
+      const p = st.advisorParams || AD_PARAM_DEFAULT;
+      const key = adActionKey(r);
+      const e = r.edge || {};
+      const k = r.kelly || {};
+      const f = r.forecast || {};
+      const plan = r.plan || {};
+      const risk = r.risk || {};
+      const conf = adPct(r.confidence);
+      const wr = adPct(e.winRate);
+      const up = adPct(f.upProb);
+      const w = adPct(k.weight);
+
+      /* 结论条 */
+      advisorBody.appendChild(h('div', { class: 'legend-inline', style: { alignItems: 'center', gap: '10px' } }, [
+        h('span', { class: AD_ACTION_CLS[key] || 'chip', title: adText(r.actionText, ''), text: adActionText(r) }),
+        h('span', { class: 'chip', text: '评分 ' + F.num(r.score, 1) }),
+        h('span', { class: 'chip accent', text: '置信度 ' + (isNum(conf) ? F.num(conf, 0) + '%' : '—') }),
+        h('span', { class: 'num ' + F.dir(r.changePct) }, [
+          h('span', { text: '现价 ' + F.price(r.price, market) }),
+          h('span', { text: '　' + F.pct(r.changePct) }),
+        ]),
+        h('span', {
+          class: 'dim3',
+          text: '窗口 h=' + p.horizon + ' · 本金 ' + F.amt(p.capital, market) +
+            ' · 更新 ' + adUpdatedText(st.advisorUpdated),
+        }),
+      ]));
+
+      /* 置信度进度条（复用 .prog / .prog-bar） */
+      advisorBody.appendChild(h('div', { class: 'prog', style: { marginTop: '10px' }, title: '模型对该结论的置信度' }, [
+        h('div', { class: 'prog-bar' }, [
+          h('i', { style: { width: (isNum(conf) ? Math.max(0, Math.min(100, conf)) : 0).toFixed(1) + '%' } }),
+        ]),
+        h('div', { class: 'prog-text' }, [
+          h('span', { text: '置信度' }),
+          h('span', { text: isNum(conf) ? F.num(conf, 0) + '%' : '—' }),
+        ]),
+      ]));
+
+      /* 核心结论 */
+      advisorBody.appendChild(advGroup('核心结论', '档位 / 评分 / 共识 / 统计优势 / 关键因子', advMetrics([
+        ['建议档位', h('span', { class: AD_ACTION_CLS[key] || 'chip', text: adActionText(r) }), '', adText(r.actionText, '')],
+        ['综合评分', F.num(r.score, 1)],
+        ['置信度', isNum(conf) ? F.num(conf, 0) + '%' : '—'],
+        ['策略共识', advConsensus(r)],
+        [
+          '统计优势',
+          '胜率 ' + (isNum(wr) ? F.num(wr, 1) + '%' : '—') +
+            ' · 盈亏比 ' + F.num(e.payoff, 2) +
+            ' · ' + (isNum(e.trades) ? e.trades + ' 笔' : '—'),
+          '', '样本 ' + adText(e.sample, '—') + ' · 期望值/笔 ' + F.num(e.expectancy, 3) + ' · Edge ' + F.num(e.edge, 3),
+        ],
+        ['关键因子', advFactors(r)],
+      ])));
+
+      /* 预测与凯利仓位 */
+      advisorBody.appendChild(advGroup('预测与凯利仓位', '窗口内期望收益 / 上涨概率 / 价格区间 · 仓位由凯利折扣与单只权重上限折算', advMetrics([
+        ['期望收益', F.pct(f.expectedReturn), isNum(f.expectedReturn) ? F.dir(f.expectedReturn) : 'dim3', adText(f.note, '')],
+        ['上涨概率', isNum(up) ? F.num(up, 0) + '%' : '—'],
+        ['预测区间', F.price(f.bandLow, market) + ' ~ ' + F.price(f.bandHigh, market)],
+        [
+          '凯利权重', isNum(w) ? F.num(w, 1) + '%' : '—', '',
+          '凯利 f* ' + F.num(k.fStar, 3) + ' · 折扣 ' + F.num(k.fraction, 2) + (k.note ? ' · ' + k.note : ''),
+        ],
+        ['仓位金额', F.amt(k.amount, market)],
+        ['折算股数', isNum(k.shares) ? F.num(k.shares, 0) + ' 股' : '—'],
+      ])));
+
+      /* 交易计划 */
+      advisorBody.appendChild(advGroup('交易计划', '入场 / 止损 / 目标位由服务端模型给出，仅作计划参考', advMetrics([
+        ['建议买入', F.price(plan.entry, market)],
+        ['止损', F.price(plan.stop, market), 'down'],
+        ['目标1', F.price(plan.target1, market), 'up'],
+        ['目标2', F.price(plan.target2, market), 'up'],
+        ['盈亏比', F.num(plan.riskReward, 2)],
+        ['方向', adText(plan.direction, '—')],
+      ])));
+
+      /* 风险 */
+      advisorBody.appendChild(advGroup('风险', 'ATR% / 年化波动 / 历史最大回撤', advMetrics([
+        ['ATR%', rawPctText(risk.atrPct, 2), '', adText(risk.note, '')],
+        ['年化波动', rawPctText(risk.vol, 2)],
+        ['最大回撤', isNum(risk.maxDrawdown) ? '-' + F.num(Math.abs(risk.maxDrawdown), 2) + '%' : '—', 'down'],
+        ['统计样本', adText(e.sample, '—')],
+      ])));
+
+      /* 服务端备注（有则展示） */
+      const notes = [];
+      [['统计优势', e.note], ['凯利仓位', k.note], ['价格预测', f.note], ['交易计划', plan.note], ['风险', risk.note]]
+        .forEach(([label, note]) => {
+          if (!note) return;
+          notes.push(h('div', { class: 'legend-inline', style: { marginTop: '4px', lineHeight: '1.8' } }, [
+            h('span', { class: 'dim3', text: '· ' + label + '：' + note }),
+          ]));
+        });
+      if (notes.length) advisorBody.appendChild(h('div', { style: { marginTop: '10px' } }, notes));
+
+      advisorBody.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '10px', lineHeight: '1.8' } }, [
+        h('span', { class: 'chip warn', text: '免责声明' }),
+        h('span', { class: 'dim3', text: adText(st.advisorDisclaimer, AD_DISCLAIMER) }),
+      ]));
+      advisorBody.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '6px' } }, [
+        h('span', { class: 'dim3', text: advisorOverlayNote() }),
+      ]));
+    }
+
+    /* 叠加层说明必须反映「当前周期」而不是笼统断言已叠加 ——
+       分时 / 分钟线 / 周月K 都拿不到 advisor 叠加层（图表结构不同），
+       曾经这里固定写「日K周期下，已…」，在分时页面上属于与事实不符的提示。 */
+    function advisorOverlayNote() {
+      if (st.period === 'day') {
+        if (!st.advisorOn) return '日K周期下已关闭叠加：点击上方「在K线上显示AI建议」可重新开启。';
+        return st.advisorChart
+          ? '日K周期下，已在K线上叠加买卖标记、交易计划线与预测带。'
+          : '日K周期下，暂无可叠加的AI研判结果（请先完成一次研判）。';
+      }
+      const label = (PERIODS.filter((p) => p.value === st.period)[0] || { label: st.period }).label;
+      return '当前为「' + label + '」周期，AI 叠加层仅支持日K；切换到「日K」即可看到买卖标记、交易计划线与预测带。';
+    }
+
+    /* 服务端只返回日期字符串：映射到当前 bars 下标；映射不到就跳过该标记 */
+    function mapAdvisorMarks(marks, bars) {
+      const list = Array.isArray(bars) ? bars : [];
+      const byT = {};
+      const byDay = {};
+      list.forEach((b, i) => {
+        const t = String((b && b.t) || '');
+        if (!t) return;
+        if (byT[t] === undefined) byT[t] = i;
+        const day = t.slice(0, 10);
+        if (byDay[day] === undefined) byDay[day] = i;
+      });
+      const out = [];
+      (Array.isArray(marks) ? marks : []).forEach((m) => {
+        if (!m) return;
+        const t = String(m.t || '');
+        if (!t) return;
+        let idx = byT[t];
+        if (idx === undefined) idx = byDay[t.slice(0, 10)];       /* 兼容带时间与纯日期两种写法 */
+        if (idx === undefined) return;
+        out.push({ idx, dir: m.dir === 'buy' ? 'buy' : 'sell', label: m.label || '', kind: m.kind || '' });
+      });
+      return out;
+    }
+
+    /* 仅在日K上叠加：分时 / 分钟线（以及周月K）一律不设置 advisor */
+    function applyAdvisorToChart(bars) {
+      if (!chart || typeof chart.setAdvisor !== 'function') return;
+      const ad = st.advisorChart;
+      const barsNow = bars || (st.kline && st.kline.bars) || [];
+      if (!st.advisorOn || !ad || st.period !== 'day') { chart.setAdvisor(null); return; }
+      chart.setAdvisor({
+        marks: mapAdvisorMarks(ad.marks, barsNow),
+        forecast: { path: (ad.forecast && Array.isArray(ad.forecast.path)) ? ad.forecast.path : [] },
+        plan: ad.plan || null,
+      });
+    }
+
+    async function loadAdvisor(manual) {
+      if (st.advisorLoading || st.destroyed) return;
+      st.advisorLoading = true;
+      const p = readAdvisorParams();
+      st.advisorParams = p;
+      advisorBtn.disabled = true;
+      advisorHint.textContent = '模型计算中…';
+      if (manual) {
+        clear(advisorBody);
+        advisorBody.appendChild(ui.loading('AI 研判计算中…'));
+      }
+      const body = {
+        market,
+        symbols: [{ code, market }],
+        codes: [code],
+        horizon: p.horizon,
+        capital: p.capital,
+        kellyFraction: p.kellyFraction,
+        maxWeight: p.maxWeight,
+      };
+      try {
+        const res = await recommend(body);
+        /* 离开页面后不再回填：api 层不透传 AbortSignal，用 destroyed 标记等价中止 */
+        if (st.destroyed) return;
+        if (!res || res.ok === false) {
+          throw new Error((res && (res.message || res.error)) || '服务端未返回有效结果');
+        }
+        const rows = Array.isArray(res.rows) ? res.rows : [];
+        const mine = rows.filter((x) => x && String(x.code).toUpperCase() === code.toUpperCase());
+        st.advisorRow = mine[0] || rows[0] || null;
+        st.advisorChart = (st.advisorRow && st.advisorRow.advisor) || null;
+        st.advisorDisclaimer = res.disclaimer || '';
+        st.advisorUpdated = res.updated || null;
+        renderAdvisor();
+        applyAdvisorToChart();
+        advisorHint.textContent = st.advisorRow
+          ? '更新 ' + F.clock(Date.now()) + ' · 窗口 h=' + p.horizon + ' · 本金 ' + F.amt(p.capital, market)
+          : '服务端未返回该标的的研判结果';
+      } catch (err) {
+        if (st.destroyed) return;
+        /* 接口失败只提示：K线 / 行情 / 资金流等原有功能不受影响 */
+        st.advisorRow = null;
+        st.advisorChart = null;
+        advisorHint.textContent = '研判失败';
+        clear(advisorBody);
+        advisorBody.appendChild(ui.empty('AI 研判暂不可用：' + err.message +
+          '（接口 /api/advisor/recommend，不影响行情 / K线 / 资金流）'));
+        applyAdvisorToChart();
+        ctx.toast('AI 研判失败：' + err.message, 'err');
+      } finally {
+        st.advisorLoading = false;
+        if (!st.destroyed) advisorBtn.disabled = false;
+      }
+    }
+
+    /* 进入详情页后日线数据就绪时自动研判一次（不轮询） */
+    function ensureAdvisor() {
+      if (st.advisorLoaded || st.destroyed) return;
+      st.advisorLoaded = true;
+      if (advisorTimer) clearTimeout(advisorTimer);
+      advisorTimer = setTimeout(() => {
+        advisorTimer = null;
+        if (st.destroyed || !root.isConnected) return;
+        loadAdvisor(false);
+      }, AD_AUTO_DELAY);
     }
 
     /* ------------------------------------------------------- 资金流 */
@@ -446,6 +880,9 @@
             legendHost,
             canvasHost,
           ])),
+          ui.section('AI 研判', '建议档位 / 评分 / 置信度 / 策略共识 / 统计优势 / 预测 / 凯利仓位 / 交易计划 / 关键因子 / 风险；字段缺失按「—」降级',
+            [advisorHint, advisorToggle, advisorBtn],
+            h('div', {}, [advisorParamHost, advisorBody])),
           ui.section('技术信号雷达', '多指标加权评分', [], signalHost),
           ui.section('资金流向', '近 60 个交易日主力资金净额', [], flowHost),
         ]),
@@ -469,6 +906,10 @@
       }
     }
 
+    /* AI 研判区骨架先渲染：参数表单 + 空态（数据由日线就绪后自动请求填充） */
+    renderAdvisorForm();
+    renderAdvisor();
+
     (async () => {
       await loadQuote();
       await loadChart();
@@ -489,7 +930,9 @@
     return {
       refresh: () => { loadQuote(); loadChart(); loadFlow(); },
       destroy() {
+        st.destroyed = true;                       /* 标记离开页面：在途的 AI 研判结果不再回填 */
         if (timer) clearInterval(timer);
+        if (advisorTimer) { clearTimeout(advisorTimer); advisorTimer = null; }
         if (chart) chart.destroy();
         if (flowChart) flowChart.destroy();
       },

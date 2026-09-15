@@ -74,6 +74,10 @@ hit("/api/backtest", {"market": "cn", "code": "600519", "strategy": "maCross",
 hit("/api/search/params", {"market": "cn", "code": "600519", "strategy": "maCross",
                            "limit": 300, "initial": 1000000, "metric": "sharpe",
                            "space": {"fast": {"enabled": True, "min": 3, "max": 9, "step": 3}}})
+hit("/api/advisor/recommend", {"market": "cn", "codes": ["600519", "000001", "300750"],
+                               "horizon": 20, "capital": 100000,
+                               "kellyFraction": 0.5, "maxWeight": 0.25})
+hit("/api/advisor/recommend", {"market": "cn", "codes": []})          # 缺标的：错误分支也要是严格 JSON
 hit("/api/notify", {"webhook": "", "events": ["on_fill", "on_exit", "on_skip", "on_error"]})
 
 print("\n已校验接口 %d 个" % len(checked))

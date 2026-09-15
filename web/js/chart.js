@@ -36,6 +36,11 @@
     volDown: 'rgba(18, 196, 139, 0.5)',
     hi: '#ffdf7e',
     lo: '#7ef0d0',
+    /* AI 选股叠加层（建议标记 / 交易计划线 / 预测带） */
+    planEntry: '#4d8dff',
+    tipBg: 'rgba(20,24,31,0.78)',
+    forecastFill: 'rgba(130,80,223,0.16)',
+    forecastLine: '#8250df',
   };
 
   let upColor = '#ff4d4f';
@@ -102,6 +107,9 @@
       this.bars = [];
       this.vis = { start: 0, count: 120 };
       this.hover = -1;
+      /* AI 选股叠加层：{ marks:[{idx,dir,label,kind}], forecast:{path:[{i,mid,lo,hi}]},
+         plan:{entry,stop,target1,target2} }，为 null 时与旧行为完全一致 */
+      this.advisor = null;
       this.tip = document.createElement('div');
       this.tip.className = 'chart-tip hidden';
       wrap.appendChild(this.tip);
@@ -130,6 +138,11 @@
     setSub(sub) { this.opts.sub = sub; this.compute(); this.render(); }
     setMA(on) { this.opts.showMA = on; this.render(); }
     setBOLL(on) { this.opts.showBOLL = on; this.render(); }
+    /* 叠加 AI 选股建议：传入 null 可清除 */
+    setAdvisor(advisor) {
+      this.advisor = advisor || null;
+      this.render();
+    }
     resetZoom() {
       this.vis.count = Math.min(this.bars.length, 120);
       this.vis.start = Math.max(0, this.bars.length - this.vis.count);
@@ -243,8 +256,13 @@
       const vol = { x: pad.l, y: main.y + mainH + gap, w: innerW, h: volH };
       const sub = hasSub ? { x: pad.l, y: vol.y + volH + gap, w: innerW, h: subH } : null;
 
-      const barW = innerW / bars.length;
-      this.geo = { x0: main.x, barW, main, vol, sub, pad };
+      /* 右侧为「预测带」预留槽位；无预测时 slots == bars.length，与旧行为一致 */
+      const ad = this.advisor;
+      const fPath = (ad && ad.forecast && Array.isArray(ad.forecast.path)) ? ad.forecast.path : [];
+      const extra = fPath.length;
+      const slots = bars.length + extra;
+      const barW = innerW / slots;
+      this.geo = { x0: main.x, barW, main, vol, sub, pad, slots, extra };
 
       /* 主图价格范围 */
       const from = this.vis.start, to = from + bars.length - 1;
@@ -265,6 +283,21 @@
           if (isNum(a)) hi = Math.max(hi, a);
           if (isNum(b2)) lo = Math.min(lo, b2);
         }
+      }
+      /* 预测带与交易计划线也要落在可视范围内，否则会被裁掉 */
+      if (extra) {
+        fPath.forEach((p) => {
+          if (isNum(p.hi)) hi = Math.max(hi, p.hi);
+          if (isNum(p.lo)) lo = Math.min(lo, p.lo);
+          if (isNum(p.mid)) { hi = Math.max(hi, p.mid); lo = Math.min(lo, p.mid); }
+        });
+      }
+      const plan = (ad && ad.plan) || null;
+      if (plan) {
+        ['entry', 'stop', 'target1', 'target2'].forEach((k) => {
+          const v = plan[k];
+          if (isNum(v) && v > 0) { hi = Math.max(hi, v); lo = Math.min(lo, v); }
+        });
       }
       const padPct = (hi - lo) * 0.06 || hi * 0.01;
       hi += padPct; lo -= padPct;
@@ -331,18 +364,103 @@
         line(this.boll.low, PALETTE.bollBand, 1, [3, 3]);
       }
 
-      /* 买卖标记 */
-      (this.marks || []).forEach((m) => {
+      /* ===== AI 选股叠加层 ===== */
+      if (plan) {
+        const planRows = [
+          ['entry', '建议买入', PALETTE.planEntry || '#4d8dff'],
+          ['target1', '目标1', upColor],
+          ['target2', '目标2', upColor],
+          ['stop', '止损', downColor],
+        ];
+        ctx.save();
+        ctx.setLineDash([5, 4]);
+        ctx.lineWidth = 1;
+        planRows.forEach(([k, label, color]) => {
+          const v = plan[k];
+          if (!isNum(v) || v <= 0) return;
+          const y = Math.round(yOf(v)) + 0.5;
+          if (y < main.y + 2 || y > main.y + main.h - 2) return;
+          ctx.strokeStyle = color;
+          ctx.beginPath(); ctx.moveTo(main.x, y); ctx.lineTo(main.x + (bars.length + extra) * barW, y); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.font = '10px -apple-system, sans-serif';
+          const text = label + ' ' + F.price(v, this.opts.market, 2);
+          const tw = ctx.measureText(text).width + 8;
+          ctx.fillStyle = PALETTE.tipBg || 'rgba(20,24,31,0.78)';
+          ctx.fillRect(main.x + 4, y - 13, tw, 13);
+          ctx.fillStyle = color;
+          ctx.textAlign = 'left';
+          ctx.fillText(text, main.x + 8, y - 3);
+          ctx.setLineDash([5, 4]);
+        });
+        ctx.restore();
+      }
+
+      if (extra) {
+        /* 预测带：从最后一根收盘价锚点出发，画到右侧预留槽位 */
+        const anchor = bars[bars.length - 1].close;
+        const xs = (j) => main.x + (bars.length + j + 0.5) * barW;
+        const upArea = fPath.map((p, j) => ({ x: xs(j), y: yOf(isNum(p.hi) ? p.hi : anchor) }));
+        const loArea = fPath.map((p, j) => ({ x: xs(j), y: yOf(isNum(p.lo) ? p.lo : anchor) }));
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(main.x + (bars.length - 0.5) * barW, yOf(anchor));
+        upArea.forEach((p) => ctx.lineTo(p.x, p.y));
+        for (let j = loArea.length - 1; j >= 0; j--) ctx.lineTo(loArea[j].x, loArea[j].y);
+        ctx.closePath();
+        ctx.fillStyle = PALETTE.forecastFill || 'rgba(130,80,223,0.16)';
+        ctx.fill();
+        /* 中位路径 */
+        ctx.strokeStyle = PALETTE.forecastLine || '#8250df';
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(main.x + (bars.length - 0.5) * barW, yOf(anchor));
+        fPath.forEach((p, j) => ctx.lineTo(xs(j), yOf(isNum(p.mid) ? p.mid : anchor)));
+        ctx.stroke();
+        ctx.setLineDash([]);
+        /* 末端标注预测区间 */
+        const lastP = fPath[fPath.length - 1];
+        if (lastP) {
+          ctx.font = '10px -apple-system, sans-serif';
+          ctx.fillStyle = PALETTE.forecastLine || '#8250df';
+          ctx.textAlign = 'center';
+          ctx.fillText('预测', xs(fPath.length - 1), main.y + 11);
+          const txt = F.price(lastP.mid, this.opts.market, 2);
+          ctx.textAlign = 'right';
+          ctx.fillText(txt, main.x + innerW - 2, yOf(lastP.mid) - 4);
+        }
+        ctx.restore();
+      }
+
+      /* 买卖标记（带文字标签的为 AI 建议） */
+      const allMarks = (this.marks || []).concat((ad && ad.marks) || []);
+      const labelSeen = {};
+      allMarks.forEach((m) => {
         const k = m.idx - from;
         if (k < 0 || k >= bars.length) return;
         const cx = main.x + (k + 0.5) * barW;
         const isBuy = m.dir === 'buy';
         const y = isBuy ? yOf(bars[k].low) + 11 : yOf(bars[k].high) - 11;
-        ctx.fillStyle = isBuy ? upColor : downColor;
+        ctx.fillStyle = m.color || (isBuy ? upColor : downColor);
         ctx.beginPath();
         if (isBuy) { ctx.moveTo(cx, y - 5); ctx.lineTo(cx - 4.5, y + 3); ctx.lineTo(cx + 4.5, y + 3); }
         else { ctx.moveTo(cx, y + 5); ctx.lineTo(cx - 4.5, y - 3); ctx.lineTo(cx + 4.5, y - 3); }
         ctx.closePath(); ctx.fill();
+        if (m.label) {
+          /* 只画第一个标签，避免密集标记把图糊住 */
+          if (labelSeen[m.label]) return;
+          labelSeen[m.label] = true;
+          ctx.font = '10px -apple-system, sans-serif';
+          ctx.textAlign = 'center';
+          const tw = ctx.measureText(m.label).width + 10;
+          const ly = isBuy ? y + 6 : y - 20;
+          ctx.fillStyle = m.color || (isBuy ? upColor : downColor);
+          const bx = Math.max(main.x + 1, Math.min(cx - tw / 2, main.x + innerW - tw - 1));
+          ctx.fillRect(bx, ly, tw, 14);
+          ctx.fillStyle = '#fff';
+          ctx.fillText(m.label, bx + tw / 2, ly + 10.5);
+        }
       });
 
       /* 成交量 */

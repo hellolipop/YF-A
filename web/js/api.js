@@ -120,6 +120,7 @@
     strategyUpdate: (id, patch, reset) => post('strategy/update', { id, patch, reset: !!reset }),
     backtest: (body) => post('backtest', body),
     searchParams: (body) => post('search/params', body),
+    advisorRecommend: (body) => post('advisor/recommend', body),
     featuresIndex: () => get('features'),
     feature: (kind, params) => get('features/' + kind, params),
     logs: (params) => get('logs', params),

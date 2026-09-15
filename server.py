@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import datetime
 
+from core import advisor as core_advisor
 from core import fills as core_fills
 from core import logs as core_logs
 from core import metrics as core_metrics
@@ -1429,6 +1430,46 @@ def api_params_search(body):
 
 
 # --------------------------------------------------------------------------- #
+# AI 选股（多标的批量研判：建议 / 凯利仓位 / 预测 / 组合分配）
+# --------------------------------------------------------------------------- #
+
+def api_advisor_recommend(body):
+    """AI 选股：一次提交多只标的，返回逐只建议 + 凯利仓位 + 预测 + 组合分配。
+
+    标的字段兼容两种写法：
+      · ``symbols``：[{code, market, name}]，逐只带市场（推荐，支持 A股 + 美股混合）；
+      · ``codes``：["600519", "AAPL"]，统一用顶层 ``market`` 解释（前端旧写法兜底）。
+    """
+    body = body or {}
+    market = str(body.get("market") or "cn").strip().lower()
+    market = "us" if market.startswith("us") else "cn"
+
+    symbols = body.get("symbols")
+    if not isinstance(symbols, list) or not symbols:
+        symbols = body.get("codes")
+    if not isinstance(symbols, list) or not symbols:
+        raise RuntimeError("缺少标的：请提供 symbols 或 codes")
+    if len(symbols) > 60:
+        raise RuntimeError("单次最多提交 60 只标的（当前 %d 只）" % len(symbols))
+
+    return core_advisor.recommend(
+        symbols,
+        fetch_bars=_runner_fetch_bars,
+        fetch_quote=_runner_fetch_quote,
+        market=market,
+        horizon=body.get("horizon"),
+        capital=body.get("capital"),
+        kelly_fraction=body.get("kellyFraction"),
+        max_weight=body.get("maxWeight"),
+        cash_buffer=body.get("cashBuffer"),
+        fee=body.get("fee"),
+        slippage=body.get("slippage"),
+        period=body.get("period") or "day",
+        limit=body.get("limit") or 800,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # A股新数据（集合竞价 / 分笔 / 龙虎榜 / 涨停梯队）
 # --------------------------------------------------------------------------- #
 
@@ -1736,6 +1777,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_backtest(body))
             if path == "/api/search/params":
                 return self.send_json(api_params_search(body))
+            if path == "/api/advisor/recommend":
+                return self.send_json(api_advisor_recommend(body))
             if path == "/api/notify":
                 return self.send_json(api_notify_update(body))
             if path == "/api/notify/test":
