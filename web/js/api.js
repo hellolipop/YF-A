@@ -19,12 +19,34 @@
     return '/api/' + path + (qs ? '?' + qs : '');
   }
 
+  /** 解析响应体。
+
+  直接用 r.json() 时，一旦服务端返回的不是合法 JSON（空响应、HTML 错误页、
+  或历史上出现过的 Infinity 字面量），浏览器只会给出难以定位的底层报错
+  （Safari 是 "The string did not match the expected pattern."），
+  这里改为先取文本再解析，并附上 HTTP 状态与响应片段，便于直接定位。
+  */
+  async function readJson(r, url) {
+    const text = await r.text();
+    try {
+      return { ok: r.ok, status: r.status, json: JSON.parse(text) };
+    } catch (e) {
+      const snippet = (text || '').replace(/\s+/g, ' ').slice(0, 120);
+      const err = new Error('服务端返回了非 JSON 响应（HTTP ' + r.status + '）' +
+        (snippet ? '：' + snippet : '（响应为空）'));
+      err.url = url;
+      err.status = r.status;
+      err.raw = (text || '').slice(0, 400);
+      throw err;
+    }
+  }
+
   function get(path, params, opts) {
     const url = buildUrl(path, params);
     const o = opts || {};
     if (!o.noDedupe && inflight.has(url)) return inflight.get(url);
     const pr = fetch(url, { headers: { Accept: 'application/json' } })
-      .then((r) => r.json().then((j) => ({ ok: r.ok, status: r.status, json: j })))
+      .then((r) => readJson(r, url))
       .then(({ ok, status, json }) => {
         if (!ok || json.error) {
           /* features/* 等接口在失败（ok=false）时仍会返回「空实现」形状与中文原因：
@@ -50,11 +72,12 @@
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(body || {}),
     })
-      .then((r) => r.json().then((j) => ({ ok: r.ok, status: r.status, json: j })))
+      .then((r) => readJson(r, url))
       .then(({ ok, status, json }) => {
         if (!ok || json.error) {
           const err = new Error((json && json.message) || ('请求失败 HTTP ' + status));
           err.url = url;
+          err.json = json;
           throw err;
         }
         return json;

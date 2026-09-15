@@ -1,0 +1,91 @@
+"""全接口严格 JSON 审计（需要服务已在 127.0.0.1:8848 运行）：
+
+用法：python3 server.py & 然后 python3 tests/audit_json_endpoints.py
+
+按浏览器 JSON.parse 的严格性校验每个接口的响应体。
+
+Python 的 json.loads 默认接受 Infinity / NaN，所以历史上这类"服务端发的不是
+合法 JSON"的问题能躲过 Python 侧测试，只在浏览器里炸出来。这里统一用
+parse_constant 抛错的方式，把每个接口的响应体按浏览器的标准校验一遍。
+"""
+
+import json
+import urllib.request
+
+OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+import os
+
+BASE = os.environ.get("AD_BASE", "http://127.0.0.1:8848")
+bad = []
+checked = []
+
+
+def strict(text, label):
+    def bad_const(v):
+        raise ValueError("非有限数值字面量 %s" % v)
+    try:
+        json.loads(text, parse_constant=bad_const)
+        checked.append(label)
+    except Exception as exc:  # noqa: BLE001
+        bad.append((label, str(exc)[:80], text[:120]))
+
+
+def hit(path, body=None):
+    url = BASE + path
+    if body is None:
+        req = urllib.request.Request(url)
+        label = "GET " + path
+    else:
+        req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                     method="POST", headers={"Content-Type": "application/json"})
+        label = "POST " + path
+    try:
+        with OP.open(req, timeout=300) as resp:
+            strict(resp.read().decode("utf-8", "ignore"), label)
+    except urllib.error.HTTPError as exc:
+        strict(exc.read().decode("utf-8", "ignore"), label + " (HTTP %d)" % exc.code)
+
+
+print("=== GET 接口 ===")
+for p in ("/api/health", "/api/sysinfo", "/api/logs?limit=50",
+          "/api/strategy/meta", "/api/strategy/overview",
+          "/api/features", "/api/features/limit_up", "/api/features/dragon_tiger",
+          "/api/features/auction?code=600519", "/api/features/ticks?code=000001&limit=10",
+          "/api/notify", "/api/indices", "/api/overview?market=cn",
+          "/api/movers?market=cn&type=gainers", "/api/sectors?market=cn",
+          "/api/news?limit=10", "/api/search?q=600519",
+          "/api/quote?market=cn&codes=600519", "/api/kline?market=cn&code=600519&period=day&limit=120",
+          "/api/stock?market=cn&code=600519", "/api/orderbook?market=cn&code=600519",
+          "/api/trends?market=cn&code=600519", "/api/fundflow?market=cn&code=600519",
+          "/api/list?market=cn&page=1&size=10"):
+    hit(p)
+
+print("=== 任务详情（逐个任务）===")
+ov = json.loads(OP.open(BASE + "/api/strategy/overview", timeout=120).read())
+for row in ov["rows"]:
+    hit("/api/strategy/run?id=" + row["id"])
+
+print("=== POST 接口 ===")
+hit("/api/backtest", {"market": "cn", "code": "600519", "strategy": "maCross",
+                      "params": {"fast": 5, "slow": 20}, "limit": 300, "initial": 1000000})
+hit("/api/backtest", {"market": "cn", "code": "600519", "strategy": "maCross",
+                      "params": {"fast": 5, "slow": 20}, "limit": 300, "initial": 1000000,
+                      "fillModel": "depthWeighted"})
+hit("/api/search/params", {"market": "cn", "code": "600519", "strategy": "maCross",
+                           "limit": 300, "initial": 1000000, "metric": "sharpe",
+                           "space": {"fast": {"enabled": True, "min": 3, "max": 9, "step": 3}}})
+hit("/api/notify", {"webhook": "", "events": ["on_fill", "on_exit", "on_skip", "on_error"]})
+
+print("\n已校验接口 %d 个" % len(checked))
+if bad:
+    print("发现非严格 JSON 响应 %d 个：" % len(bad))
+    for label, err, snippet in bad:
+        print("  - %s → %s\n      %s" % (label, err, snippet))
+else:
+    print("全部为严格合法 JSON（浏览器 JSON.parse 可解析）")
+
+# 附带确认：无亏损任务的 profitFactor 现在是 null 且带显式标记
+null_pf = [r["code"] for r in ov["rows"] if r["stats"]["profitFactor"] is None]
+flag = [r["code"] for r in ov["rows"] if r["stats"].get("profitFactorInfinite")]
+print("\n盈亏比为空（无亏损）的任务: %s" % (null_pf or "无"))
+print("其中带 profitFactorInfinite 标记: %s" % (flag or "无"))

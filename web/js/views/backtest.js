@@ -145,7 +145,7 @@
       grid.appendChild(statCard('索提诺', F.num(s.sortino, 2), s.sortino > 1 ? 'up' : ''));
       grid.appendChild(statCard('卡玛比率', F.num(s.calmar, 2), s.calmar > 1 ? 'up' : ''));
       grid.appendChild(statCard('胜率', F.num(s.winRate, 1) + '%', s.winRate >= 50 ? 'up' : ''));
-      grid.appendChild(statCard('盈亏比', s.profitFactor === null || !isFinite(s.profitFactor) ? '∞' : F.num(s.profitFactor, 2)));
+      grid.appendChild(statCard('盈亏比', (s.profitFactorInfinite || s.profitFactor === null || !isFinite(s.profitFactor)) ? '∞（无亏损）' : F.num(s.profitFactor, 2)));
       grid.appendChild(statCard('期望值/笔', F.amt(s.expectancy, st.market), F.dir(s.expectancy)));
       grid.appendChild(statCard('交易次数', String(s.trades)));
       grid.appendChild(statCard('平均持仓', F.num(s.avgHoldBars, 1) + ' 根'));

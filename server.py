@@ -1551,6 +1551,25 @@ def api_notify_test(body):
 # HTTP 服务
 # --------------------------------------------------------------------------- #
 
+def sanitize_json(obj):
+    """把非有限浮点数（inf / -inf / NaN）替换为 None。
+
+    Python 的 json.dumps 默认会输出 Infinity / NaN 字面量，但这不是合法 JSON：
+    浏览器 JSON.parse 会直接抛错，Safari 的文案是
+    "The string did not match the expected pattern."，从报错完全看不出原因。
+    绩效指标里 profit_factor 在「无亏损交易」时就是 inf，所以必须在出口统一兜底。
+    """
+    if isinstance(obj, float):
+        if obj != obj or obj == float("inf") or obj == float("-inf"):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_json(v) for v in obj]
+    return obj
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AlphaDesk/1.0"
     protocol_version = "HTTP/1.1"
@@ -1560,7 +1579,13 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
 
     def send_json(self, obj, status=200):
-        body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+        # 严格 JSON：先清洗非有限浮点数，再以 allow_nan=False 序列化作为兜底断言，
+        # 避免 Infinity / NaN 流入浏览器导致 JSON.parse 失败（见 sanitize_json 说明）
+        try:
+            body = json.dumps(sanitize_json(obj), ensure_ascii=False, allow_nan=False,
+                              default=str).encode("utf-8")
+        except ValueError:
+            body = json.dumps(sanitize_json(obj), ensure_ascii=False, default=str).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")

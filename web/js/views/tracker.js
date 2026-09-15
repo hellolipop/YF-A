@@ -774,7 +774,7 @@
         statCard('已实现 / 浮动', F.amt(s.realized, run.market) + ' / ' + F.amt(s.unrealized, run.market), F.dir(s.unrealized)),
         statCard('胜率', F.num(s.winRate, 1) + '%', s.winRate >= 50 ? 'up' : (s.trades ? 'down' : '')),
         statCard('交易次数', s.trades + ' 笔（' + s.wins + ' 胜 / ' + s.losses + ' 负）'),
-        statCard('盈亏比', s.profitFactor >= 99 ? '∞（无亏损）' : F.num(s.profitFactor, 2)),
+        statCard('盈亏比', (s.profitFactorInfinite || !isFinite(s.profitFactor)) ? '∞（无亏损）' : F.num(s.profitFactor, 2)),
         statCard('最大回撤', '-' + F.num(s.maxDrawdown, 2) + '%', 'down'),
         statCard('夏普比率', F.num(s.sharpe, 2), s.sharpe > 1 ? 'up' : ''),
         statCard('索提诺', F.num(s.sortino, 2), s.sortino > 1 ? 'up' : ''),

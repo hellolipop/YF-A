@@ -304,6 +304,8 @@ class Runner:
         m = M.summarize(equity, trades, run.get("initial") or 0,
                         mode=run.get("metricsMode") or "compound",
                         bench=bench or None)
+        pf = m.get("profit_factor", 0.0)
+        pf_infinite = (pf == float("inf"))     # 无亏损交易时盈亏比为无穷大
         days = len({p.get("t") for p in equity if p.get("t")})
         target = run.get("targetDays") or 90
         equity_now = acc.equity(last_price)
@@ -325,7 +327,8 @@ class Runner:
             "wins": len([t for t in trades if t.get("outDate") and (t.get("pnl") or 0) > 0]),
             "losses": len([t for t in trades if t.get("outDate") and (t.get("pnl") or 0) <= 0]),
             "winRate": m.get("win_rate", 0.0) * 100,
-            "profitFactor": m.get("profit_factor", 0.0),
+            "profitFactor": pf,
+            "profitFactorInfinite": pf_infinite,
             "avgWin": m.get("avg_win", 0.0),
             "avgLoss": m.get("avg_loss", 0.0),
             "expectancy": m.get("expectancy", 0.0),
