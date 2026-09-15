@@ -66,6 +66,13 @@
       if (typeof v === 'string' && v) return v.indexOf(':') >= 0 ? F.hhmmss(v) : v;
       return F.clock(Date.now());
     }
+  /* 本地「YYYY-MM-DD HH:MM:SS」：用于展示「最近保存」时间（F.clock 只有时分秒） */
+  function adDateTime(ts) {
+    const d = new Date(isNum(ts) ? ts : Date.now());
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+      p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
   function adActionKey(r) { return String((r && r.action) || '').toLowerCase(); }
   function adActionText(r) {
     return AD_ACTION_LABEL[adActionKey(r)] || adText(r && r.actionText, '—');
@@ -125,6 +132,8 @@
       /* AI 研判：row 为服务端逐只结果，advisorChart 为 K 线叠加层数据 */
       advisorRow: null, advisorChart: null, advisorOn: true, advisorLoaded: false,
       advisorLoading: false, advisorParams: null, advisorDisclaimer: '', advisorUpdated: null,
+      /* 手动保存本次研判到「AI 选股」历史记录（不自动保存，避免每次打开详情都落库） */
+      advisorSaving: false, advisorSaved: null,
       destroyed: false,
     };
     let chart = null;
@@ -144,6 +153,8 @@
     const advisorBody = h('div');
     const advisorParamHost = h('div');
     const advisorHint = h('span', { class: 'dim3', text: '待研判' });
+    /* 「最近保存」说明行（仅手动保存成功后出现） */
+    const advisorSavedHost = h('div', { class: 'legend-inline', style: { margin: '8px 0 4px', lineHeight: '1.8' } });
     const advFields = {};
 
     /* ---------------------------------------------------------- 头部 */
@@ -451,6 +462,13 @@
       on: { click: () => loadAdvisor(true) },
     });
 
+    /* 手动保存：把本次研判结果写入「AI 选股」历史记录（详情页不做自动保存） */
+    const advSaveBtn = h('button', {
+      class: 'btn ghost sm', text: '保存本次研判',
+      title: '把当前参数的研判结果保存到「AI 选股 → 历史记录」，可在那里回放与复盘',
+      on: { click: () => saveAdvisor() },
+    });
+
     const advisorToggle = h('button', {
       class: 'btn ghost sm active', text: '在K线上显示AI建议',
       title: '在日K上叠加 AI 建议的买卖标记、交易计划线与预测带',
@@ -755,6 +773,62 @@
       }
     }
 
+    /* 「最近保存」说明行：仅手动保存成功后展示 */
+    function renderAdvisorSaved() {
+      clear(advisorSavedHost);
+      const s = st.advisorSaved;
+      if (!s) return;
+      advisorSavedHost.appendChild(h('span', { class: 'chip accent', text: '已保存' }));
+      advisorSavedHost.appendChild(h('span', {
+        class: 'dim3',
+        text: '最近保存：' + adDateTime(s.ts) + ' #' + s.id + '（可在「AI 选股 → 历史记录」中回放与复盘）',
+      }));
+    }
+
+    /* 手动保存本次研判：请求体带 save=true 与 trigger='detail'（详情页不自动保存） */
+    async function saveAdvisor() {
+      if (st.advisorSaving || st.destroyed) return;
+      const p = readAdvisorParams();
+      st.advisorSaving = true;
+      advSaveBtn.disabled = true;
+      const label = advSaveBtn.textContent;
+      advSaveBtn.textContent = '保存中…';
+      try {
+        const res = await recommend({
+          market,
+          symbols: [{ code, market, name: (st.quote && st.quote.name) || code }],
+          codes: [code],
+          horizon: p.horizon,
+          capital: p.capital,
+          kellyFraction: p.kellyFraction,
+          maxWeight: p.maxWeight,
+          save: true,
+          trigger: 'detail',
+        });
+        if (st.destroyed) return;
+        if (!res || res.ok === false) {
+          throw new Error((res && (res.message || res.error)) || '服务端未返回有效结果');
+        }
+        if (res.saved === false || !res.recordId) {
+          ctx.toast('服务端未保存本次研判（' + (res.saved === false ? 'saved=false' : '未返回记录号') + '）', 'warn');
+          return;
+        }
+        st.advisorSaved = { id: res.recordId, ts: Date.now() };
+        renderAdvisorSaved();
+        ctx.toast('已保存到 AI 选股记录 #' + res.recordId, 'ok');
+      } catch (err) {
+        if (st.destroyed) return;
+        /* 保存失败只提示：不影响既有研判结果与图表 */
+        ctx.toast('保存失败：' + err.message, 'err');
+      } finally {
+        st.advisorSaving = false;
+        if (!st.destroyed) {
+          advSaveBtn.disabled = false;
+          advSaveBtn.textContent = label;
+        }
+      }
+    }
+
     /* 进入详情页后日线数据就绪时自动研判一次（不轮询） */
     function ensureAdvisor() {
       if (st.advisorLoaded || st.destroyed) return;
@@ -881,8 +955,8 @@
             canvasHost,
           ])),
           ui.section('AI 研判', '建议档位 / 评分 / 置信度 / 策略共识 / 统计优势 / 预测 / 凯利仓位 / 交易计划 / 关键因子 / 风险；字段缺失按「—」降级',
-            [advisorHint, advisorToggle, advisorBtn],
-            h('div', {}, [advisorParamHost, advisorBody])),
+            [advisorHint, advisorToggle, advSaveBtn, advisorBtn],
+            h('div', {}, [advisorParamHost, advisorSavedHost, advisorBody])),
           ui.section('技术信号雷达', '多指标加权评分', [], signalHost),
           ui.section('资金流向', '近 60 个交易日主力资金净额', [], flowHost),
         ]),
@@ -908,6 +982,7 @@
 
     /* AI 研判区骨架先渲染：参数表单 + 空态（数据由日线就绪后自动请求填充） */
     renderAdvisorForm();
+    renderAdvisorSaved();
     renderAdvisor();
 
     (async () => {

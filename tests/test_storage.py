@@ -439,7 +439,9 @@ class TestSchemaMigration(StoreTestBase):
         result = store.migrate()
         self.assertEqual(result["from"], 1)
         self.assertEqual(result["to"], SCHEMA_VERSION)
-        self.assertEqual(result["applied"], [2])
+        # v1 库升到最新会逐级补上全部版本步骤（v2 成本列、v3 AI 选股记录两表），
+        # 断言必须跟着 SCHEMA_VERSION 走而不是写死某一级，否则每加一版都要改测试
+        self.assertEqual(result["applied"], list(range(2, SCHEMA_VERSION + 1)))
         self.assertEqual(store.schema_version(), SCHEMA_VERSION)
 
         cols = {r["name"] for r in store._conn().execute("PRAGMA table_info(trades)")}

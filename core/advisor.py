@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import math
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from . import indicators as I
@@ -65,6 +66,7 @@ from .forecast import forecast as build_forecast
 __all__ = [
     "recommend", "stances", "stance_net", "DEFAULT_HORIZON", "DEFAULT_CAPITAL",
     "MIN_BARS", "MIN_TRADES_FOR_EDGE", "ACTION_LABEL", "DISCLAIMER", "STANCE_KEYS",
+    "to_record", "record_id", "record_note", "review", "REVIEW_NOTE", "REVIEW_HORIZONS",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -1301,4 +1303,349 @@ def recommend(symbols, fetch_bars, fetch_quote=None, market="cn", horizon=DEFAUL
         },
         "source": "服务端 AI 选股引擎（core/advisor.py：多策略共识 + 共识回放统计 + 凯利仓位 + 历史条件分布）",
         "updated": now_ms(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 十、记录持久化：把一次研判整理成可落库的结构
+# --------------------------------------------------------------------------- #
+#: 建议档位的「可操作性排序」：越小越靠前（用于记录列表摘要里的优先展示）
+ACTION_ORDER = {"buy": 0, "add": 1, "sell": 2, "reduce": 3, "avoid": 4, "hold": 5, "watch": 6}
+#: 记录摘要里的 topRows 数量上限
+TOP_ROWS = 3
+
+RECORD_NOTE = (
+    "每条记录保存的是「当时这一刻的研判快照」：参数、逐只建议、凯利仓位、预测与交易计划"
+    "原样落库，便于事后回看当时的判断依据与当时的价位。为避免记录无限膨胀，"
+    "单条记录**不保存预测带路径**（预测带锚定在保存时的价格上，事后回看没有意义），"
+    "但买卖标记与交易计划保留。记录按时间倒序保留，超出上限的自动清理，"
+    "置顶记录不参与自动清理。"
+)
+
+
+def record_note(keep=None):
+    """记录口径说明 + 保留上限。
+
+    保留上限**不在本模块写死**：真实生效值由存储层（``Store.ADVISOR_KEEP``，可被
+    环境变量 ``AD_ADVISOR_KEEP`` 覆盖）决定，服务端拿到生效值后拼进来 ——
+    曾经这里硬编码过「300 条」而实际是 500，属于会误导用户的文案缺陷。
+    """
+    if keep:
+        try:
+            return RECORD_NOTE + "当前保留上限：%d 条未置顶记录（可用环境变量 AD_ADVISOR_KEEP 调整）。" % int(keep)
+        except (TypeError, ValueError):
+            return RECORD_NOTE
+    return RECORD_NOTE
+
+
+def record_id(ts=None):
+    """记录 id：``ar-毫秒时间戳-4位随机后缀``（可读、可排序，且并发不冲突）。"""
+    return "ar-%d-%s" % (int(ts if ts is not None else now_ms()), uuid.uuid4().hex[:4])
+
+
+def _record_top(rows):
+    """摘要里优先展示的 3 只：可操作性优先，同档位按评分降序。"""
+    def rank(r):
+        act = str(r.get("action") or "").lower()
+        return (ACTION_ORDER.get(act, 9), -(_num(r.get("score")) or 0.0))
+
+    out = []
+    for r in sorted(rows, key=rank)[:TOP_ROWS]:
+        k = r.get("kelly") or {}
+        out.append({
+            "code": r.get("code"), "name": r.get("name"), "market": r.get("market"),
+            "action": r.get("action"), "actionText": r.get("actionText"),
+            "score": r.get("score"), "kellyWeight": k.get("weight"),
+        })
+    return out
+
+
+def _slim_row(row):
+    """落库前裁剪逐只结论：去掉预测带路径（保留买卖标记与交易计划）。
+
+    预测带（``advisor.forecast.path``）是 20 个点的价格序列，锚定在保存时的收盘价上，
+    事后回看既不准确也无意义，却占了单行 JSON 近一半的体积，因此明确裁掉并在
+    `trimmed` 上标记，避免前端误以为是「预测带为空」。
+    """
+    item = dict(row)
+    adv = item.get("advisor")
+    if isinstance(adv, dict):
+        adv = dict(adv)
+        fc = adv.get("forecast")
+        if isinstance(fc, dict):
+            adv["forecast"] = {
+                "path": [], "horizon": fc.get("horizon"),
+                "levels": fc.get("levels"), "trimmed": True,
+            }
+        item["advisor"] = adv
+    return item
+
+
+def to_record(res, trigger="list", note="", rid=None, ts=None, keep=None):
+    """把 :func:`recommend` 的响应整理成可落库的记录 ``{"run": {...}, "rows": [...]}``。
+
+    纯函数、不接触存储：服务端拿到记录后再交给 ``core.storage.Store.save_advisor_run``，
+    这样「怎么算」与「怎么存」互不耦合，也便于单测。
+    """
+    res = res if isinstance(res, dict) else {}
+    rows = [r for r in (res.get("rows") or []) if isinstance(r, dict)]
+    created = int(ts if ts is not None else now_ms())
+
+    counts = {k: 0 for k in ACTION_LABEL}
+    for r in rows:
+        act = str(r.get("action") or "").lower()
+        if act in counts:
+            counts[act] += 1
+    actionable = counts["buy"] + counts["add"]
+
+    payload = {k: v for k, v in res.items() if k != "rows"}
+    payload["recordedAt"] = created
+    payload["recordNote"] = record_note(keep)
+
+    return {
+        "run": {
+            "id": rid or record_id(created),
+            "createdAt": created,
+            "createdDate": time.strftime("%Y-%m-%d", time.localtime(created / 1000.0)),
+            "market": res.get("market"),
+            "horizon": res.get("horizon"),
+            "capital": res.get("capital"),
+            "kellyFraction": res.get("kellyFraction"),
+            "maxWeight": res.get("maxWeight"),
+            "trigger": trigger,
+            "note": note,
+            "pinned": False,
+            "symbolCount": len(rows),
+            "analyzed": res.get("analyzed") or 0,
+            "buyCount": actionable,
+            "actionableCount": actionable,
+            "totalWeight": (res.get("portfolio") or {}).get("totalWeight"),
+            "source": res.get("source"),
+            "summary": {
+                "actions": counts,
+                "codes": [{"code": r.get("code"), "market": r.get("market"),
+                           "name": r.get("name")} for r in rows],
+                "topRows": _record_top(rows),
+            },
+            "payload": payload,
+        },
+        "rows": [_slim_row(r) for r in rows],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 十一、事后回看（复盘）：用之后真实发生的行情检验当时的建议
+# --------------------------------------------------------------------------- #
+#: 默认复盘窗口（交易日根数）
+REVIEW_HORIZONS = (5, 20)
+#: 哪些档位算「看多」（+1）/「看空」（-1）：命中判定就是看方向对不对
+REVIEW_DIRECTION = {"buy": 1, "add": 1, "reduce": -1, "sell": -1, "avoid": -1}
+#: 中性档位：不参与命中率统计（持有 / 观望本身不含方向判断）
+REVIEW_NEUTRAL = ("hold", "watch")
+
+REVIEW_NOTE = (
+    "这是**事后回看**，不是回测也不是收益承诺：以上市价（日线收盘）检验当时的建议方向"
+    "在随后若干交易日内是否成立。口径说明：①「命中 / 未命中」用**最短的已到期窗口**"
+    "（默认 5 根）判定，未走满该窗口的一律计为「未到期」，不参与命中率；"
+    "②「持有 / 观望」属中性档位，只记录实际涨跌、不计入命中率；"
+    "③ 收益为价格变动，**未计手续费、印花税与滑点**，也未考虑仓位能否成交；"
+    "④ 样本量有限（一条记录通常只有几只标的），单条记录的命中率没有统计意义，"
+    "只有把长期记录累积起来看才有参考价值；⑤ 历史表现不代表未来。"
+)
+
+
+def _fwd_return(bars, idx0, k):
+    """基准K线之后第 k 根的收益（相对基准收盘价，百分数）。"""
+    j = idx0 + int(k)
+    if idx0 < 0 or j >= len(bars) or j < 0:
+        return {"ret": None, "hit": None, "ready": False, "date": None, "price": None}
+    base = bars[idx0]["close"]
+    if base <= 0:
+        return {"ret": None, "hit": None, "ready": False, "date": None, "price": None}
+    return {
+        "ret": _r((bars[j]["close"] / base - 1.0) * 100.0, 3),
+        "hit": None, "ready": True, "date": bars[j].get("t"),
+        "price": _r(bars[j]["close"], 4),
+    }
+
+
+def _review_one(item, base_date, fetch_bars, horizons, limit):
+    """复盘单只标的：保存价 → 最新价，以及各窗口的后续收益与命中判定。"""
+    market = str(item.get("market") or "cn")
+    code = str(item.get("code") or "")
+    # fwd 先按「全部未到期」初始化：取不到行情的标的也保持同样的结构，
+    # 前端读 fwd['5'].ret 永远不会拿到 undefined（这类键缺失最难排查）
+    out = {
+        "code": code, "name": item.get("name"), "market": market,
+        "action": item.get("action"), "actionText": item.get("actionText"),
+        "weight": (item.get("kelly") or {}).get("weight"),
+        "savedPrice": _num(item.get("price")), "savedAt": base_date,
+        "baseDate": None, "basePrice": None, "refPrice": None,
+        "lastPrice": None, "lastDate": None, "barsElapsed": 0,
+        "sinceReturn": None, "verdict": "nodata",
+        "verdictHorizon": None, "verdictReturn": None, "contribution": None,
+        "note": None,
+        "fwd": {str(int(k)): _fwd_return([], 0, k) for k in horizons},
+    }
+    if not code:
+        out["note"] = "缺少标的代码"
+        return out
+    try:
+        bars = _clean_bars(fetch_bars(market, code, "day", limit) or [])
+    except Exception as e:  # noqa: BLE001  单只失败不影响整条记录的复盘
+        out["note"] = "行情获取失败：%s" % e
+        return out
+    if not bars:
+        out["note"] = "无可用日线数据"
+        return out
+
+    day = str(base_date or "")[:10]
+    # 保存当天可能是非交易日：取「最后一个日期不晚于保存日」的K线作为基准
+    cands = [i for i, b in enumerate(bars)
+             if day and str(b.get("t") or "")[:10] <= day]
+    idx0 = max(cands) if cands else 0
+    base_close = bars[idx0]["close"]
+    if base_close <= 0:
+        out["note"] = "基准K线价格无效"
+        return out
+
+    ref = _num(item.get("price"))
+    ref = ref if (ref is not None and ref > 0) else base_close
+    out.update({
+        "baseDate": bars[idx0].get("t"), "basePrice": _r(base_close, 4),
+        "refPrice": _r(ref, 4), "lastPrice": _r(bars[-1]["close"], 4),
+        "lastDate": bars[-1].get("t"), "barsElapsed": len(bars) - 1 - idx0,
+        "sinceReturn": _r((bars[-1]["close"] / ref - 1.0) * 100.0, 3),
+    })
+
+    fwd = {}
+    for k in horizons:
+        fwd[str(int(k))] = _fwd_return(bars, idx0, k)
+    out["fwd"] = fwd
+
+    act = str(item.get("action") or "").lower()
+    direction = REVIEW_DIRECTION.get(act)
+    ready = None
+    for k in sorted(int(x) for x in horizons):
+        if (fwd.get(str(k)) or {}).get("ready"):
+            ready = k
+            break
+    if act in REVIEW_NEUTRAL:
+        out["verdict"] = "neutral"
+        out["note"] = "中性档位（%s），只记录实际涨跌，不计入命中率" % ACTION_LABEL.get(act, act)
+    elif direction is None:
+        out["verdict"] = "nodata"
+        out["note"] = "当时未给出可执行档位（数据不足或已回避风险）"
+    elif ready is None:
+        out["verdict"] = "pending"
+        out["note"] = "尚未走满最短判定窗口（%d 根），当前仅 %d 根" % (
+            min(int(x) for x in horizons), out["barsElapsed"])
+    else:
+        ret = fwd[str(ready)]["ret"]
+        hit = bool(ret is not None and ((ret > 0) if direction > 0 else (ret < 0)))
+        fwd[str(ready)]["hit"] = hit
+        out.update({"verdict": "hit" if hit else "miss", "verdictHorizon": ready,
+                    "verdictReturn": ret})
+    w = _num(out.get("weight")) or 0.0
+    if out["sinceReturn"] is not None and w > 0:
+        # 账户口径贡献：权重 × 收益（两者都是百分数，乘积仍是百分数）
+        out["contribution"] = _r(w * out["sinceReturn"], 4)
+    return out
+
+
+def review(record, fetch_bars, horizons=REVIEW_HORIZONS, limit=800, max_workers=4):
+    """对一条已保存的记录做事后回看。
+
+    参数
+    ----
+    record : dict
+        记录（``Store.get_advisor_run`` 的返回值，或 ``to_record`` 的 ``run``+``rows``
+        合并体）。只需要 ``createdDate`` 与 ``rows``。
+    fetch_bars : callable(market, code, period, limit) -> list[dict]
+        与 :func:`recommend` 同一份数据抓取器。
+    horizons : tuple[int]
+        复盘窗口（交易日根数），默认 (5, 20)。命中判定只用**最短的已到期窗口**，
+        保证同一条记录内不同标的口径一致。
+    limit / max_workers
+        单只标的请求的K线根数 / 并发线程数。
+
+    返回
+    ----
+    dict：``rows`` 逐只复盘明细、``summary`` 汇总（命中率按看多组 / 看空组分开统计，
+    另给出已建仓部分的加权收益与占本金收益）、``note`` 口径说明。
+    任何异常都不抛出：取不到行情的标的一律记为 ``verdict='nodata'`` 并写明原因。
+    """
+    record = record if isinstance(record, dict) else {}
+    rows = [r for r in (record.get("rows") or []) if isinstance(r, dict)]
+    base_date = record.get("createdDate") or record.get("created_at") or ""
+
+    hs = []
+    probe = horizons if isinstance(horizons, (list, tuple)) else [horizons]
+    for h in probe:
+        v = _num(h)
+        if v is not None and int(v) >= 1:
+            hs.append(int(v))
+    hs = sorted(set(hs)) or list(REVIEW_HORIZONS)
+    lim = _int_arg(limit, 800, MIN_BARS, 3000)
+
+    if not rows:
+        return {"ok": False, "id": record.get("id"), "asOf": None, "horizons": hs,
+                "rows": [], "summary": {}, "note": record_note(),
+                "message": "该记录没有可复盘的标的"}
+
+    workers = _int_arg(max_workers, 4, 1, 8)
+    if len(rows) > 1 and workers > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(rows))) as pool:
+            items = list(pool.map(
+                lambda it: _review_one(it, base_date, fetch_bars, hs, lim), rows))
+    else:
+        items = [_review_one(it, base_date, fetch_bars, hs, lim) for it in rows]
+
+    def avg(vals):
+        vals = [v for v in vals if v is not None]
+        return _r(sum(vals) / len(vals), 3) if vals else None
+
+    def rate(group):
+        return _r(len([r for r in group if r["verdict"] == "hit"]) / len(group), 4) if group else None
+
+    graded = [r for r in items if r["verdict"] in ("hit", "miss")]
+    hits = [r for r in graded if r["verdict"] == "hit"]
+    bearish = [r for r in graded if str(r.get("action") or "").lower() in ("reduce", "sell", "avoid")]
+    bullish = [r for r in graded if str(r.get("action") or "").lower() in ("buy", "add")]
+    withret = [r for r in items if r.get("sinceReturn") is not None]
+    contrib = [r for r in withret if (r.get("weight") or 0) > 0]
+    wsum = sum((r.get("weight") or 0.0) for r in contrib)
+    account = sum((r.get("contribution") or 0.0) for r in contrib)
+    last_dates = [r["lastDate"] for r in items if r.get("lastDate")]
+
+    summary = {
+        "total": len(items),
+        "ready": len(graded),
+        "pending": len([r for r in items if r["verdict"] == "pending"]),
+        "neutral": len([r for r in items if r["verdict"] == "neutral"]),
+        "nodata": len([r for r in items if r["verdict"] == "nodata"]),
+        "hits": len(hits),
+        "misses": len(graded) - len(hits),
+        "hitRate": rate(graded),
+        "horizon": min(hs),
+        "avgReturn": avg([r["sinceReturn"] for r in withret]),
+        "avgHitReturn": avg([r["sinceReturn"] for r in hits]),
+        "avgMissReturn": avg([r["sinceReturn"] for r in graded if r["verdict"] == "miss"]),
+        "bullHitRate": rate(bullish),
+        "bearHitRate": rate(bearish),
+        "bullCount": len(bullish),
+        "bearCount": len(bearish),
+        "positionReturn": _r(account / wsum, 3) if wsum > 0 else None,
+        "accountReturn": _r(account, 3),
+        "totalWeight": _r(wsum, 6),
+    }
+    return {
+        "ok": True,
+        "id": record.get("id"),
+        "asOf": max(last_dates) if last_dates else None,
+        "baseDate": base_date or None,
+        "horizons": hs,
+        "rows": items,
+        "summary": summary,
+        "note": REVIEW_NOTE,
     }

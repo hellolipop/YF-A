@@ -14,7 +14,8 @@
 --------
 1. 仅依赖标准库 sqlite3（辅以 json / os / threading / time），零第三方依赖；
 2. 建库即开启 WAL（读写不互相阻塞）与 foreign_keys（子表随任务级联删除）；
-3. 表：runs / trades / equity / signals / logs / meta；
+3. 表：runs / trades / equity / signals / logs / meta，以及 v3 新增的
+   advisor_runs / advisor_items（AI 选股记录：一次批量研判的上下文 + 逐只结论）；
 4. schema 版本存于 meta 表的 `schema_version` 键；`migrate()` 是结构升级的唯一入口，
    `migrate_from_json()` 负责把旧的 strategy_runs.json 整体搬进来；
 5. trades 表固定包含 phase / signal_price / fill_price / fee / slippage：
@@ -44,7 +45,7 @@ from contextlib import contextmanager
 # --------------------------------------------------------------------------- #
 
 #: 当前 schema 版本（每次改表结构都要 +1，并在 MIGRATIONS 里补一条升级步骤）
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: schema 版本在 meta 表中的键名
 META_SCHEMA_VERSION = "schema_version"
@@ -475,10 +476,88 @@ def _apply_v2(conn):
         conn.execute("ALTER TABLE trades ADD COLUMN slippage REAL DEFAULT 0")
 
 
+#: v3：AI 选股记录（advisor_runs 主表 + advisor_items 逐只明细）
+#:
+#: 设计取舍与 runs/trades 一致：**常用检索字段提升为独立列，其余整体 JSON 进 payload**。
+#: · advisor_runs 存「一次批量研判」的上下文与汇总（参数、来源、备注、置顶、建议分布、
+#:   组合分配、免责声明与模型口径），列表页不需要解析逐只明细即可渲染；
+#: · advisor_items 存逐只结论，既落一批可查询的列（代码 / 名称 / 档位 / 评分 / 凯利仓位 /
+#:   预测 / 计划价位），也保留完整行 JSON 供「载入历史记录」原样回放；
+#: · 两者用外键级联，删除一条记录即连带清掉它的全部明细。
+_DDL_V3 = (
+    """
+    CREATE TABLE IF NOT EXISTS advisor_runs (
+        id               TEXT PRIMARY KEY,
+        created_at       INTEGER,
+        created_date     TEXT,
+        market           TEXT,
+        horizon          INTEGER,
+        capital          REAL,
+        kelly_fraction   REAL,
+        max_weight       REAL,
+        trigger_source   TEXT,
+        note             TEXT,
+        pinned           INTEGER DEFAULT 0,
+        symbol_count     INTEGER,
+        analyzed         INTEGER,
+        buy_count        INTEGER,
+        actionable_count INTEGER,
+        total_weight     REAL,
+        source           TEXT,
+        summary          TEXT,
+        payload          TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_advisor_runs_created ON advisor_runs (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_advisor_runs_market ON advisor_runs (market)",
+    "CREATE INDEX IF NOT EXISTS idx_advisor_runs_pinned ON advisor_runs (pinned, created_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS advisor_items (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id        TEXT NOT NULL REFERENCES advisor_runs (id) ON DELETE CASCADE,
+        seq           INTEGER NOT NULL DEFAULT 0,
+        code          TEXT,
+        name          TEXT,
+        market        TEXT,
+        price         REAL,
+        change_pct    REAL,
+        action        TEXT,
+        action_text   TEXT,
+        score         REAL,
+        confidence    REAL,
+        kelly_weight  REAL,
+        kelly_amount  REAL,
+        shares        INTEGER,
+        exp_return    REAL,
+        up_prob       REAL,
+        plan_entry    REAL,
+        plan_stop     REAL,
+        plan_target1  REAL,
+        plan_target2  REAL,
+        risk_reward   REAL,
+        edge_trades   INTEGER,
+        edge_win_rate REAL,
+        edge_payoff   REAL,
+        payload       TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_advisor_items_run ON advisor_items (run_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_advisor_items_code ON advisor_items (market, code)",
+    "CREATE INDEX IF NOT EXISTS idx_advisor_items_action ON advisor_items (action)",
+)
+
+
+def _apply_v3(conn):
+    """v3 结构：AI 选股记录两张表 + 索引"""
+    for stmt in _DDL_V3:
+        conn.execute(stmt)
+
+
 #: 迁移步骤表：version 为目标版本，fn 接收连接（在事务里执行）
 MIGRATIONS = (
     {"version": 1, "desc": "初始结构：runs / trades / equity / signals / logs / meta", "fn": _apply_v1},
     {"version": 2, "desc": "trades 增加 fee / slippage 交易成本列", "fn": _apply_v2},
+    {"version": 3, "desc": "AI 选股记录：advisor_runs / advisor_items", "fn": _apply_v3},
 )
 
 #: 建表语句按版本索引：init_schema(version=N) 可直接建出历史版本结构（迁移演练 / 测试用）
@@ -996,11 +1075,307 @@ class Store:
             out.append(rec)
         return out
 
-    # ------------------------------------------------------------ 计数辅助 --
+    # ------------------------------------------ AI 选股记录（advisor_runs / items） --
+    #: 记录保留上限：超出后自动清理「最旧的**未置顶**记录」，置顶记录永不自动清理。
+    #: 之所以要上限：逐只明细含因子说明、买卖标记与多段口径文案，**实测单只约 9 KB**
+    #: （3 只标的的单次记录 26.5 KB），不设上限会随使用无限膨胀。
+    #: 默认 500 条（按每天 10 次、每次 5 只标的估算可留约 50 天，占用约 25 MB），
+    #: 可用环境变量 AD_ADVISOR_KEEP 覆盖（在 server.py 读取后传入 keep）。
+    ADVISOR_KEEP = 500
+    #: 已被自动清理的累计条数写在 meta 里的键（用于前端如实展示保留策略）
+    META_ADVISOR_PRUNED = "advisor_pruned_total"
+
+    _ADVISOR_RUN_INSERT = """
+    INSERT INTO advisor_runs (id, created_at, created_date, market, horizon, capital,
+                              kelly_fraction, max_weight, trigger_source, note, pinned,
+                              symbol_count, analyzed, buy_count, actionable_count,
+                              total_weight, source, summary, payload)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        -- 创建时间只在首次写入时确定：重写同一条记录时不能被挪动。
+        -- 这不是形式问题：record_id 内嵌了毫秒时间戳、review 的基准日取自 createdDate、
+        -- 列表也按 created_at 排序，重写时覆盖会让 id 与时间互相矛盾、复盘起点漂移。
+        created_at       = COALESCE(advisor_runs.created_at, excluded.created_at),
+        created_date     = COALESCE(advisor_runs.created_date, excluded.created_date),
+        market           = excluded.market,
+        horizon          = excluded.horizon,
+        capital          = excluded.capital,
+        kelly_fraction   = excluded.kelly_fraction,
+        max_weight       = excluded.max_weight,
+        trigger_source   = excluded.trigger_source,
+        note             = COALESCE(excluded.note, advisor_runs.note),
+        -- 置顶是用户手工状态：同一条记录被重写时不允许被默认值覆盖
+        pinned           = advisor_runs.pinned,
+        symbol_count     = excluded.symbol_count,
+        analyzed         = excluded.analyzed,
+        buy_count        = excluded.buy_count,
+        actionable_count = excluded.actionable_count,
+        total_weight     = excluded.total_weight,
+        source           = excluded.source,
+        summary          = excluded.summary,
+        payload          = excluded.payload
+    """
+
+    _ADVISOR_ITEM_INSERT = """
+    INSERT INTO advisor_items (run_id, seq, code, name, market, price, change_pct,
+                               action, action_text, score, confidence, kelly_weight,
+                               kelly_amount, shares, exp_return, up_prob, plan_entry,
+                               plan_stop, plan_target1, plan_target2, risk_reward,
+                               edge_trades, edge_win_rate, edge_payoff, payload)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    @staticmethod
+    def _advisor_run_view(row):
+        """advisor_runs 行 → 列表视图 dict（summary JSON 展开成 actions / codes / topRows）"""
+        summary = _loads(row["summary"], {}) or {}
+        if not isinstance(summary, dict):
+            summary = {}
+        created = _i(row["created_at"])
+        return {
+            "id": row["id"],
+            "createdAt": created,
+            "createdDate": _s(row["created_date"]),
+            "timeText": _iso(created) if created else None,
+            "market": _s(row["market"]),
+            "horizon": _i(row["horizon"]),
+            "capital": _f(row["capital"]),
+            "kellyFraction": _f(row["kelly_fraction"]),
+            "maxWeight": _f(row["max_weight"]),
+            "trigger": _s(row["trigger_source"]),
+            "note": _s(row["note"]),
+            "pinned": bool(row["pinned"]),
+            "symbolCount": _i(row["symbol_count"], 0),
+            "analyzed": _i(row["analyzed"], 0),
+            "buyCount": _i(row["buy_count"], 0),
+            "actionableCount": _i(row["actionable_count"], 0),
+            "totalWeight": _f(row["total_weight"], 0.0),
+            "source": _s(row["source"]),
+            "actions": summary.get("actions") or {},
+            "codes": summary.get("codes") or [],
+            "topRows": summary.get("topRows") or [],
+        }
+
+    def save_advisor_run(self, record, keep=None):
+        """写入一条 AI 选股记录（主表 + 逐只明细），返回记录 id。
+
+        record 形如 ``{"run": {"id":…, "summary":…, "payload":…}, "rows": [逐只结论…]}``，
+        由 ``core.advisor.to_record()`` 生成。同一个 id 重复写入会先清掉旧明细再整体重写
+        （幂等），所以重试不会产生重复行。写入后按 ``keep``（默认 ADVISOR_KEEP）自动清理
+        最旧的未置顶记录，避免无限增长。
+        """
+        if not isinstance(record, dict):
+            raise ValueError("record 必须是 dict")
+        run = record.get("run") or {}
+        rows = record.get("rows") or []
+        rid = _s(run.get("id"))
+        if not rid:
+            raise ValueError("记录缺少 id")
+        created = _i(run.get("createdAt")) or now_ms()
+        vals = (
+            rid, created, _s(run.get("createdDate")),
+            _s(run.get("market")), _i(run.get("horizon")),
+            _f(run.get("capital")), _f(run.get("kellyFraction")), _f(run.get("maxWeight")),
+            _s(run.get("trigger")), _s(run.get("note")), _b(run.get("pinned")) or 0,
+            _i(run.get("symbolCount"), 0), _i(run.get("analyzed"), 0),
+            _i(run.get("buyCount"), 0), _i(run.get("actionableCount"), 0),
+            _f(run.get("totalWeight"), 0.0), _s(run.get("source")),
+            _dumps(run.get("summary") or {}),
+            _dumps(run.get("payload") or {}),
+        )
+        with self._tx() as conn:
+            conn.execute("DELETE FROM advisor_items WHERE run_id = ?", (rid,))
+            conn.execute(self._ADVISOR_RUN_INSERT, vals)
+            for i, item in enumerate(rows):
+                if not isinstance(item, dict):
+                    continue
+                kelly = item.get("kelly") or {}
+                forecast = item.get("forecast") or {}
+                plan = item.get("plan") or {}
+                edge = item.get("edge") or {}
+                conn.execute(self._ADVISOR_ITEM_INSERT, (
+                    rid, i, _s(item.get("code")), _s(item.get("name")), _s(item.get("market")),
+                    _f(item.get("price")), _f(item.get("changePct")),
+                    _s(item.get("action")), _s(item.get("actionText")),
+                    _f(item.get("score")), _f(item.get("confidence")),
+                    _f(kelly.get("weight")), _f(kelly.get("amount")), _i(kelly.get("shares")),
+                    _f(forecast.get("expectedReturn")), _f(forecast.get("upProb")),
+                    _f(plan.get("entry")), _f(plan.get("stop")),
+                    _f(plan.get("target1")), _f(plan.get("target2")),
+                    _f(plan.get("riskReward")),
+                    _i(edge.get("trades")), _f(edge.get("winRate")), _f(edge.get("payoff")),
+                    _dumps(item),
+                ))
+        self.advisor_prune(keep=keep)
+        return rid
+
+    def list_advisor_runs(self, limit=50, offset=0, market=None, code=None, action=None,
+                          q=None, pinned=None):
+        """记录列表（置顶优先，其次按时间倒序）。
+
+        market / code / action 走 advisor_items 的 EXISTS 子查询（已建索引）；
+        q 同时匹配备注、记录 id、标的代码与名称；pinned=True 只看置顶。
+        返回 ``{"rows", "total", "limit", "offset"}``。
+        """
+        where, params = [], []
+        if market:
+            where.append("r.market = ?")
+            params.append(str(market))
+        if pinned:
+            where.append("r.pinned = 1")
+        if code:
+            where.append("EXISTS (SELECT 1 FROM advisor_items i WHERE i.run_id = r.id"
+                         " AND i.code = ?)")
+            params.append(str(code).upper())
+        if action:
+            where.append("EXISTS (SELECT 1 FROM advisor_items i WHERE i.run_id = r.id"
+                         " AND i.action = ?)")
+            params.append(str(action))
+        if q:
+            like = "%%%s%%" % str(q).strip()
+            where.append(
+                "(COALESCE(r.note, '') LIKE ? OR r.id LIKE ?"
+                " OR EXISTS (SELECT 1 FROM advisor_items i WHERE i.run_id = r.id"
+                " AND (COALESCE(i.code, '') LIKE ? OR COALESCE(i.name, '') LIKE ?)))")
+            params.extend([like, like, like, like])
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        conn = self._conn()
+        total = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_runs r" + clause, params).fetchone()["n"])
+        rows = conn.execute(
+            "SELECT r.* FROM advisor_runs r" + clause +
+            " ORDER BY r.pinned DESC, COALESCE(r.created_at, 0) DESC, r.id DESC LIMIT ? OFFSET ?",
+            params + [max(1, int(limit or 50)), max(0, int(offset or 0))]).fetchall()
+        return {
+            "rows": [self._advisor_run_view(r) for r in rows],
+            "total": total,
+            "limit": int(limit or 50),
+            "offset": max(0, int(offset or 0)),
+        }
+
+    def get_advisor_run(self, rid):
+        """取回一条完整记录：摘要字段 + 顶层 envelope（payload）+ ``rows`` 逐只结论。
+
+        逐只结论直接还原 ``advisor_items.payload``（写入时就是完整行 JSON），
+        保证「载入历史记录」看到的内容与当时一致，不做二次拼装。
+        """
+        row = self._conn().execute(
+            "SELECT * FROM advisor_runs WHERE id = ?", (_s(rid),)).fetchone()
+        if row is None:
+            return None
+        out = self._advisor_run_view(row)
+        payload = _loads(row["payload"], {}) or {}
+        if isinstance(payload, dict):
+            for k, v in payload.items():
+                out.setdefault(k, v)
+        items = self._conn().execute(
+            "SELECT payload FROM advisor_items WHERE run_id = ? ORDER BY seq ASC",
+            (_s(rid),)).fetchall()
+        rows = []
+        for it in items:
+            data = _loads(it["payload"], None)
+            if isinstance(data, dict):
+                rows.append(data)
+        out["rows"] = rows
+        return out
+
+    def advisor_items(self, rid):
+        """只取逐只明细（复盘用，避免把整份 payload 都解析出来）"""
+        rows = self._conn().execute(
+            "SELECT payload FROM advisor_items WHERE run_id = ? ORDER BY seq ASC",
+            (_s(rid),)).fetchall()
+        out = []
+        for it in rows:
+            data = _loads(it["payload"], None)
+            if isinstance(data, dict):
+                out.append(data)
+        return out
+
+    def delete_advisor_run(self, rid):
+        """删除一条记录（逐只明细靠外键级联删除）；返回是否删到了记录"""
+        with self._tx() as conn:
+            cur = conn.execute("DELETE FROM advisor_runs WHERE id = ?", (_s(rid),))
+        return cur.rowcount > 0
+
+    def update_advisor_run(self, rid, note=None, pinned=None):
+        """更新记录的备注 / 置顶状态（只改传入的字段），返回更新后的视图；不存在返回 None"""
+        sets, params = [], []
+        if note is not None:
+            sets.append("note = ?")
+            params.append(_s(note))
+        if pinned is not None:
+            sets.append("pinned = ?")
+            params.append(_b(pinned) or 0)
+        if not sets:
+            return self.get_advisor_run(rid)
+        with self._tx() as conn:
+            cur = conn.execute("UPDATE advisor_runs SET %s WHERE id = ?" % ", ".join(sets),
+                               params + [_s(rid)])
+            if cur.rowcount <= 0:
+                return None
+        row = self._conn().execute(
+            "SELECT * FROM advisor_runs WHERE id = ?", (_s(rid),)).fetchone()
+        return self._advisor_run_view(row) if row is not None else None
+
+    def advisor_prune(self, keep=None):
+        """按保留上限清理最旧的**未置顶**记录，返回本次删除条数。
+
+        keep=0 表示清空全部未置顶记录（前端「清空全部」用它）；
+        置顶记录不参与自动清理，需要用户自己取消置顶或删除。
+        """
+        limit = self.ADVISOR_KEEP if keep is None else max(0, int(keep))
+        conn = self._conn()
+        free = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_runs WHERE COALESCE(pinned, 0) = 0"
+        ).fetchone()["n"])
+        targets = free - limit
+        if targets <= 0:
+            return 0
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT id FROM advisor_runs WHERE COALESCE(pinned, 0) = 0"
+                " ORDER BY COALESCE(created_at, 0) ASC, id ASC LIMIT ?", (targets,)).fetchall()
+            ids = [r["id"] for r in rows]
+            if not ids:
+                return 0
+            conn.executemany("DELETE FROM advisor_runs WHERE id = ?", [(i,) for i in ids])
+        prev = _i(self.meta_get(self.META_ADVISOR_PRUNED, 0), 0) or 0
+        self.meta_set(self.META_ADVISOR_PRUNED, prev + len(ids))
+        return len(ids)
+
+    def advisor_pinned_count(self):
+        """当前置顶记录条数（置顶记录不参与自动清理，前端需要如实展示这一点）"""
+        return int(self._conn().execute(
+            "SELECT COUNT(*) AS n FROM advisor_runs WHERE COALESCE(pinned, 0) = 1"
+        ).fetchone()["n"])
+
+    def advisor_stats(self):
+        """记录汇总：条数、明细条数、买入/增持条数、平均总仓位、最近一次时间、累计清理条数"""
+        conn = self._conn()
+        runs = int(conn.execute("SELECT COUNT(*) AS n FROM advisor_runs").fetchone()["n"])
+        items = int(conn.execute("SELECT COUNT(*) AS n FROM advisor_items").fetchone()["n"])
+        buys = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_items WHERE action IN ('buy', 'add')"
+        ).fetchone()["n"])
+        row = conn.execute(
+            "SELECT AVG(COALESCE(total_weight, 0)) AS avg_w, MAX(COALESCE(created_at, 0)) AS last_t"
+            " FROM advisor_runs").fetchone()
+        return {
+            "records": runs,
+            "items": items,
+            "buyTotal": buys,
+            "avgTotalWeight": _f(row["avg_w"], 0.0) if row is not None else 0.0,
+            "latestAt": _i(row["last_t"]) if row is not None else None,
+            "prunedTotal": _i(self.meta_get(self.META_ADVISOR_PRUNED, 0), 0) or 0,
+            "keep": self.ADVISOR_KEEP,
+        }
+
+    # ------------------------------------------------- 计数辅助 --
     def counts(self):
         """各表行数（自检 / 测试用）"""
         out = {}
-        for table in ("runs", "trades", "equity", "signals", "logs", "meta"):
+        for table in ("runs", "trades", "equity", "signals", "logs", "meta",
+                      "advisor_runs", "advisor_items"):
             row = self._conn().execute("SELECT COUNT(*) AS n FROM %s" % table).fetchone()
             out[table] = int(row["n"])
         return out

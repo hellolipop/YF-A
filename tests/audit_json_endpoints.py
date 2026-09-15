@@ -78,6 +78,28 @@ hit("/api/advisor/recommend", {"market": "cn", "codes": ["600519", "000001", "30
                                "horizon": 20, "capital": 100000,
                                "kellyFraction": 0.5, "maxWeight": 0.25})
 hit("/api/advisor/recommend", {"market": "cn", "codes": []})          # 缺标的：错误分支也要是严格 JSON
+
+print("=== AI 选股记录（先落一条再读回来）===")
+hit("/api/advisor/recommend", {"market": "cn", "symbols": [{"code": "600519", "market": "cn"}],
+                               "capital": 1000000, "save": True, "trigger": "list",
+                               "note": "browser-json-audit"})
+for p in ("/api/advisor/history?limit=5",
+          "/api/advisor/history?limit=5&market=cn&action=buy&q=%E8%8C%85%E5%8F%B0&pinned=1",
+          "/api/advisor/record?id=__MISSING__", "/api/advisor/review?id=__MISSING__"):
+    hit(p)
+try:
+    hist = json.loads(OP.open(BASE + "/api/advisor/history?limit=1", timeout=120).read())
+    rid = (hist.get("rows") or [{}])[0].get("id")
+    if rid:
+        hit("/api/advisor/record?id=" + rid)
+        hit("/api/advisor/review?id=" + rid)
+        hit("/api/advisor/note", {"id": rid, "note": "audit", "pinned": True})
+        hit("/api/advisor/note", {"id": rid, "pinned": False})
+        hit("/api/advisor/delete", {"id": rid})
+    hit("/api/advisor/prune", {"keep": 500})
+except Exception as exc:  # noqa: BLE001
+    print("  记录链路审计跳过：%s" % exc)
+
 hit("/api/notify", {"webhook": "", "events": ["on_fill", "on_exit", "on_skip", "on_error"]})
 
 print("\n已校验接口 %d 个" % len(checked))

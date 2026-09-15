@@ -1439,6 +1439,11 @@ def api_advisor_recommend(body):
     标的字段兼容两种写法：
       · ``symbols``：[{code, market, name}]，逐只带市场（推荐，支持 A股 + 美股混合）；
       · ``codes``：["600519", "AAPL"]，统一用顶层 ``market`` 解释（前端旧写法兜底）。
+
+    落库开关：``save`` 为真时把本次研判整理成一条记录写进 SQLite（`advisor_runs`
+    + `advisor_items`），响应里回带 ``recordId``；``trigger`` / ``note`` 一并入库，
+    便于在历史记录里区分来源（列表批量研判 / 个股详情手动保存）。
+    保存失败**不影响研判结果**：只在响应里带 ``saveError`` 并记一条错误日志。
     """
     body = body or {}
     market = str(body.get("market") or "cn").strip().lower()
@@ -1452,7 +1457,7 @@ def api_advisor_recommend(body):
     if len(symbols) > 60:
         raise RuntimeError("单次最多提交 60 只标的（当前 %d 只）" % len(symbols))
 
-    return core_advisor.recommend(
+    res = core_advisor.recommend(
         symbols,
         fetch_bars=_runner_fetch_bars,
         fetch_quote=_runner_fetch_quote,
@@ -1467,6 +1472,168 @@ def api_advisor_recommend(body):
         period=body.get("period") or "day",
         limit=body.get("limit") or 800,
     )
+
+    res["recordId"] = None
+    res["saved"] = False
+    if body.get("save"):
+        try:
+            rec = core_advisor.to_record(
+                res,
+                trigger=str(body.get("trigger") or "list"),
+                note=str(body.get("note") or ""),
+                keep=advisor_keep(),
+            )
+            res["recordId"] = advisor_store().save_advisor_run(rec, keep=advisor_keep())
+            res["saved"] = True
+            try:
+                runner().logger.info("advisor.saved", recordId=res["recordId"],
+                                     market=market, symbols=rec["run"]["symbolCount"],
+                                     analyzed=rec["run"]["analyzed"],
+                                     trigger=rec["run"]["trigger"])
+            except Exception:  # noqa: BLE001  日志失败不影响业务
+                pass
+        except Exception as exc:  # noqa: BLE001  保存失败不拖垮研判
+            res["saveError"] = "记录保存失败：%s" % str(exc)[:200]
+            try:
+                runner().logger.error("advisor.save_failed", error=str(exc)[:200])
+            except Exception:  # noqa: BLE001
+                pass
+    res["historyCount"] = safe_call(lambda: advisor_store().advisor_stats().get("records"))
+    return res
+
+
+# --------------------------------------------------------------------------- #
+# AI 选股记录（持久化：历史列表 / 载入 / 复盘 / 备注置顶 / 删除清理）
+# --------------------------------------------------------------------------- #
+
+def advisor_store():
+    """AI 选股记录与策略跟踪共用同一个 SQLite 库（data/alphadesk.db），避免多库并存。"""
+    return runner().store
+
+
+def advisor_keep():
+    """记录保留上限：默认取 Store.ADVISOR_KEEP（500），可用 AD_ADVISOR_KEEP 覆盖。"""
+    try:
+        v = int(os.environ.get("AD_ADVISOR_KEEP") or 0)
+    except (TypeError, ValueError):
+        v = 0
+    return v if v > 0 else core_storage.Store.ADVISOR_KEEP
+
+
+def _advisor_query(q):
+    """把 GET 查询串整理成 list_advisor_runs 的过滤参数（非法值一律忽略）。"""
+    pinned = str((q.get("pinned") or "")).strip().lower() in ("1", "true", "yes", "on")
+    return {
+        "limit": int(num(q.get("limit"), 50) or 50),
+        "offset": int(num(q.get("offset"), 0) or 0),
+        "market": (q.get("market") or "").strip().lower() or None,
+        "code": (q.get("code") or "").strip().upper() or None,
+        "action": (q.get("action") or "").strip().lower() or None,
+        "q": (q.get("q") or "").strip() or None,
+        "pinned": pinned,
+    }
+
+
+def api_advisor_history(q):
+    """历史记录列表（置顶优先 + 时间倒序），带汇总统计与保留策略说明。"""
+    st = advisor_store()
+    found = st.list_advisor_runs(**_advisor_query(q or {}))
+    stats = st.advisor_stats()
+    return {
+        "ok": True,
+        "rows": found["rows"],
+        "total": found["total"],
+        "limit": found["limit"],
+        "offset": found["offset"],
+        "stats": {
+            "records": stats["records"], "items": stats["items"],
+            "buyTotal": stats["buyTotal"], "avgTotalWeight": stats["avgTotalWeight"],
+            "latestAt": stats["latestAt"],
+        },
+        "retention": {"limit": advisor_keep(), "pruned": stats["prunedTotal"],
+                      "pinned": advisor_store().advisor_pinned_count()},
+        "note": core_advisor.record_note(advisor_keep()),
+        "updated": now_ms(),
+    }
+
+
+def api_advisor_record(q):
+    """载入一条记录：完整还原当时的逐只结论与组合分配（预测带已裁剪，见 note）。"""
+    rid = (q.get("id") or "").strip()
+    if not rid:
+        raise RuntimeError("缺少 id")
+    rec = advisor_store().get_advisor_run(rid)
+    if not rec:
+        raise RuntimeError("记录不存在：%s" % rid)
+    return {"ok": True, "record": rec, "review": None, "updated": now_ms()}
+
+
+def api_advisor_review(q):
+    """复盘：用保存之后真实发生的行情检验当时的建议方向是否成立。"""
+    rid = (q.get("id") or "").strip()
+    if not rid:
+        raise RuntimeError("缺少 id")
+    rec = advisor_store().get_advisor_run(rid)
+    if not rec:
+        raise RuntimeError("记录不存在：%s" % rid)
+    raw = (q.get("horizons") or "").strip()
+    hs = []
+    for piece in re.split(r"[,\s]+", raw):
+        if piece.isdigit() and int(piece) >= 1:
+            hs.append(int(piece))
+    res = core_advisor.review(rec, _runner_fetch_bars,
+                              horizons=tuple(hs) or core_advisor.REVIEW_HORIZONS)
+    res["note"] = core_advisor.record_note(advisor_keep())
+    res["recordId"] = rid
+    res["updated"] = now_ms()
+    return res
+
+
+def api_advisor_delete(body):
+    """删除一条记录（逐只明细级联删除）"""
+    rid = str((body or {}).get("id") or "").strip()
+    if not rid:
+        raise RuntimeError("缺少 id")
+    ok = advisor_store().delete_advisor_run(rid)
+    return {"ok": True, "id": rid, "deleted": bool(ok),
+            "remaining": advisor_store().advisor_stats()["records"]}
+
+
+def api_advisor_note(body):
+    """更新记录的备注 / 置顶状态（只改传进来的字段）"""
+    body = body or {}
+    rid = str(body.get("id") or "").strip()
+    if not rid:
+        raise RuntimeError("缺少 id")
+    note = body.get("note")
+    pinned = body.get("pinned")
+    if note is None and pinned is None:
+        raise RuntimeError("缺少 note 或 pinned")
+    view = advisor_store().update_advisor_run(
+        rid,
+        note=None if note is None else str(note)[:500],
+        pinned=None if pinned is None else bool(pinned),
+    )
+    if view is None:
+        raise RuntimeError("记录不存在：%s" % rid)
+    # 记录一条日志：备注/置顶是用户手工数据，出了问题要能从上到下追溯到底收到了什么
+    try:
+        runner().logger.info("advisor.note_updated", recordId=rid,
+                             noteLen=len(str(note)) if note is not None else None,
+                             pinned=None if pinned is None else bool(pinned))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "id": rid, "note": view.get("note"), "pinned": view.get("pinned")}
+
+
+def api_advisor_prune(body):
+    """按保留上限清理最旧的未置顶记录（keep=0 表示清空全部未置顶记录）"""
+    keep = int(num((body or {}).get("keep"), 0) or 0)
+    st = advisor_store()
+    deleted = st.advisor_prune(keep=keep)
+    stats = st.advisor_stats()
+    return {"ok": True, "deleted": deleted, "remaining": stats["records"],
+            "keep": keep, "pinned": st.advisor_pinned_count()}
 
 
 # --------------------------------------------------------------------------- #
@@ -1743,6 +1910,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_features_index())
             if path.startswith("/api/features/"):
                 return self.send_json(api_feature(path.rsplit("/", 1)[-1], q))
+            if path == "/api/advisor/history":
+                return self.send_json(api_advisor_history(q))
+            if path == "/api/advisor/record":
+                return self.send_json(api_advisor_record(q))
+            if path == "/api/advisor/review":
+                return self.send_json(api_advisor_review(q))
             if path == "/api/logs":
                 return self.send_json(api_logs(int(fnum("limit", 100) or 100), q.get("level")))
             if path == "/api/sysinfo":
@@ -1779,6 +1952,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_params_search(body))
             if path == "/api/advisor/recommend":
                 return self.send_json(api_advisor_recommend(body))
+            if path == "/api/advisor/delete":
+                return self.send_json(api_advisor_delete(body))
+            if path == "/api/advisor/note":
+                return self.send_json(api_advisor_note(body))
+            if path == "/api/advisor/prune":
+                return self.send_json(api_advisor_prune(body))
             if path == "/api/notify":
                 return self.send_json(api_notify_update(body))
             if path == "/api/notify/test":

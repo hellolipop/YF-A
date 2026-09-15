@@ -121,6 +121,29 @@
     backtest: (body) => post('backtest', body),
     searchParams: (body) => post('search/params', body),
     advisorRecommend: (body) => post('advisor/recommend', body),
+
+    /* AI 选股历史记录（持久化）
+       - 列表：支持 limit / offset / market / code / action / q / pinned
+       - 单条：GET advisor/record?id=...（rows 与 recommend 返回体同构，用于回放）
+       - 复盘：GET advisor/review?id=...&horizons=5,20（保存时点之后的实际表现） */
+    advisorHistory: (params) => get('advisor/history', params, { noDedupe: true }),
+    advisorRecord: (id) => get('advisor/record', { id }, { noDedupe: true }),
+    advisorReview: (id, horizons) => get('advisor/review', {
+      id,
+      horizons: Array.isArray(horizons) ? horizons.join(',') : (horizons || '5,20'),
+    }, { noDedupe: true }),
+    advisorDelete: (id) => post('advisor/delete', { id }),
+    /* 只把「本次真的要改」的字段放进请求体：服务端对缺失字段的语义是保持不变。
+       不能随手补默认值（例如「不传 pinned 就填当前值」）—— 调用方手里的行对象
+       可能是渲染前的旧快照，补默认值会把别的字段一起写脏（实测过备注被置顶请求冲空）。 */
+    advisorNote: (id, note, pinned) => {
+      const body = { id };
+      if (note !== undefined) body.note = note;
+      if (pinned !== undefined) body.pinned = pinned;
+      return post('advisor/note', body);
+    },
+    advisorPrune: (keep) => post('advisor/prune', { keep: keep === undefined ? 0 : keep }),
+
     featuresIndex: () => get('features'),
     feature: (kind, params) => get('features/' + kind, params),
     logs: (params) => get('logs', params),
