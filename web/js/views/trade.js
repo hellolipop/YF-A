@@ -29,6 +29,28 @@
             intent, qty, limitPrice, createdAt, payload }] }
      POST /api/trade/ack    { id, extRef, status? } → { ok, order }
 
+   定时调度（服务端已实现调度线程，本视图只负责把它"讲清楚"）：
+     GET  /api/trade/status?market=cn
+            → { ok, scheduler:{ running, startedAt, step, enabled, scheduler, autoExecute,
+                 mode, market, interval, inSession, ignoreMarketHours, nextOpen, nextRunAt,
+                 lastRunAt, lastResult:{at,market,symbols,analyzed,orders,skipped,filled,
+                 execute,mode}, lastSkip, lastError, runs, planned, filled, skips, note },
+                config:{...}, gates, account, counts, note, updated }
+     POST /api/trade/scheduler { running?:bool, once?:true }
+            → { ok, scheduler:{…}, once?:{ action:'skip'|'planned'|'executed'|'error',
+                 reason?, ts, market, orders?, filled?, skipped?, note?, nextOpen? } }
+        · running 启停调度线程；once:true 额外立即试跑一次。
+        · 试跑语义：跳过「调度开关 / 间隔 / 交易时段」三项限制，但仍要求 enabled=true，
+          且 dryrun 永不成交；dryrun 下 execute 恒为 false。
+     POST /api/trade/config 新增三个布尔键（默认均为 false）：
+        scheduler         是否启用定时自动扫描（关着只能手动扫描）
+        autoExecute       自动扫描后是否自动成交（仅 mode==='paper' 有效）
+        ignoreMarketHours 忽略交易时段（演示 / 回放用）
+        该接口现在同时返回 scheduler 段（服务端保存后会按 scheduler 开关启停线程）。
+
+   三层开关（缺一不可，界面上必须能一眼看出是哪一层没开）：
+     enabled 自动交易总开关 → scheduler 定时调度 → autoExecute 自动成交。
+
    自动交易接口（给「你自己的券商桥接」消费）：
      GET /api/trade/export 取待执行意图 → 外部系统执行 → POST /api/trade/ack 回执。
      X-Trade-Confirm / confirmToken 只是**防误触口令，不是安全边界**：本服务是本机单
@@ -39,14 +61,18 @@
      连不上或断开时由 stream 层自动降级为 15 秒轮询（fallbackTick 复用本视图 pollTick）。
      独立于推送的 15 秒自动刷新保留为最终兜底（可切换为手动）。
 
-   destroy() 约定：置 st.destroyed，关闭推送句柄并清空所有定时器；
-     所有异步回调与推送回调进入时先判 st.destroyed，销毁后绝不再碰 DOM。
+   destroy() 约定：置 st.destroyed，关闭推送句柄并清空所有定时器（15 秒兜底轮询 +
+     20 秒调度区块刷新）；所有异步回调与推送回调进入时先判 st.destroyed，销毁后绝不再碰 DOM。
 
    可测试钩子（data-* 定位，便于自动化用例与人工排查）：
-     [data-host=…] 渲染容器：config/metrics/gates/positions/orders/skipped/plan/fills/export
+     [data-host=…] 渲染容器：config/metrics/gates/positions/orders/skipped/plan/fills/export/
+                   scheduler（定时调度区块）
      [data-cfg=…]  配置控件：enabled/mode/capital/maxWeight/maxPositions/maxOrdersPerDay/
-                   maxOrderAmount/minConfidence/interval/allowReduce/universe/whitelist/webhook
-     [data-act=…]  操作控件：plan/execute/token/confirm-token/reset/export/more/cancel/close/ack
+                   maxOrderAmount/minConfidence/interval/allowReduce/universe/whitelist/webhook/
+                   scheduler/autoExecute/ignoreMarketHours
+     [data-act=…]  操作控件：plan/execute/token/confirm-token/reset/export/more/cancel/close/ack/
+                   scheduler-toggle/scheduler-once
+     [data-sched=…] 调度区块内部：state/layers/metrics/reason/once/note
    ========================================================================== */
 (function () {
   'use strict';
@@ -59,6 +85,7 @@
   const MARKET_LABEL = window.AD.MARKET_LABEL || { cn: 'A股', us: '美股' };
 
   const POLL_MS = 15000;        /* 自动刷新 / 推送降级后的轮询间隔 */
+  const SCHED_MS = 20000;       /* 「定时调度」区块的独立刷新间隔 */
   const ORDERS_LIMIT = 50;      /* 委托单每次拉取条数 */
   const ORDERS_MAX = 200;       /* 本地最多保持的委托单条数（避免无限增长） */
   const FILL_MAX = 40;          /* 成交回报最多保留条数 */
@@ -87,6 +114,11 @@
     buy: '买入', add: '加仓', hold: '持有', reduce: '减仓', sell: '卖出',
     watch: '观望', avoid: '回避', open: '开仓', close: '清仓',
   };
+
+  /* 调度「立即试跑一次」的 action → 文案（契约：skip / planned / executed / error） */
+  const ONCE_LABEL = { skip: '已跳过', planned: '已生成计划', executed: '已执行（有成交）', error: '出错' };
+  /* 三层开关的展示名（顺序即校验顺序：缺一不可） */
+  const LAYER_LABEL = { enabled: '自动交易', scheduler: '定时调度', autoExecute: '自动成交' };
 
   /* ------------------------------------------------------------ 小工具 */
 
@@ -177,10 +209,20 @@
       note: '', cfgHint: '改动即保存（乐观更新，失败自动回滚）', opHint: '',
       cfgFocused: false, cfgPending: false, tokenEdited: false,
       auto: true, destroyed: false,
+      /* 定时调度（GET /api/trade/status 的 scheduler 段，原样落库，不做任何推断） */
+      sched: null, schedErr: '', schedAt: null,
+      /* 上一次「立即试跑一次」的结果（POST /api/trade/scheduler { once:true }） */
+      once: null, onceAt: null, onceBusy: false, onceErr: '',
+      /* 调度启停请求在途标记：在途时禁用「启用/停用调度」避免连点 */
+      schedBusy: false,
+      /* 配置保存在途计数：在途时不用 /api/trade/status 回灌开关状态（避免把乐观更新冲掉） */
+      cfgBusy: 0,
       /* 推送句柄与状态 */
       push: { handle: null, state: '', lastError: '', errToasted: false },
     };
     let timer = null;           /* 15 秒兜底刷新 */
+    let schedTimer = null;      /* 20 秒调度区块刷新（独立定时器） */
+    let schedFetching = false;  /* 调度状态请求在途（用于合并 SSE 成串事件触发的刷新） */
     let pollBusy = false;
 
     const toast = (msg, type) => {
@@ -197,6 +239,7 @@
     const noteHost = h('span', { class: 'hint dim3', dataset: { host: 'note' } });
     const cfgHost = h('div', { dataset: { host: 'config' } });
     const cfgHintHost = h('span', { class: 'hint', text: '改动即保存（乐观更新，失败自动回滚）' });
+    const schedHost = h('div', { dataset: { host: 'scheduler' } });
     const metricHost = h('div', { class: 'metric-list', dataset: { host: 'metrics' } });
     const gateHost = h('div', { class: 'metric-list', dataset: { host: 'gates' } });
     const posHost = h('div', { dataset: { host: 'positions' } });
@@ -275,6 +318,18 @@
       if (status) body.status = status;
       if (typeof api.tradeAck === 'function') return api.tradeAck(id, extRef, status);
       return api.post('trade/ack', body);
+    }
+    /* 调度状态：GET /api/trade/status（回答「为什么现在没动作」的唯一入口）。
+       用 noDedupe 拉取：20 秒定时刷新与「手动试跑后立刻回读」会打到同一个 URL，
+       若被去重复用旧 Promise，试跑后的状态可能反射不回来 */
+    function apiStatus() {
+      if (typeof api.tradeStatus === 'function') return api.tradeStatus(st.market);
+      return api.get('trade/status', { market: st.market }, { noDedupe: true });
+    }
+    /* 调度启停 / 立即试跑：POST /api/trade/scheduler */
+    function apiScheduler(body) {
+      if (typeof api.tradeScheduler === 'function') return api.tradeScheduler(body);
+      return api.post('trade/scheduler', body);
     }
 
     /* 复制：优先剪贴板 API，失败回落到「选中 + execCommand」，都不行就提示手动复制 */
@@ -379,6 +434,8 @@
           h('div', { text: '· 本页的委托、成交、持仓与盈亏全部由本地服务按公开行情模拟撮合并记账，只写本地存储，' +
             '不会向任何券商下单，也不会动到真实资金。' }),
           h('div', { text: '· 「自动交易」总开关默认关闭，需要在下方配置区显式开启；关闭时仍可「立即扫描」出计划，但不会写入成交。' }),
+          h('div', { text: '· 「自动扫描」由服务端的调度线程负责：需「自动交易 + 定时调度」同时开启，默认只在交易时段内动作；' +
+            '三层开关当前状态与「为什么现在没动作」见下方「定时调度」区块。' }),
           h('div', { text: '· 委托单状态流转：待执行（pending）→ 已成交（filled）或已拒绝（rejected）；被风控拦下的标的不会生成委托，' +
             '只记入「被风控拦截」列表并写明原因。' }),
         ]),
@@ -408,11 +465,14 @@
 
     /* --------------------------------------------------------- 配置区 */
 
-    /** 提交配置改动：乐观更新 → POST → 失败回滚（并回滚界面上的输入框） */
+    /** 提交配置改动：乐观更新 → POST → 失败回滚（并回滚界面上的输入框）
+        scheduler / autoExecute / ignoreMarketHours 三个键由服务端在保存后立即生效
+        （并按 scheduler 开关启停调度线程），响应体里带 scheduler 段，这里直接回读重绘。*/
     async function saveConfig(key, value, rollback) {
       if (!st.config) { toast('配置尚未就绪，稍后再试', 'warn'); return; }
       const prev = st.config[key];
       st.config[key] = value;                       /* 乐观更新：界面立即响应 */
+      st.cfgBusy += 1;                              /* 在途期间禁止 status 回灌开关状态 */
       paintTradeState();
       cfgHintHost.textContent = '保存中…（' + key + '）';
       try {
@@ -422,6 +482,12 @@
         if (st.destroyed) return;
         if (res && res.config) st.config = res.config;
         if (res && res.note) st.configNote = res.note;
+        /* 服务端保存后可能已经启停调度线程：有 scheduler 段就如实回读 */
+        if (res && res.scheduler && typeof res.scheduler === 'object') {
+          st.sched = res.scheduler;
+          st.schedErr = '';
+          renderScheduler();
+        }
         cfgHintHost.textContent = '已保存「' + key + '」· ' + F.clock(Date.now()) +
           (st.configNote ? ' · ' + st.configNote : '');
         toast('配置已保存：' + key, 'ok');
@@ -436,10 +502,16 @@
         toast('配置保存失败，已回滚到上一次生效值：' + e.message, 'err');
         renderConfig(true);
         paintTradeState();
+      } finally {
+        st.cfgBusy = Math.max(0, st.cfgBusy - 1);
       }
     }
 
-    function toggleCfg(key, label, title) {
+    /* 布尔开关按钮：与状态 chip 同一判定口径（契约里是布尔，只认 === true）。
+       opts.before = () => bool：**开启前**的二次确认（返回 false 表示用户取消）。
+       取消时：不发请求、不改服务端真相，按钮外观回到 st.config 的真实值，
+       并明确提示「未发起请求」—— 否则用户会以为点了没反应。 */
+    function toggleCfg(key, label, title, opts) {
       const on = !!(st.config && st.config[key] === true);   /* 与状态 chip 同一判定口径（契约里是布尔） */
       const btn = h('button', {
         class: 'btn ghost sm' + (on ? ' active' : ''),
@@ -448,14 +520,40 @@
         title: title || '',
       });
       btn.addEventListener('click', () => {
+        const next = !(st.config && st.config[key] === true);
+        if (next && opts && typeof opts.before === 'function') {
+          let go = false;
+          try { go = opts.before() === true; } catch (e) { go = false; }
+          if (!go) {
+            btn.classList.toggle('active', !!(st.config && st.config[key] === true));
+            toast('已取消开启「' + label + '」，未发起请求', 'info');
+            return;
+          }
+        }
         /* 先把按钮外观切到新状态：乐观更新的即时反馈不能依赖整表重绘
            （重绘可能因为「正在输入」被挂起，也可能在 mousedown 与 click 之间
              把节点换掉，导致这一次点击丢失） */
-        const next = !(st.config && st.config[key] === true);
         btn.classList.toggle('active', next);
         saveConfig(key, next, () => renderConfig(true));
       });
       return btn;
+    }
+
+    /* 「自动成交」的开启确认文案：必须把「只在本机模拟账户内、可随时关闭」和
+       「只有 paper 才可能成交、dryrun 永不成交」两件事都写清楚
+       （不管当前是哪个模式，「dryrun 永不成交」这句都要在，避免用户误以为开了就会成交） */
+    function confirmAutoExecute() {
+      const mode = st.config ? String(st.config.mode || '') : '';
+      const isPaper = mode === 'paper';
+      return window.confirm(
+        '确认开启「自动成交」？\n' +
+        '· 开启后将在交易时段内自动按计划成交，仅发生在本地模拟账户，可随时关闭。\n' +
+        '· 只有 mode=paper（模拟成交）才可能成交，dryrun 永不成交；' +
+        '当前模式：' + (MODE_LABEL[mode] || text(mode, '—')) +
+        (isPaper ? '（当前会按模拟撮合成交）' : '（当前不是 paper，即使开启也不会产生任何成交）') + '。\n' +
+        '· 不会连接任何真实券商通道，也不会产生真实委托。\n' +
+        '确认开启？'
+      );
     }
 
     function numCfg(key, label, title) {
@@ -553,6 +651,25 @@
         numCfg('minConfidence', '置信度门槛', '按服务端口径原样提交，不做百分比换算'),
         numCfg('interval', '扫描间隔（秒）'),
         h('div', { class: 'field' }, [
+          h('label', { text: '定时调度' }),
+          toggleCfg('scheduler', '定时调度',
+            '开启后按 interval 在交易时段内自动扫描；关着时只能手动点「立即扫描」。' +
+            '同时仍要求「自动交易」总开关为开启（三层开关缺一不可）'),
+        ]),
+        h('div', { class: 'field' }, [
+          h('label', { text: '自动成交' }),
+          toggleCfg('autoExecute', '自动成交',
+            '开启后按计划自动成交（开启需二次确认，可随时关闭）。只有 mode=paper 才可能成交，' +
+            'dryrun 永不成交；成交只发生在本地模拟账户，不接任何券商通道',
+            { before: confirmAutoExecute }),
+        ]),
+        h('div', { class: 'field' }, [
+          h('label', { text: '交易时段' }),
+          toggleCfg('ignoreMarketHours', '忽略交易时段（演示）',
+            '非交易时段也会扫描，非交易日会得到与上一交易日相同的结果' +
+            '（服务端无交易日历，只按「周一到周五 + UTC 时段」判定）；仅供演示 / 回放'),
+        ]),
+        h('div', { class: 'field' }, [
           h('label', { text: '减仓' }),
           toggleCfg('allowReduce', '允许减仓', '关闭后只允许开仓 / 加仓，减仓信号会被风控拦下'),
         ]),
@@ -575,6 +692,8 @@
         '标的池 ' + codesOf(cfg.universe).length + ' 个 · 白名单 ' + codesOf(cfg.whitelist).length + ' 个' +
         (cfg.accountId || st.accountId ? ' · 账户 ' + text(cfg.accountId || st.accountId) : '') +
         (cfg.market ? ' · 配置市场 ' + marketText(cfg.market) : '') +
+        (cfg.mode ? ' · 模式 ' + (MODE_LABEL[cfg.mode] || text(cfg.mode)) : '') +
+        ' · 三层开关（缺一不可）：自动交易 → 定时调度 → 自动成交' +
         ' · 所有改动即时 POST /api/trade/config（失败自动回滚）',
       ]));
     }
@@ -591,6 +710,407 @@
         if (!st.cfgFocused && st.cfgPending) { st.cfgPending = false; renderConfig(true); }
       }, 150);
     });
+
+    /* --------------------------------------------------- 定时调度区块
+
+       这一块只回答两个问题：① 现在到底会不会自动跑；② 如果不会，是**哪一层**没开。
+       「为什么现在没动作」不允许出现空答案 —— 一个静默不动的自动化系统比一个报错的系统更难用。 */
+
+    /* 毫秒 / 秒时间戳 / ISO 串 → 毫秒；取不到返回 null（不臆造时间） */
+    function stampMs(v) {
+      if (isNum(v) && v > 0) return v < 1e12 ? v * 1000 : v;
+      if (typeof v === 'string' && v) {
+        const t = Date.parse(v);
+        if (isFinite(t)) return t;
+      }
+      return null;
+    }
+
+    /* MM-DD HH:MM:SS（浏览器本地时区）；无值一律「—」 */
+    function stampText(v) {
+      const ms = stampMs(v);
+      if (ms === null) return '—';
+      const d = new Date(ms);
+      const p = (n) => String(n).padStart(2, '0');
+      return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+        p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    }
+
+    /* 三层开关里的一层：关掉的那一层必须一眼可见（chip warn + 文案「已关闭」） */
+    function layerChip(key, on, title) {
+      return h('span', {
+        class: 'chip' + (on ? '' : ' warn'),
+        text: (LAYER_LABEL[key] || key) + '：' + (on ? '已开启' : '已关闭'),
+        title: title || '',
+      });
+    }
+
+    /* 「为什么现在没动作」：优先级 lastError → lastSkip → running=false → 三层开关未开。 */
+    function idleReason(s) {
+      if (s.lastError) {
+        return { cls: 'down', tag: '上次调度出错', text: String(s.lastError) };
+      }
+      if (s.lastSkip) {
+        return { cls: 'warn', tag: '上次调度被跳过', text: String(s.lastSkip) };
+      }
+      if (s.running !== true) {
+        return {
+          cls: 'warn', tag: '调度未启动',
+          text: '调度线程未运行（running=false）：不会自动扫描；点下方「启用调度」后才会按 interval ' +
+            '在交易时段内自动扫描，在此之前只能手动点「立即扫描」。',
+        };
+      }
+      if (s.enabled !== true) {
+        return {
+          cls: 'warn', tag: '自动交易未开启',
+          text: '自动交易总开关未开启（enabled=false）：调度会被「自动交易总开关未开启」这一步跳过，' +
+            '任何扫描都不会执行。可在上方配置区开启「自动交易（默认关闭）」。',
+        };
+      }
+      if (s.scheduler !== true) {
+        return {
+          cls: 'warn', tag: '定时调度未开启',
+          text: '定时调度未开启（scheduler=false）：每轮调度都会在「定时调度未启用」这一步被跳过，' +
+            '只能手动「立即扫描」出计划。',
+        };
+      }
+      if (s.autoExecute !== true) {
+        return {
+          cls: 'warn', tag: '自动成交未开启',
+          text: '当前只出计划：自动成交未开启（autoExecute=false），调度只会生成 pending 委托，' +
+            '不会写入任何成交。',
+        };
+      }
+      return {
+        cls: 'up', tag: '三层开关均已开启',
+        text: '将在交易时段内按 interval（' + text(s.interval) + ' 秒）自动扫描' +
+          (String(s.mode) === 'paper' ? '并自动成交（仅本地模拟账户）。' : '；当前模式不是 paper，仍不会成交。'),
+      };
+    }
+
+    /* 「立即试跑一次」的结果：skip 显示原因、planned/executed 显示订单与成交笔数、error 显示错误 */
+    function onceText(o) {
+      const act = String((o && o.action) || '');
+      if (act === 'skip') {
+        return '跳过原因：' + text(o.reason, '（服务端未给出原因）') +
+          (stampMs(o.nextOpen) !== null ? '　下次开市 ' + stampText(o.nextOpen) : '');
+      }
+      if (act === 'planned' || act === 'executed') {
+        return '市场 ' + marketText(o.market) + '　生成计划 ' + text(o.orders) + ' 笔 · 成交 ' +
+          text(o.filled) + ' 笔 · 拦截 ' + text(o.skipped) + ' 个' +
+          (o.note ? '　' + o.note : '');
+      }
+      if (act === 'error') return '错误：' + text(o.reason, '（服务端未给出原因）');
+      return '服务端返回了未见过的 action，原样展示：' + text(act, '—') +
+        (o.reason ? '　' + o.reason : '');
+    }
+
+    function renderScheduler() {
+      if (st.destroyed) return;
+      clear(schedHost);
+
+      /* 接口失败：区域内如实提示，并说明下面展示的是「上一次成功读取的值」 */
+      if (st.schedErr) {
+        schedHost.appendChild(h('div', {
+          class: 'legend-inline', style: { marginBottom: '8px', alignItems: 'center', gap: '8px' },
+          dataset: { sched: 'error' },
+        }, [
+          h('span', { class: 'chip down', text: '调度状态获取失败' }),
+          h('span', { class: 'dim', text: st.schedErr, title: st.schedErr }),
+          st.sched
+            ? h('span', { class: 'dim3', text: '（下方为上一次成功读取的状态，可能已过期）' })
+            : null,
+        ]));
+      }
+
+      const s = st.sched;
+      if (!s) {
+        schedHost.appendChild(ui.empty('调度状态未就绪：GET /api/trade/status 无有效返回时展示此空态；' +
+          '本页不会臆造「运行中 / 已停止」，也不会臆造任何调度计数。'));
+        return;
+      }
+
+      const running = s.running === true;
+      const inSession = s.inSession === true;
+      const ignoreHours = s.ignoreMarketHours === true;
+      const mode = String(s.mode || '');
+
+      /* ① 运行状态 + 交易时段 */
+      schedHost.appendChild(h('div', {
+        class: 'legend-inline', style: { alignItems: 'center', gap: '8px' },
+        dataset: { sched: 'state' },
+      }, [
+        h('span', {
+          class: 'chip ' + (running ? 'up' : 'dim'),
+          text: running ? '运行中' : '已停止',
+          title: running
+            ? '调度线程正在运行（running=true，启动于 ' + stampText(s.startedAt) +
+              '，服务端步长 ' + text(s.step) + ' 秒；实际扫描间隔由 interval 决定）'
+            : '调度线程未运行（running=false）：不会自动扫描，只能手动点「立即扫描」',
+        }),
+        h('span', {
+          class: 'chip' + (inSession ? '' : ' warn'),
+          text: inSession ? '交易时段内' : '非交易时段',
+          title: inSession
+            ? '服务端判定当前处于交易时段（' + marketText(s.market) + '）：调度会正常扫描'
+            : '服务端判定当前不在交易时段（' + marketText(s.market) + '）：调度会被跳过' +
+              (ignoreHours ? '（但「忽略交易时段（演示）」已开启，仍会继续扫描）'
+                : '；下次开市 ' + stampText(s.nextOpen)),
+        }),
+        ignoreHours
+          ? h('span', {
+            class: 'chip warn', text: '忽略交易时段（演示）已开启',
+            title: 'ignoreMarketHours=true：非交易时段也会扫描，非交易日会得到与上一交易日相同的结果',
+          })
+          : null,
+        h('span', { class: 'chip', text: '间隔：' + text(s.interval) + ' 秒' }),
+        h('span', { class: 'chip', text: '市场：' + marketText(s.market) }),
+        h('span', {
+          class: 'dim3',
+          text: '状态读取：' + (st.schedAt ? F.clock(st.schedAt) : '—') + '（每 ' + (SCHED_MS / 1000) + ' 秒自动刷新）',
+        }),
+      ]));
+
+      /* ② 三层开关：一行里必须能看出是哪一层没开 */
+      schedHost.appendChild(h('div', {
+        class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center', gap: '8px' },
+        dataset: { sched: 'layers' },
+      }, [
+        layerChip('enabled', s.enabled === true,
+          '第一层 enabled：自动交易总开关；关着时一切都只出计划'),
+        layerChip('scheduler', s.scheduler === true,
+          '第二层 scheduler：定时调度开关；关着时调度每轮都会在「定时调度未启用」被跳过'),
+        layerChip('autoExecute', s.autoExecute === true,
+          '第三层 autoExecute：自动成交开关；关着时调度只生成 pending 计划。' +
+          '即使开着，也只有 mode=paper 会成交，dryrun 永不成交'),
+        h('span', {
+          class: 'chip' + (mode === 'paper' ? ' accent' : ''),
+          text: '模式：' + (MODE_SHORT[mode] || text(mode)),
+          title: mode === 'paper'
+            ? 'paper：按模拟撮合成交（仍只写本地模拟账户，不接任何券商通道）'
+            : 'dryrun：只出计划，永不成交（autoExecute 开着也不会成交）',
+        }),
+      ]));
+
+      /* ③ 指标 */
+      const lr = (s.lastResult && typeof s.lastResult === 'object') ? s.lastResult : null;
+      const hasNextRun = stampMs(s.nextRunAt) !== null;
+      const hasNextOpen = stampMs(s.nextOpen) !== null;
+      const nextTitle = hasNextRun
+        ? '来源：服务端 nextRunAt（上次扫描时间 + interval 的推算值）' +
+          (running ? '' : '；调度已停止，这只是推算值，不会真的触发')
+        : (hasNextOpen
+          ? '来源：服务端 nextOpen（下次开市；处于交易时段内时通常为空）'
+          : '服务端未给出 nextRunAt / nextOpen，如实显示「—」');
+      const cells = [
+        ['累计调度', text(s.runs) + ' 次', '', '服务端 runs：调度线程累计完成的扫描轮次'],
+        ['生成计划', text(s.planned) + ' 笔', '', '服务端 planned：累计生成的委托计划笔数'],
+        ['自动成交', text(s.filled) + ' 笔', isNum(s.filled) && s.filled > 0 ? 'up' : 'dim',
+          '服务端 filled：累计自动成交笔数；dryrun 恒为 0'],
+        ['跳过', text(s.skips) + ' 次', isNum(s.skips) && s.skips > 0 ? 'dim' : '',
+          '服务端 skips：因「调度未启用 / 自动交易未开 / 非交易时段」等被跳过的累计次数' +
+          '（未到间隔的静默跳过不计入）'],
+        ['上次扫描', stampText(s.lastRunAt), '', '服务端 lastRunAt；从未扫描过时为「—」'],
+        ['上次结果', lr
+          ? ('研判 ' + text(lr.analyzed) + ' 只 · 计划 ' + text(lr.orders) + ' 笔 · 成交 ' +
+            text(lr.filled) + ' 笔 · 耗时 —')
+          : '—',
+          '',
+          lr
+            ? ('拦截 ' + text(lr.skipped) + ' 个 · 标的 ' + text(lr.symbols) + ' 个 · 市场 ' +
+              marketText(lr.market) + ' · execute=' + text(lr.execute) + ' · 模式 ' + text(lr.mode) +
+              ' · 扫描时间 ' + stampText(lr.at) +
+              '｜服务端 lastResult 未提供耗时字段，如实显示「—」')
+            : '服务端尚未产生过成功的扫描结果（lastResult 为 null）'],
+        ['下次预计', stampText(hasNextRun ? s.nextRunAt : (hasNextOpen ? s.nextOpen : null)), '', nextTitle],
+      ];
+      const metricWrap = h('div', {
+        class: 'metric-list', style: { marginTop: '8px' }, dataset: { sched: 'metrics' },
+      });
+      cells.forEach((c) => metricWrap.appendChild(metricCell(c[0], c[1], c[2], c[3])));
+      schedHost.appendChild(metricWrap);
+
+      /* ④ 为什么现在没动作（永远给出一个答案） */
+      const r = idleReason(s);
+      schedHost.appendChild(h('div', {
+        class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center', gap: '8px' },
+        dataset: { sched: 'reason' },
+      }, [
+        h('span', { class: 'chip ' + r.cls, text: '为什么现在没动作：' + r.tag }),
+        h('span', { class: 'dim', text: r.text, title: r.text }),
+      ]));
+
+      /* ⑤ 启停 + 立即试跑 */
+      schedHost.appendChild(h('div', {
+        style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' },
+      }, [
+        h('button', {
+          class: 'btn ' + (running ? '' : 'primary') + ' sm',
+          text: running ? '停用调度' : '启用调度',
+          dataset: { act: 'scheduler-toggle' },
+          disabled: st.schedBusy,
+          title: running
+            ? 'POST /api/trade/scheduler { running:false }：停止调度线程（不会撤销已生成的委托）'
+            : 'POST /api/trade/scheduler { running:true }：启动调度线程；' +
+              '仍受「自动交易 / 定时调度」开关与交易时段约束',
+          on: { click: () => toggleScheduler(!running) },
+        }),
+        h('button', {
+          class: 'btn sm', text: st.onceBusy ? '试跑中…' : '立即试跑一次',
+          dataset: { act: 'scheduler-once' },
+          disabled: st.onceBusy,
+          title: 'POST /api/trade/scheduler { once:true }：立即试跑一次。' +
+            '跳过「调度开关 / 间隔 / 交易时段」三项限制，但仍要求「自动交易」总开关为开启；' +
+            'dryrun 永不成交（试跑不是绕过总开关的后门）',
+          on: { click: runOnce },
+        }),
+        h('span', {
+          class: 'dim3',
+          text: '试跑只为确认链路是否通：不绕过总开关，不会在 dryrun 下成交',
+        }),
+      ]));
+
+      const onceHost = h('div', {
+        class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center', gap: '8px' },
+        dataset: { sched: 'once' },
+      });
+      if (st.onceErr) {
+        onceHost.appendChild(h('span', { class: 'chip down', text: '试跑请求失败' }));
+        onceHost.appendChild(h('span', { class: 'dim', text: st.onceErr, title: st.onceErr }));
+      } else if (st.once) {
+        const act = String(st.once.action || '');
+        const cls = act === 'error' ? 'down'
+          : (act === 'skip' ? 'warn' : (act === 'executed' ? 'up' : 'accent'));
+        const label = ONCE_LABEL[act] || text(act);
+        onceHost.appendChild(h('span', {
+          class: 'chip ' + cls,
+          text: '试跑结果：' + label + '（' + timeText(st.onceAt || st.once.ts) + '）',
+        }));
+        onceHost.appendChild(h('span', {
+          class: 'dim', text: onceText(st.once), title: onceText(st.once),
+        }));
+      } else {
+        onceHost.appendChild(h('span', {
+          class: 'dim3', text: '尚未试跑：点「立即试跑一次」可跳过开关 / 间隔 / 时段限制跑一轮（仍要求总开关开启）',
+        }));
+      }
+      schedHost.appendChild(onceHost);
+
+      /* ⑥ 服务端调度口径说明（原文截断展示，全文挂 title） */
+      if (s.note) {
+        schedHost.appendChild(h('div', {
+          class: 'hint dim3', style: { marginTop: '8px' }, dataset: { sched: 'note' },
+          title: String(s.note), text: clip(s.note, 150),
+        }));
+      }
+    }
+
+    /* /api/trade/status 里的 scheduler 段带三层开关的生效值。若与本页 st.config 不一致
+       （例如另一个标签页改过配置），在「配置区没有正在输入 / 没有在途保存」时回灌 ——
+       否则会把用户编辑到一半的开关外观改掉，也会冲掉乐观更新。 */
+    function syncCfgFromSched() {
+      const s = st.sched;
+      if (!s || !st.config || st.cfgBusy > 0 || st.cfgFocused) return;
+      let changed = false;
+      ['enabled', 'scheduler', 'autoExecute', 'ignoreMarketHours'].forEach((k) => {
+        if (typeof s[k] !== 'boolean') return;
+        if (st.config[k] !== s[k]) { st.config[k] = s[k]; changed = true; }
+      });
+      if (typeof s.mode === 'string' && s.mode && st.config.mode !== s.mode) {
+        st.config.mode = s.mode;
+        changed = true;
+      }
+      if (changed) { renderConfig(); paintTradeState(); }
+    }
+
+    async function loadScheduler(silent) {
+      if (st.destroyed) return;
+      /* 一次扫描会连着推多个 order / fill 事件，这里做「在途合并」：
+         已有一次请求在途时不再叠加，避免成串的重复 GET（下一拍会补上） */
+      if (schedFetching) return;
+      schedFetching = true;
+      try {
+        const res = await apiStatus();
+        if (st.destroyed) return;
+        st.schedErr = '';
+        st.schedAt = Date.now();
+        st.sched = (res && res.scheduler && typeof res.scheduler === 'object') ? res.scheduler : null;
+        syncCfgFromSched();
+        renderScheduler();
+        if (!st.sched && !silent) toast('调度状态接口未返回 scheduler：GET /api/trade/status', 'warn');
+      } catch (e) {
+        if (st.destroyed) return;
+        st.schedErr = e.message;
+        renderScheduler();
+        if (!silent) toast('调度状态获取失败：' + e.message, 'err');
+      } finally {
+        schedFetching = false;
+      }
+    }
+
+    /* 启停调度线程：POST /api/trade/scheduler { running } */
+    async function toggleScheduler(want) {
+      if (st.schedBusy) return;
+      st.schedBusy = true;
+      renderScheduler();                       /* 立即置灰按钮，避免连点发出两次请求 */
+      try {
+        const res = await apiScheduler({ running: want === true });
+        if (st.destroyed) return;
+        st.schedBusy = false;
+        st.schedErr = '';
+        if (res && res.scheduler && typeof res.scheduler === 'object') {
+          st.sched = res.scheduler;
+        } else {
+          await loadScheduler(true);           /* 没带回 scheduler 段：立刻回读一次，不猜 */
+          if (st.destroyed) return;
+        }
+        syncCfgFromSched();
+        renderScheduler();
+        const rs = st.sched || {};
+        toast((rs.running === true ? '调度已启动' : '调度已停止') +
+          '（三层开关：' + (rs.enabled === true ? '自动交易✓' : '自动交易✗') + ' ' +
+          (rs.scheduler === true ? '定时调度✓' : '定时调度✗') + ' ' +
+          (rs.autoExecute === true ? '自动成交✓' : '自动成交✗') + '）', 'ok');
+      } catch (e) {
+        if (st.destroyed) return;
+        st.schedBusy = false;
+        renderScheduler();
+        toast('调度' + (want ? '启用' : '停用') + '失败：' + e.message, 'err');
+      }
+    }
+
+    /* 立即试跑一次：POST /api/trade/scheduler { once:true } */
+    async function runOnce() {
+      if (st.onceBusy) return;
+      st.onceBusy = true;
+      st.onceErr = '';
+      renderScheduler();
+      try {
+        const res = await apiScheduler({ once: true });
+        if (st.destroyed) return;
+        st.onceBusy = false;
+        st.once = (res && res.once && typeof res.once === 'object') ? res.once : null;
+        st.onceErr = st.once ? '' : '接口未返回 once 字段（POST /api/trade/scheduler）';
+        st.onceAt = Date.now();
+        if (res && res.scheduler && typeof res.scheduler === 'object') st.sched = res.scheduler;
+        syncCfgFromSched();
+        renderScheduler();
+        await loadScheduler(true);             /* 试跑可能改变计数与 lastResult：回读一次 */
+        if (st.destroyed) return;
+        const act = st.once ? String(st.once.action || '') : '';
+        if (act === 'error') toast('试跑失败：' + text(st.once.reason, '服务端未给出原因'), 'err');
+        else if (act === 'skip') toast('试跑被跳过：' + text(st.once.reason, '服务端未给出原因'), 'warn');
+        else if (act) toast('试跑完成：生成计划 ' + text(st.once.orders) + ' 笔，成交 ' + text(st.once.filled) + ' 笔', 'ok');
+        else toast(st.onceErr || '试跑已发起，但服务端未返回结果', 'warn');
+      } catch (e) {
+        if (st.destroyed) return;
+        st.onceBusy = false;
+        st.once = null;
+        st.onceErr = e.message;                /* 失败也留在区域内，不只在 toast 里一闪而过 */
+        renderScheduler();
+        toast('试跑失败：' + e.message, 'err');
+      }
+    }
 
     /* ----------------------------------------------------- 账户总览 */
 
@@ -1379,6 +1899,7 @@
         loadConfig(true),
         loadAccount(silent),
         loadOrders(false, silent),
+        loadScheduler(silent),
       ]);
     }
 
@@ -1418,6 +1939,8 @@
         st.note = String(payload.note || payload.message);
         paintNote();
       }
+      /* 定时调度的产出会推 order 事件：顺带把调度区块（计数 / 上次结果）刷新一次 */
+      loadScheduler(true);
     }
 
     /* fill：追加一条成交回报流水，并同步账户与对应委托单行 */
@@ -1435,6 +1958,8 @@
       if (o.id) { upsertOrder(o); renderOrders(); }
       /* 推送没带账户体：补拉一次，保证总览与持仓跟得上成交 */
       if (!applyAccountPayload(payload)) loadAccount(true);
+      /* 自动成交也会推 fill 事件：同步刷新调度区块（自动成交笔数 / 上次结果） */
+      loadScheduler(true);
     }
 
     function onStreamAccount(payload) {
@@ -1537,6 +2062,8 @@
       ui.section('这是什么 / 怎么用', '模拟盘说明 · 自动交易接口 · 连接状态', [], noticeHost),
       ui.section('自动交易配置', '改动即保存（乐观更新，失败自动回滚）；总开关默认关闭', [],
         h('div', {}, [cfgHost, h('div', { class: 'legend-inline', style: { marginTop: '8px' } }, [cfgHintHost])])),
+      ui.section('定时调度', '服务端调度线程的真实状态（GET /api/trade/status，每 20 秒刷新）：' +
+        '三层开关缺一不可，并如实说明「为什么现在没动作」', [], schedHost),
       ui.section('账户总览', '服务端在首次读取 /api/trade/account 时创建模拟账户（本页不臆造账户）', [], metricHost),
       ui.section('风控快照', '当前生效上限：优先取服务端 gates，缺失项回落配置值并如实标注来源', [], gateHost),
       ui.section('持仓', '「平仓」按最新报价模拟撮合（POST /api/trade/close）；无报价时最新价显示「—」', [], posHost),
@@ -1552,6 +2079,7 @@
 
     renderNotice();
     renderConfig(true);
+    renderScheduler();
     renderMetrics();
     renderGates();
     renderPositions();
@@ -1566,10 +2094,10 @@
     paintNote();
 
     (async () => {
-      /* 启动顺序：先配置（口令默认值）、再账户与委托单，最后订阅推送 */
+      /* 启动顺序：先配置（口令默认值）、再调度状态 / 账户与委托单，最后订阅推送 */
       await loadConfig(true);
       if (st.destroyed) return;
-      await Promise.all([loadAccount(true), loadOrders(false, true)]);
+      await Promise.all([loadAccount(true), loadOrders(false, true), loadScheduler(true)]);
       if (st.destroyed) return;
       startStream();
     })();
@@ -1579,12 +2107,20 @@
       pollTick();
     }, POLL_MS);
 
+    /* 调度区块的独立刷新：比 15 秒兜底轮询慢一拍，也不受「自动刷新」开关影响
+       —— 用户手动关掉自动刷新时，「为什么没动作」仍然要保持新鲜 */
+    schedTimer = setInterval(() => {
+      if (st.destroyed || !root.isConnected) return;
+      loadScheduler(true);
+    }, SCHED_MS);
+
     return {
       refresh: () => refreshAll(false),
       destroy() {
         st.destroyed = true;          /* 先置位：之后所有回调一律直接返回 */
         closeStream();
         if (timer) { clearInterval(timer); timer = null; }
+        if (schedTimer) { clearInterval(schedTimer); schedTimer = null; }
       },
     };
   }

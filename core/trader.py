@@ -93,9 +93,12 @@ mode 时按 ``"paper"`` 处理，便于服务端单独查模拟成交账户。
 
 from __future__ import annotations
 
+import datetime
 import functools
 import inspect
 import re
+import threading
+import time
 import uuid
 
 from . import advisor as A
@@ -167,6 +170,11 @@ DEFAULT_CONFIG = {
     "maxOrderAmount": 50000.0,  # 单笔金额上限（超出则缩减，不是跳过）
     "minConfidence": 0.25,      # 触发下单的最低置信度
     "allowReduce": True,        # 是否允许自动减仓 / 卖出
+    #: 定时调度（把「自动交易」的『自动』补上）。两个开关默认都为 False：
+    #: 关掉调度时，一切动作都只能由用户点击触发，这是最安全的默认。
+    "scheduler": False,         # 是否启用定时自动扫描（受 enabled 与交易时段约束）
+    "autoExecute": False,       # 自动扫描后是否**自动成交**（仅 paper 模式有效；dryrun 永不成交）
+    "ignoreMarketHours": False,  # 忽略交易时段（演示 / 回放用，非交易日会得到与上一交易日相同的结果）
     "universe": [],             # 自动扫描的标的池（代码数组，去重大写）
     "whitelist": [],            # 交易白名单（非空时只允许这些代码）
     "interval": 60,             # 自动扫描间隔（秒，夹取到 15..3600）
@@ -182,7 +190,9 @@ CONFIG_NOTE = (
     "配置口径：enabled 默认 False（装好引擎也不会自己下单）；mode 默认 dryrun"
     "（只生成计划、不成交）；capital 既是模拟账户本金，也是仓位计算的基准；"
     "maxWeight / maxOrderAmount / 可用现金三者取最小后**向下取整到整手**；"
-    "非法输入不抛异常，一律回退默认值并夹取到合理区间。"
+    "scheduler（定时自动扫描）与 autoExecute（自动成交）默认同样为 False —— "
+    "三层开关都打开、且处于交易时段内，才会出现「无人值守也自动成交」，"
+    "并且成交只发生在本地模拟账户里；非法输入不抛异常，一律回退默认值并夹取到合理区间。"
 )
 ORDER_NOTE = (
     "委托单口径：qty 已向下取整到整手（core.kelly.LOTS）；limitPrice 是计划时的当前价、"
@@ -486,6 +496,10 @@ def normalize_config(patch, base=None):
         "maxOrderAmount": _amount(pick("maxOrderAmount"), DEFAULT_CONFIG["maxOrderAmount"]),
         "minConfidence": _rate(pick("minConfidence"), DEFAULT_CONFIG["minConfidence"]),
         "allowReduce": _bool(pick("allowReduce"), DEFAULT_CONFIG["allowReduce"]),
+        "scheduler": _bool(pick("scheduler"), DEFAULT_CONFIG["scheduler"]),
+        "autoExecute": _bool(pick("autoExecute"), DEFAULT_CONFIG["autoExecute"]),
+        "ignoreMarketHours": _bool(pick("ignoreMarketHours"),
+                                   DEFAULT_CONFIG["ignoreMarketHours"]),
         "universe": _codes(pick("universe"), DEFAULT_CONFIG["universe"]),
         "whitelist": _codes(pick("whitelist"), DEFAULT_CONFIG["whitelist"]),
         "interval": _int_in(pick("interval"), DEFAULT_CONFIG["interval"], *INTERVAL_RANGE),
@@ -1980,3 +1994,348 @@ def trade_snapshot(store, config, quotes=None):
         "feeTotal": _r(extra["feeTotal"], ND_MONEY),
         "note": (CONFIG_NOTE + "｜" + ACCOUNT_NOTE),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 交易时段与定时调度：把「自动交易」里真正的『自动』补上
+# --------------------------------------------------------------------------- #
+#: 常规交易时段（UTC，周一到周五）。用 **UTC** 而不是「本机时区」：用户机器未必在
+#: Asia/Shanghai，写死 UTC 才不会因为时区设置而判断错开市时间。
+#: · A股：09:30–11:30 / 13:00–15:00 北京时间 = 01:30–03:30 / 05:00–07:00 UTC（全年不变）
+#: · 美股：09:30–16:00 美东 = 13:30–20:00 UTC（夏令时）/ 14:30–21:00 UTC（冬令时）。
+#:   这里取 13:30–21:00 的**并集**，前后各多放宽 30 分钟 —— 没有交易日历与冬夏令时库的
+#:   前提下，多扫一次最坏结果是「拿到与上一交易日相同的静态行情、生成同样的计划」，
+#:   而因为夏令时切换整天不扫，才是真正的漏检。
+SESSIONS_UTC = {
+    "cn": (((1, 30), (3, 30)), ((5, 0), (7, 0))),
+    "us": (((13, 30), (21, 0)),),
+}
+
+SCHEDULER_NOTE = (
+    "定时调度口径：需要 **enabled + scheduler** 同时开启才会动作；"
+    "autoExecute 默认关闭 —— 关着的时候调度只生成计划（等价于无人值守的 dryrun），"
+    "打开后且 mode=paper 才会自动成交（仍只发生在本地模拟账户里）。"
+    "默认只在常规交易时段内扫描（周一到周五，按 UTC 判定，无交易日历：节假日会照常判定"
+    "为开市，此时行情是上一交易日的静态数据，结果与上一交易日相同，不会造成错误成交）；"
+    "ignoreMarketHours 可关掉时段判断，仅供演示与回放。单次调度不重叠，间隔夹取 15~3600 秒。"
+)
+
+
+def _sched_minutes(ts):
+    """UTC 分钟数与星期（调度判定用）"""
+    dt = datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc)
+    return dt.weekday(), dt.hour * 60 + dt.minute
+
+
+def in_session(market, ts=None):
+    """当前是否处于该市场的常规交易时段（UTC 判定，只看周一到周五）。
+
+    这是一个**粗判**：没有交易日历，所以节假日会被判成开市。这个偏差对自动交易是安全的
+    （节假日行情是静态的，生成的是与上一交易日相同的计划，不会产生错误成交），
+    但会在节假日多打一次上游请求 —— 取舍写在 SCHEDULER_NOTE 里，不藏着。
+    """
+    mkt = _market(market)
+    stamp = int(ts if ts is not None else time.time())
+    # 容忍毫秒：next_session_open() 返回的是毫秒时间戳，若把它直接喂回来（很自然的用法）
+    # 会被当成「公元 5 万年」而抛 ValueError。这里统一按秒处理，避免两个函数单位不一致。
+    if stamp > 100000000000:      # > 1e11 只可能是毫秒
+        stamp //= 1000
+    weekday, minutes = _sched_minutes(stamp)
+    if weekday >= 5:
+        return False
+    for (sh, sm), (eh, em) in SESSIONS_UTC.get(mkt, ()):
+        if sh * 60 + sm <= minutes < eh * 60 + em:
+            return True
+    return False
+
+
+def next_session_open(market, ts=None):
+    """下一次开市的 UTC 毫秒时间戳（界面上显示「下次扫描」用）。
+
+    逐分钟向前试，最多找 7 天：判定函数本身极便宜，而这个值只在状态查询时算一次，
+    没有必要为它引入交易日历。
+    """
+    stamp = int(ts if ts is not None else time.time())
+    step = 60
+    for i in range(1, 7 * 24 * 60 + 1):
+        probe = stamp + i * step
+        if in_session(market, probe):
+            return probe * 1000
+    return None
+
+
+class TradeScheduler:
+    """定时自动扫描调度器。
+
+    为什么单独做一个类而不是在 server 里塞个线程：调度逻辑（是否该跑、跑成什么结果、
+    跳过原因）是**可测的业务判断**，必须能在没有线程、没有网络的情况下用 `tick_once()`
+    直接验证；线程只是它的外壳。
+
+    安全边界（三层开关，缺一不可，默认全关）：
+    1. ``enabled``     自动交易总开关 —— 关着时一切都只出计划；
+    2. ``scheduler``   定时调度开关 —— 关着时只能手动点扫描；
+    3. ``autoExecute`` 自动成交开关 —— 关着时调度只生成 pending 计划；且只有
+       ``mode == "paper"`` 才会成交，dryrun 永远不成交。
+
+    另外：默认只在交易时段内动作；单次调度不重叠（锁）；任何异常都不会让调度线程退出
+    （异常写进 ``lastError`` 并在下一次继续尝试），否则一次网络抖动就会让「自动」永久失效
+    而用户毫无察觉。
+    """
+
+    def __init__(self, store, recommend_fn, fetch_quotes=None, market=None,
+                 clock=time.time, step=5.0, on_result=None, log=None):
+        self.store = store
+        self.recommend_fn = recommend_fn
+        self.fetch_quotes = fetch_quotes
+        self.market_override = market
+        self.clock = clock
+        self.step = max(0.05, float(step))
+        self.on_result = on_result
+        self.log = log
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self.started_at = None
+        self.last_run_at = None
+        self.last_result = None
+        self.last_error = None
+        self.last_skip = None
+        #: 上一次被跳过的原因：用于「同一原因只计一次」，见 _skip()
+        self._last_skip_reason = None
+        self.runs = 0
+        self.planned = 0
+        self.filled = 0
+        self.skips = 0
+
+    # ------------------------------------------------------------------ 生命周期 --
+    def running(self):
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def start(self):
+        """启动调度线程（幂等）"""
+        if self.running():
+            return self.status()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="trade-scheduler", daemon=True)
+        self._thread.start()
+        self.started_at = int(self.clock() * 1000)
+        self._log("info", "scheduler.started", step=self.step)
+        return self.status()
+
+    def stop(self, timeout=2.0):
+        """停止调度线程（幂等）"""
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._log("info", "scheduler.stopped", runs=self.runs)
+        return self.status()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self.tick_once()
+            except Exception as exc:  # noqa: BLE001  调度线程绝不能因为单次异常退出
+                self.last_error = str(exc)[:200]
+                self._log("error", "scheduler.tick_failed", error=str(exc)[:200])
+            self._stop.wait(self.step)
+
+    def _log(self, level, event, **fields):
+        # 守卫是「有没有注入」而不是「可不可调用」：项目自带的 core.logs.Logger 提供
+        # info/error 方法但并不实现 __call__，用 callable() 判断会把它的日志**全部静默丢弃**
+        # （表现为功能正常但事后什么都查不到）
+        if self.log is None:
+            return
+        try:
+            getattr(self.log, level)(event, **fields)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------ 单次调度 --
+    def tick_once(self, force=False, now=None):
+        """执行一次调度判断（可离线测试）。
+
+        返回 ``{"action": "skip"|"planned"|"executed"|"error", ...}``：无论是跳过还是
+        执行，都带上**原因或结果**，这样「为什么没动」在界面上永远有答案 ——
+        一个静默不动的自动化系统比一个报错的系统更难用。
+        """
+        stamp = float(now if now is not None else self.clock())
+        if not self._lock.acquire(blocking=False):
+            # 走统一的 _skip：否则「锁竞争」这条路径既不计入日志、又绕过同原因去重
+            # （实测连续两次争用会让 skips 直接 +2）
+            return self._skip("上一次调度尚未结束")
+        try:
+            return self._tick_locked(stamp, force)
+        finally:
+            self._lock.release()
+
+    def _tick_locked(self, stamp, force):
+        cfg = get_config(self.store)
+        # 构造时传入的 market 应当覆盖配置（此前这个参数只被赋值、从未被读取，
+        # 是个「看着能用其实无效」的陷阱参数）
+        market = _market(self.market_override or cfg.get("market"))
+        if force:
+            pass
+        elif not cfg.get("scheduler"):
+            return self._skip("定时调度未启用（配置 scheduler=false）")
+        if not cfg.get("enabled"):
+            return self._skip("自动交易总开关未开启（enabled=false）")
+        interval = _int_in(cfg.get("interval"), DEFAULT_CONFIG["interval"], *INTERVAL_RANGE)
+        if not force and self.last_run_at is not None:
+            elapsed = stamp - self.last_run_at / 1000.0
+            if elapsed < interval:
+                return self._skip("未到调度间隔（%d 秒，已过 %.0f 秒）" % (interval, elapsed),
+                                  quiet=True)
+        if not force and not cfg.get("ignoreMarketHours") and not in_session(market, stamp):
+            # force（界面上的「立即试跑」）跳过时段限制：试跑的目的正是「收盘后也想确认链路
+            # 通不通」，若还要求交易时段，这个按钮在最需要它的时候就永远只回答「非交易时段」。
+            return self._skip("非交易时段（%s）；ignoreMarketHours 可关掉此判断" % market,
+                              extra={"nextOpen": next_session_open(market, stamp)})
+        symbols = list(cfg.get("universe") or []) or list(cfg.get("whitelist") or [])
+        if not symbols:
+            return self._skip("标的池为空：请在配置里填写 universe（或 whitelist）")
+        execute = bool(cfg.get("autoExecute")) and cfg.get("mode") == "paper"
+        try:
+            # 先只出计划（execute=False），需要成交时再单独按**最新报价**执行 ——
+            # 与手动路径（/api/trade/plan → /api/trade/execute）完全同口径。
+            # scan 内部的成交只能用研判快照价，而自动成交发生在快照之后，理应拿最新的价；
+            # 这也是本类持有 fetch_quotes 的唯一用途。
+            res = scan(self.store, cfg, self.recommend_fn, market=market, execute=False)
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)[:200]
+            self._log("error", "scheduler.scan_failed", market=market, error=str(exc)[:200])
+            return {"action": "error", "reason": str(exc)[:200], "ts": int(stamp * 1000)}
+        self.last_run_at = int(stamp * 1000)
+        # 研判整体失败必须记成错误，而不是「已生成 0 笔计划」：scan 内部把上游异常吞成了
+        # 一句 note + error 字段，如果这里只看 orders/filled，一次全量取数失败会显示成
+        # 「本轮无操作」—— 用户会以为自动化在正常工作，这是最危险的静默失败
+        if res.get("error") or (res.get("adviceSummary") or {}).get("analyzed") == 0:
+            self.runs += 1
+            self.last_error = str(res.get("error") or res.get("note") or "研判未产出任何标的")
+            self.last_skip = None
+            self._log("error", "scheduler.scan_empty", market=market,
+                      error=self.last_error[:200], symbols=len(symbols))
+            return {"action": "error", "reason": self.last_error[:200],
+                    "ts": self.last_run_at, "market": market,
+                    "symbols": len(symbols), "result": res.get("adviceSummary")}
+        self.runs += 1
+        planned = len(res.get("orders") or [])
+        filled = 0
+        if execute:
+            # 按最新报价成交：报价取不到时**照样尝试**（execute_orders 会按无有效价格记
+            # rejected 并写明原因），而不是静默跳过 —— 自动成交失败必须留下痕迹
+            pending = [o for o in (res.get("orders") or []) if o.get("status") == "pending"]
+            quotes, source = [], "none"
+            if pending and callable(self.fetch_quotes):
+                try:
+                    quotes = self.fetch_quotes(market, [o.get("code") for o in pending]) or []
+                    source = "live" if quotes else "none"
+                except Exception as exc:  # noqa: BLE001
+                    self._log("error", "scheduler.quote_failed", error=str(exc)[:200])
+            if pending and not quotes:
+                # 取不到实时报价时回退到**计划时的价格**（order.signalPrice / limitPrice）：
+                # 宁可「按最近可得价格成交、并把来源标成 snapshot」，也不要因为一次取数失败
+                # 把所有委托都记成 rejected —— 后者在界面上表现为「自动交易全是拒单」，
+                # 用户会以为策略出了问题，其实是行情源抖了一下。
+                quotes = [{"code": o.get("code"), "market": market,
+                           "price": o.get("signalPrice") or o.get("limitPrice")}
+                          for o in pending]
+                source = "snapshot"
+            if pending:
+                try:
+                    done = execute_orders(self.store, cfg, pending, quotes)
+                    filled = int(done.get("filled") or 0)
+                    by_id = {o.get("id"): o for o in (done.get("orders") or [])}
+                    res["orders"] = [by_id.get(o.get("id"), o) for o in (res.get("orders") or [])]
+                    res["filled"] = filled
+                    res["account"] = done.get("account") or res.get("account")
+                    res["executed"] = True
+                    res["priceSource"] = source
+                    if source != "live":
+                        self._log("info", "scheduler.price_fallback", source=source,
+                                  orders=len(pending))
+                except Exception as exc:  # noqa: BLE001  成交失败不该让整轮调度算失败
+                    self.last_error = str(exc)[:200]
+                    self._log("error", "scheduler.execute_failed", error=str(exc)[:200])
+        else:
+            res["filled"] = 0
+        self.planned += planned
+        self.filled += filled
+        self.last_result = {
+            "at": self.last_run_at, "market": market, "symbols": len(symbols),
+            "analyzed": (res.get("adviceSummary") or {}).get("analyzed"),
+            "orders": planned, "skipped": len(res.get("skipped") or []),
+            "filled": filled, "execute": execute, "mode": cfg.get("mode"),
+        }
+        self.last_skip = None
+        self._last_skip_reason = None    # 真正跑过一轮后，下次同原因的跳过重新计数
+        self.last_error = None
+        self._log("info", "scheduler.tick",
+                  market=market, mode=cfg.get("mode"), execute=execute,
+                  orders=planned, filled=filled, analyzed=self.last_result["analyzed"])
+        if callable(self.on_result):
+            try:
+                self.on_result(res, cfg)
+            except Exception:  # noqa: BLE001  推送失败不影响调度
+                pass
+        return {
+            "action": "executed" if filled else "planned",
+            "ts": self.last_run_at, "market": market, "execute": execute,
+            "mode": cfg.get("mode"),
+            "orders": planned, "filled": filled,
+            "skipped": len(res.get("skipped") or []),
+            "result": self.last_result,
+            "note": ("自动成交 %d 笔（仅模拟账户）" % filled) if filled
+                    else ("已生成 %d 笔计划（未自动成交：%s）" % (
+                        planned, "autoExecute 未开启" if not cfg.get("autoExecute")
+                        else "dryrun 模式不成交")),
+        }
+
+    def _skip(self, reason, quiet=False, extra=None):
+        """记录一次跳过。
+
+        ``skips`` 只在**跳过原因发生变化**时累加：调度线程每 5 秒醒一次，
+        「非交易时段」这种整晚都成立的原因若每次都累加，一天就能堆到上万次，
+        这个指标会彻底失去意义（实测联调时半小时内就被这类噪声顶起来）。
+        原因不变时不重复计数、也不重复写日志，但 ``lastSkip`` 始终保持最新值 ——
+        界面上「为什么没动作」永远有答案，只是不会被同一个原因刷屏。
+        """
+        self.last_skip = reason
+        if not quiet:
+            if reason != self._last_skip_reason:
+                self.skips += 1
+                self._log("info", "scheduler.skip", reason=reason)
+            self._last_skip_reason = reason
+        out = {"action": "skip", "reason": reason, "ts": int(self.clock() * 1000)}
+        if extra:
+            out.update(extra)
+        return out
+
+    # ------------------------------------------------------------------ 状态 --
+    def status(self):
+        cfg = get_config(self.store)
+        return {
+            "running": self.running(),
+            "startedAt": self.started_at,
+            "step": self.step,
+            "enabled": bool(cfg.get("enabled")),
+            "scheduler": bool(cfg.get("scheduler")),
+            "autoExecute": bool(cfg.get("autoExecute")),
+            "mode": cfg.get("mode"),
+            "market": _market(cfg.get("market")),
+            "interval": cfg.get("interval"),
+            "inSession": in_session(cfg.get("market"), self.clock()),
+            "ignoreMarketHours": bool(cfg.get("ignoreMarketHours")),
+            "nextOpen": next_session_open(cfg.get("market"), self.clock()),
+            "nextRunAt": (self.last_run_at + int((cfg.get("interval") or 60) * 1000))
+            if self.last_run_at else None,
+            "lastRunAt": self.last_run_at,
+            "lastResult": self.last_result,
+            "lastSkip": self.last_skip,
+            "lastError": self.last_error,
+            "runs": self.runs,
+            "planned": self.planned,
+            "filled": self.filled,
+            "skips": self.skips,
+            "note": SCHEDULER_NOTE,
+        }

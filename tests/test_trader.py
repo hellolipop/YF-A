@@ -67,6 +67,10 @@ CONFIG_KEYS = {
     "enabled", "mode", "market", "capital", "maxWeight", "maxPositions",
     "maxOrdersPerDay", "maxOrderAmount", "minConfidence", "allowReduce",
     "universe", "whitelist", "interval", "webhook", "confirmToken", "updatedAt",
+    # 定时调度三键：scheduler（是否定时扫描）/ autoExecute（是否自动成交）/
+    # ignoreMarketHours（是否忽略交易时段）。漏掉它们会让「键集一致」这条断言必失败 ——
+    # 而失败原因与三键本身毫无关系，属于夹具没跟上 schema 变化
+    "scheduler", "autoExecute", "ignoreMarketHours",
 }
 
 #: 委托单字段集（与 store.save_trade_order 的列一一对应）

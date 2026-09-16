@@ -117,6 +117,9 @@ hit("/api/trade/config")
 hit("/api/trade/account")
 hit("/api/trade/orders?limit=5")
 hit("/api/trade/export")
+hit("/api/trade/status")                                 # 调度器状态（含为什么没动作）
+hit("/api/trade/scheduler", {"running": False})           # 停调度（幂等）
+hit("/api/trade/scheduler", {"once": True})               # 试跑：跳过时段限制，但仍要求 enabled
 hit("/api/trade/config", {"patch": {"enabled": False, "mode": "dryrun"}})   # 回到安全默认
 hit("/api/trade/execute", {"market": "cn"})             # 无口令：必须被拒且是严格 JSON
 hit("/api/trade/cancel", {})                            # 缺 id：错误分支

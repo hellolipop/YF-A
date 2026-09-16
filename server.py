@@ -1850,6 +1850,92 @@ def api_stream_test(q):
 
 
 # --------------------------------------------------------------------------- #
+# 定时调度（把「自动交易」的『自动』补上）
+# --------------------------------------------------------------------------- #
+
+TRADER_SCHED = None
+
+
+def _on_schedule_result(res, cfg):
+    """调度产出的委托与成交也要推到 trade 通道：与手动操作走同一条推送链路，
+    前端与外部桥接系统不必区分「这笔是自动来的还是手点的」。"""
+    for order in res.get("orders") or []:
+        _trade_publish("order", dict(order, ts=now_ms()))
+        if order.get("status") == "filled":
+            _trade_publish("fill", {
+                "orderId": order.get("id"), "code": order.get("code"),
+                "side": order.get("side"), "qty": order.get("qty"),
+                "fillPrice": order.get("fillPrice"), "fee": order.get("fee"),
+                "amount": order.get("amount"), "ts": now_ms(),
+                "scheduled": True})
+    try:
+        _trade_account_event(cfg, cfg.get("market"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def trade_scheduler():
+    """取（必要时创建）调度器。单例：调度线程与「哪一次请求触发的」无关。"""
+    global TRADER_SCHED
+    if TRADER_SCHED is None:
+        logger = None
+        try:
+            logger = runner().logger
+        except Exception:  # noqa: BLE001
+            logger = None
+        # 参数顺序适配器：调度器与推送中枢统一按 (market, codes) 调用报价，
+        # 而 trade_quotes 的历史签名是 (codes, market)。曾经直接把 trade_quotes 传进来，
+        # 于是 market 与 codes 互换了位置 → 报价永远取不到 → 被「回退到计划价」掩盖成
+        # 正常成交（日志里才看得到 scheduler.price_fallback）。
+        # 这类「沉默地用错了参数」正是必须显式适配而不是靠「看起来能跑」的原因。
+        TRADER_SCHED = core_trader.TradeScheduler(
+            trade_store(), _stream_recommend,
+            fetch_quotes=lambda market, codes: trade_quotes(codes, market),
+            market=None, clock=time.time, step=float(os.environ.get("AD_TRADE_STEP", "5") or 5),
+            on_result=_on_schedule_result, log=logger)
+    return TRADER_SCHED
+
+
+def api_trade_status(q):
+    """调度器状态 + 生效配置 + 账户概览：回答「为什么现在没动作」的唯一入口。"""
+    st = trade_store()
+    cfg = core_trader.get_config(st)
+    sched = trade_scheduler()
+    snap = core_trader.trade_snapshot(st, cfg)
+    return {
+        "ok": True,
+        "scheduler": sched.status(),
+        "config": cfg,
+        "gates": snap.get("gates") or {},
+        "account": snap.get("account") or {},
+        "counts": snap.get("counts") or {},
+        "note": core_trader.SCHEDULER_NOTE,
+        "updated": now_ms(),
+    }
+
+
+def api_trade_scheduler(body):
+    """启停调度线程；``once=true`` 时额外立即试跑一次。
+
+    试跑（force）的语义：跳过「调度开关 / 间隔 / 交易时段」三项限制，但**仍然要求
+    enabled 为真、且仍然遵守 dryrun 不成交** —— 试跑是为了确认「链路通不通」，
+    不该成为绕过总开关或绕过 dryrun 的后门。
+    """
+    body = body or {}
+    want = body.get("running")
+    sched = trade_scheduler()
+    if want is not None:
+        if bool(want):
+            sched.start()
+        else:
+            sched.stop()
+    out = {"ok": True, "scheduler": sched.status()}
+    if body.get("once"):
+        out["once"] = sched.tick_once(force=True)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 模拟交易 / 自动交易接口
 # --------------------------------------------------------------------------- #
 #: 自动交易的三条硬约束（写在接口说明与前端提示里，避免用户误解成真实下单）：
@@ -1868,7 +1954,11 @@ def trade_cfg(store=None):
 
 
 def trade_quotes(codes, market):
-    """批量取报价（成交定价用）。取不到就返回空列表，由 trader 记 rejected 而不是抛异常。"""
+    """批量取报价（成交定价用）。取不到就返回空列表，由 trader 记 rejected 而不是抛异常。
+
+    注意签名是 ``(codes, market)``，与推送中枢 / 调度器使用的 ``(market, codes)`` **相反**；
+    注入给它们时必须显式适配（见 trade_scheduler），不要把函数本身直接传进去。
+    """
     codes = [str(c).strip().upper() for c in (codes or []) if str(c).strip()]
     if not codes:
         return []
@@ -1912,6 +2002,7 @@ def api_trade_config_get():
         "account": snap.get("account") or {},
         "accountId": (snap.get("account") or {}).get("accountId"),
         "counts": snap.get("counts") or {},
+        "scheduler": trade_scheduler().status(),
         "note": ("自动交易默认关闭；dryrun 模式只生成计划、不产生任何成交与账户变动。"
                  "confirmToken 是**防误触口令**，不是安全边界：本工具面向本机单用户，"
                  "请勿把端口暴露到公网。"),
@@ -1931,9 +2022,19 @@ def api_trade_config_set(body):
                              keys=sorted(k for k in (patch or {}) if k != "confirmToken"))
     except Exception:  # noqa: BLE001
         pass
+    # scheduler 开关要**真的**控制调度线程：否则用户在界面上打开了「定时调度」，
+    # 后台却什么都没发生，这种「开关没接线」的问题最难被察觉
+    sched = trade_scheduler()
+    if cfg.get("scheduler"):
+        sched.start()
+    else:
+        sched.stop()
     _trade_publish("config", dict(cfg, ts=now_ms()))
-    return {"ok": True, "config": cfg, "gates": core_trader.trade_snapshot(st, cfg).get("gates") or {},
-            "note": "配置已保存；enabled 与 mode 变更会立即生效。"}
+    return {"ok": True, "config": cfg,
+            "gates": core_trader.trade_snapshot(st, cfg).get("gates") or {},
+            "scheduler": sched.status(),
+            "note": ("配置已保存；enabled / scheduler / autoExecute 变更会立即生效。"
+                     "自动成交需 enabled + scheduler + autoExecute 同时开启且 mode=paper。")}
 
 
 def api_trade_account(q):
@@ -2571,6 +2672,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_trade_config_get())
             if path == "/api/trade/account":
                 return self.send_json(api_trade_account(q))
+            if path == "/api/trade/status":
+                return self.send_json(api_trade_status(q))
             if path == "/api/trade/orders":
                 return self.send_json(api_trade_orders(q))
             if path == "/api/trade/export":
@@ -2643,6 +2746,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_trade_reset(body))
             if path == "/api/trade/ack":
                 return self.send_json(api_trade_ack(body))
+            if path == "/api/trade/scheduler":
+                return self.send_json(api_trade_scheduler(body))
             if path == "/api/notify":
                 return self.send_json(api_notify_update(body))
             if path == "/api/notify/test":
@@ -2665,6 +2770,10 @@ def main():
     tick = int(os.environ.get("AD_STRATEGY_TICK", "60") or 60)
     if not args.no_engine:
         r.start_loop(tick)
+        # 定时调度的线程与策略引擎同一约定：--no-engine 时不自动启动
+        # （仍可用 POST /api/trade/scheduler {"running":true} 手动拉起，便于联调）
+        if core_trader.get_config(r.store).get("scheduler"):
+            trade_scheduler().start()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print("AlphaDesk 行情服务已启动:  http://%s:%d" % (args.host, args.port))
