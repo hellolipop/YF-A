@@ -988,6 +988,13 @@ def _analyze_one(sym, ctx):
     if isinstance(q, dict) and q:
         price = _num(q.get("price")) or price
         change_pct = _num(q.get("changePct"))
+        # 名称回填：调用方只给了代码时（最常见的用法），用行情源返回的名称补上。
+        # 不做这一步的话，界面与历史记录里全是「600519」这样的数字，用户得自己记代码；
+        # 行情源本来就带名称，回填是零成本的。只在「没名称」或「名称就是代码」时替换，
+        # 不覆盖调用方明确给出的名称（例如用户自定义的备注名）。
+        qname = str(q.get("name") or "").strip()
+        if qname and (not name or str(name).strip().upper() == code):
+            name = qname
     if change_pct is None and n >= 2 and bars[i - 1]["close"] > 0:
         change_pct = (bars[i]["close"] / bars[i - 1]["close"] - 1.0) * 100.0
 

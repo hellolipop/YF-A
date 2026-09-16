@@ -2,7 +2,7 @@
    视图 · AI 选股（多标的批量研判：建议 / 凯利仓位 / 组合分配）
 
    接口：POST /api/advisor/recommend（由主程接入 api.advisorRecommend）
-   请求体：{ market, codes: [...], symbols: [{ code, market }],
+   请求体：{ market, codes: [...], symbols: [{ code, market, name }],
             horizon, capital, kellyFraction, maxWeight }
    返回体：{ ok, rows: [{ code, name, price, changePct, action, actionText, score,
                          confidence, signals: [{ key, label, dir, brief }],
@@ -14,6 +14,26 @@
                          risk: { atrPct, vol, maxDrawdown, note } }],
              portfolio: { totalWeight, cash, rows: [{ code, name, weight, amount }], note },
              disclaimer }
+
+   标的识别（服务端识别层，前端只调用、不自建规则）：
+     POST /api/symbols/resolve  { market, tokens: [...], limit: 5, max: 30 }
+     返回：{ ok, market, items: [{ raw, kind: code|name|ambiguous|unknown,
+                                  code, market, name,
+                                  hits: [{ code, name, market, tier, score, source,
+                                           echo, classify, type }], note, guess }],
+             summary: { total, resolved, code, name, ambiguous, unknown, named,
+                        guessed, indexed, truncated },
+             localIndex: { available, count, note }, note, updated }
+     语义（界面必须如实体现，不得替用户猜）：
+       · kind='code'   ：用户输的就是代码，name 可能为空 → 显示「名称待回填」而不是「—」；
+       · kind='name'   ：唯一命中，hits 里可能还有候选（可改选）；
+       · kind='ambiguous'：**多命中，绝不自动选第一个**，必须让用户从 hits 里挑一只，
+                          未挑选前不允许提交（否则会把分析对象静默换成另一只股票）；
+       · kind='unknown'：本地名录与远端都没命中 → 显示服务端 note（说明试过什么）；
+       · guess=true    ：名称与远端都没命中、只能按代码处理的猜测（远端只回显，
+                         没有真实名称）→ 用 chip warn 标出「按代码处理，可能不存在」。
+     识别规则只有服务端一套：前端已删除本地 parseToken 参与识别的路径，
+     只在识别接口故障时降级为「按输入原样当代码提交」，并在「识别结果」区块说明降级原因。
 
    历史记录（持久化）：
      接口：GET  /api/advisor/history?limit=&offset=&market=&code=&action=&q=&pinned=
@@ -55,6 +75,8 @@
   const PUSH_NOTE_MAX = 120;          /* 「最近变化」提示行最大展示字符数 */
   const MAX_SYMBOLS = 30;             /* 单次批量上限，避免一次性打爆服务端 */
   const SEP = /[\s,，、;；|]+/;         /* 逗号 / 空格 / 换行 / 分号分隔 */
+  const RESOLVE_DEBOUNCE_MS = 400;    /* 输入变化后去抖多久自动识别（边打字边看结果） */
+  const RESOLVE_LIMIT = 5;            /* 单条输入最多返回多少个候选（服务端 limit） */
   const FACTOR_MAX = 3;               /* 因子 chips 最多展示数量 */
   const ALLOC_COLORS = ['var(--accent)', '#7fb0ff', 'var(--warn)', 'var(--down)', '#8b95a5'];
 
@@ -206,17 +228,16 @@
     Array.prototype.forEach.call(seg.children, (b, i) => b.classList.toggle('active', values[i] === active));
   }
 
-  /* 单个 token -> { code, market, name }；无法识别为代码时返回 null（交给搜索接口解析中文名） */
-  function parseToken(raw) {
-    let s = String(raw || '').replace(/[（(]/g, '').replace(/[）)]/g, '').trim();
+  /* 降级路径的极简形态判断：**只在识别接口不可用时使用**。
+
+  这里刻意不做任何名称 / 拼音 / 别名推断 —— 识别规则只有服务端一套，前端不再复刻，
+  否则同一个输入会在「识别」与「提交」两条路径上得到不同结果（历史上本地 parseToken
+  与服务端规则就是这么漂移的）。降级时只回答一个问题：这个 token 长得像不像代码。 */
+  function shapeOfToken(raw) {
+    const s = String(raw || '').trim();
     if (!s) return null;
-    let name = '';
-    const kv = /^([A-Za-z0-9.\-]+)[:：](.+)$/.exec(s);   /* 支持「600519:贵州茅台」写法 */
-    if (kv) { s = kv[1]; name = kv[2].trim(); }
-    /* 只在后面紧跟 6 位数字时剥离交易所前缀，避免把 SHEL / SHOP 这类美股代码截断 */
-    s = s.replace(/^(sh|sz|bj)[.\-]?(?=\d{6})/i, '').replace(/^us[:.]/i, '');
-    if (/^\d{6}$/.test(s)) return { code: s, market: 'cn', name };
-    if (/^[A-Za-z][A-Za-z0-9.\-]{0,9}$/.test(s)) return { code: s.toUpperCase(), market: 'us', name };
+    if (/^\d{6}$/.test(s)) return { code: s, market: 'cn' };
+    if (/^[A-Za-z][A-Za-z0-9.\-]{0,9}$/.test(s)) return { code: s.toUpperCase(), market: 'us' };
     return null;
   }
 
@@ -227,6 +248,15 @@
       rows: [], portfolio: null, disclaimer: '',
       submitted: false, auto: true, loading: false, destroyed: false,
       lastBody: null, symbolMap: {}, fields: {},
+      /* 标的识别（服务端 /api/symbols/resolve）
+         key   = 当前结果对应的输入指纹（market + tokens），输入没变就不重复请求；
+         items = 服务端 items（原样保留 kind / note / guess 语义）；
+         pick  = 歧义项的用户选择（raw -> code），只有用户选过的才能提交；
+         degraded = 识别接口故障时的降级原因，界面必须如实展示。 */
+      resolve: {
+        key: '', market: '', tokens: [], items: [], summary: null, localIndex: null,
+        note: '', loading: false, loaded: false, degraded: '', pick: {},
+      },
       /* 保存开关：默认开启，提交时把 save / trigger 一起带给服务端 */
       save: true,
       /* 历史记录（列表 / 统计 / 保留策略 / 筛选条件） */
@@ -278,6 +308,9 @@
       class: 'legend-inline', style: { lineHeight: '1.8', marginTop: '4px' },
     }, [pushChangeHost, pushPulseHost, pushQuoteHost, pushErrHost]);
 
+    /* 「识别结果」区块的挂载点：放在「标的与参数」区块内、标的输入框正下方 */
+    const resolveHost = h('div');
+
     /* ------------------------------------------------- 标的 / 参数表单 */
 
     const codeInput = h('textarea', {
@@ -290,7 +323,7 @@
         fontFamily: 'var(--mono)', fontSize: '12px', lineHeight: '1.7', outline: 'none', resize: 'vertical',
       },
       on: {
-        input: () => renderCodeHint(),
+        input: () => codesChanged(),
         /* ⌘/Ctrl + Enter 直接提交，符合批量粘贴后的操作习惯 */
         keydown: (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); },
       },
@@ -304,6 +337,11 @@
       const n = readCodes().length;
       formHint.textContent = '已输入 ' + n + ' 个标的' +
         (n > MAX_SYMBOLS ? '（超过上限 ' + MAX_SYMBOLS + '，提交时自动截断）' : '');
+    }
+    /* 输入变化（键入 / 导入自选 / 清空）统一入口：更新计数 + 去抖自动识别 */
+    function codesChanged() {
+      renderCodeHint();
+      scheduleResolve();
     }
 
     function numField(key, label, value, step, title) {
@@ -358,7 +396,7 @@
       });
       if (!add.length) { ctx.toast('自选股中的' + MARKET_LABEL[market] + '标的已在列表中', 'info'); return; }
       codeInput.value = (codeInput.value.trim() ? codeInput.value.replace(/\s+$/, '') + '\n' : '') + add.join(' ');
-      renderCodeHint();
+      codesChanged();
       ctx.toast('已从自选股导入 ' + add.length + ' 只' + MARKET_LABEL[market] + '标的', 'ok');
     }
 
@@ -405,10 +443,12 @@
               h('button', { class: 'btn ghost sm', text: '从自选股导入', on: { click: importWatch } }),
               h('button', {
                 class: 'btn ghost sm', text: '清空',
-                on: { click: () => { codeInput.value = ''; renderCodeHint(); } },
+                on: { click: () => { codeInput.value = ''; codesChanged(); } },
               }),
               planBtn,
             ]),
+            /* 识别结果：紧贴输入框下方，输入变化去抖 400ms 自动识别 */
+            resolveHost,
           ]),
         ]),
         numField('horizon', '预测窗口（交易日）', 20, '1', '模型对未来多少个交易日做预测，默认 20'),
@@ -919,39 +959,396 @@
       }
     }
 
-    /* 标的解析：代码直接识别，中文名走本地搜索接口。
-       submit() 与「生成交易计划」共用，保证两处识别口径完全一致 */
-    async function resolveSymbols(tokens) {
-      const list = [];
-      const seen = {};
-      const unknown = [];
-      const nameTokens = [];
-      const push = (x) => {
-        const key = x.market + ':' + x.code;
-        if (!x.code || seen[key]) return;
-        seen[key] = 1;
-        list.push(x);
-      };
-      tokens.forEach((t) => {
-        const parsed = parseToken(t);
-        if (parsed) push(parsed); else nameTokens.push(t);
-      });
+    /* ============================================ 标的识别（服务端 /api/symbols/resolve）
 
-      if (nameTokens.length) {
-        const probe = nameTokens.slice(0, 10);
-        const hits = await Promise.all(probe.map((t) => api.search(t)
-          .then((r) => (r.rows || [])[0] || null)
-          .catch(() => null)));
-        hits.forEach((hit, i) => {
-          if (hit && hit.code) push({ code: hit.code, market: hit.market || 'cn', name: hit.name });
-          else unknown.push(probe[i]);
-        });
-        nameTokens.slice(10).forEach((t) => unknown.push(t));
-      }
-      return { list, unknown };
+       识别规则只有服务端一套：前端只负责「切 token → 调接口 → 如实渲染」，
+       不再自己解析代码 / 拼拼音 / 取搜索结果第一个（老实现的三处问题：
+       只输代码不显示名称、中文名多命中时静默取第一个会把分析对象换成另一只股票）。
+       歧义项必须由用户从 hits 里挑一只，未挑选前 submit() / genTradePlan() 一律不提交。 */
+
+    let resolveTimer = null;        /* 输入去抖定时器（destroy 时清理） */
+
+    function resolveKey(list, market) {
+      return String(market || '') + '|' + (list || []).join('\u0001');
     }
 
-    /* 提交：解析标的 -> 组装 body -> 取数 */
+    /* 手动识别：输入没变也强制重发一次（用户点按钮就是要重试） */
+    const resolveBtn = h('button', {
+      class: 'btn ghost sm', text: '识别',
+      title: 'POST /api/symbols/resolve { market, tokens }：按当前输入重新识别标的；'
+        + '输入变化后 400ms 也会自动识别',
+      on: {
+        click: () => {
+          if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null; }
+          if (!readCodes().length) { ctx.toast('请先输入标的：代码或中文名，逗号 / 空格 / 换行分隔', 'warn'); return; }
+          resolveInput(readCodes(), true);
+        },
+      },
+    });
+
+    /* 输入变化 → 去抖 400ms 自动识别（用户一边打字一边看到识别结果） */
+    function scheduleResolve() {
+      if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null; }
+      const tokens = readCodes();
+      if (!tokens.length) {                     /* 空输入：清掉结果，只留引导文案 */
+        resetResolve();
+        renderResolve();
+        return;
+      }
+      resolveTimer = setTimeout(() => {
+        resolveTimer = null;
+        if (st.destroyed) return;
+        resolveInput(tokens);
+      }, RESOLVE_DEBOUNCE_MS);
+    }
+
+    function resetResolve() {
+      const r = st.resolve;
+      r.key = ''; r.market = ''; r.tokens = []; r.items = []; r.summary = null;
+      r.localIndex = null; r.note = ''; r.loaded = false; r.degraded = '';
+      r.pick = {};
+    }
+
+    /* 服务端字段兜底：缺字段一律降级，绝不让渲染层因为一个 undefined 崩掉 */
+    function normItem(it) {
+      const o = (it && typeof it === 'object') ? it : {};
+      return {
+        raw: String(o.raw === undefined || o.raw === null ? '' : o.raw),
+        kind: String(o.kind || 'unknown'),
+        code: o.code ? String(o.code).toUpperCase() : null,
+        market: o.market || null,
+        name: o.name === undefined || o.name === null || o.name === '' ? '' : String(o.name),
+        hits: Array.isArray(o.hits) ? o.hits.filter((x) => x && x.code) : [],
+        note: o.note ? String(o.note) : '',
+        guess: o.guess === true,
+      };
+    }
+
+    /* 接口故障时的降级结果：按输入原样当代码（**不做任何名称识别**）。
+       名字形态的 token 无法在本地解析成代码，标为未识别并在界面上说明原因 ——
+       把「茅台」当代码提交只会换来一行服务端错误，不如如实说「解析不了」。 */
+    function degradedItems(tokens, reason) {
+      return (tokens || []).map((t) => {
+        const shape = shapeOfToken(t);
+        if (shape) {
+          return {
+            raw: t, kind: 'code', code: shape.code, market: shape.market, name: '', hits: [],
+            guess: false, note: '识别接口不可用：按输入原样当作代码提交，名称待服务端回填',
+          };
+        }
+        return {
+          raw: t, kind: 'unknown', code: null, market: ctx.state.market, name: '', hits: [],
+          guess: false, note: '识别接口不可用，且这不是代码形态，无法解析成标的（' + reason + '）',
+        };
+      });
+    }
+
+    /* 服务端结果落地：保留仍然有效的用户选择（输入没变时不把用户挑好的候选清掉） */
+    function applyItems(items, market) {
+      const r = st.resolve;
+      const list = (Array.isArray(items) ? items : []).map(normItem);
+      const nextPick = {};
+      Object.keys(r.pick || {}).forEach((raw) => {
+        const it = list.find((x) => x.raw === raw);
+        if (!it || it.kind !== 'ambiguous') return;
+        if (!(it.hits || []).some((h) => String(h.code).toUpperCase() === String(r.pick[raw]).toUpperCase())) return;
+        nextPick[raw] = String(r.pick[raw]).toUpperCase();
+      });
+      r.pick = nextPick;
+      r.items = list;
+      r.market = market;
+      r.loaded = true;
+      return list;
+    }
+
+    /* 调服务端识别接口；任何失败都降级为「按输入原样提交」，绝不把提交流程 block 住 */
+    async function resolveInput(tokens, force) {
+      const list = (tokens || []).map((t) => String(t).trim()).filter(Boolean);
+      const market = ctx.state.market;
+      const r = st.resolve;
+      const key = resolveKey(list, market);
+      if (!force && r.loaded && r.key === key) return r;      /* 输入没变：复用，不重复请求 */
+
+      r.loading = true;
+      r.key = key;
+      r.tokens = list;
+      renderResolve();
+      const body = { market, tokens: list, limit: RESOLVE_LIMIT, max: MAX_SYMBOLS };
+      try {
+        const call = typeof api.symbolsResolve === 'function'
+          ? api.symbolsResolve(body)
+          : (typeof api.post === 'function' ? api.post('symbols/resolve', body) : null);
+        if (!call) throw new Error('api.symbolsResolve 未接入');
+        const res = await call;
+        if (st.destroyed) return r;
+        if (!res || res.ok === false || !Array.isArray(res.items)) {
+          throw new Error((res && (res.message || res.error)) || '服务端未返回有效识别结果');
+        }
+        r.degraded = '';
+        r.summary = res.summary || null;
+        r.localIndex = res.localIndex || null;
+        r.note = res.note || '';
+        applyItems(res.items, res.market || market);
+      } catch (e) {
+        if (st.destroyed) return r;
+        /* 识别接口故障 ≠ 提交失败：按输入原样当代码，并在区块里说明降级原因 */
+        r.degraded = (e && e.message) || '识别接口不可用';
+        r.summary = null;
+        r.localIndex = null;
+        r.note = '';
+        applyItems(degradedItems(list, r.degraded), market);
+      } finally {
+        if (!st.destroyed) {
+          r.loading = false;
+          renderResolve();
+        }
+      }
+      return r;
+    }
+
+    /* 提交前的统一入口：复用当前输入对应的识别结果，没有或已过期就现识别一次 */
+    async function ensureResolved(tokens) {
+      const list = (tokens || []).map((t) => String(t).trim()).filter(Boolean);
+      const key = resolveKey(list, ctx.state.market);
+      const r = st.resolve;
+      if (r.loaded && r.key === key) return r;
+      return resolveInput(list);
+    }
+
+    /* 单条输入的有效标的；歧义未选 / 未识别返回 null（= 不可提交） */
+    function itemSymbol(it) {
+      if (!it) return null;
+      if (it.kind === 'ambiguous') {
+        const code = st.resolve.pick[it.raw];
+        if (!code) return null;
+        const hit = (it.hits || []).find((x) => String(x.code).toUpperCase() === String(code).toUpperCase()) || {};
+        return {
+          code: String(hit.code || code).toUpperCase(),
+          market: hit.market || it.market || ctx.state.market,
+          name: hit.name ? String(hit.name) : '',
+        };
+      }
+      if (it.code) {
+        return { code: it.code, market: it.market || ctx.state.market, name: it.name || '' };
+      }
+      return null;
+    }
+
+    /* 仍未选择的歧义项（有它就不允许提交） */
+    function pendingAmbiguous(items) {
+      return (items || []).filter((it) => it.kind === 'ambiguous' && !itemSymbol(it));
+    }
+
+    /* 可提交标的：去重（同一只股票只提交一次），顺序按输入顺序 */
+    function usableSymbols(items) {
+      const out = [];
+      const seen = {};
+      (items || []).forEach((it) => {
+        const sym = itemSymbol(it);
+        if (!sym) return;
+        const key = sym.market + ':' + sym.code;
+        if (seen[key]) return;
+        seen[key] = 1;
+        out.push(sym);
+      });
+      return out;
+    }
+
+    /* symbols 提交体：名称来自识别结果，为空则**不带 name 字段**（交给服务端回填） */
+    function symbolBody(x) {
+      const o = { code: x.code, market: x.market };
+      if (x.name) o.name = x.name;
+      return o;
+    }
+
+    /* 摘要计数：按当前 items + 用户选择实时重算（选中歧义项后「歧义」会立刻回落） */
+    function resolveCounts() {
+      const c = { total: 0, resolved: 0, code: 0, name: 0, ambiguous: 0, unknown: 0, guessed: 0 };
+      (st.resolve.items || []).forEach((it) => {
+        c.total++;
+        const sym = itemSymbol(it);
+        if (sym) c.resolved++;
+        if (it.kind === 'code') c.code++;
+        else if (it.kind === 'name') c.name++;
+        else if (it.kind === 'ambiguous') { if (!sym) c.ambiguous++; }
+        else c.unknown++;
+        if (it.guess) c.guessed++;
+      });
+      return c;
+    }
+
+    function hitText(x) {
+      const code = (x.market === 'us' ? 'US:' : '') + String(x.code || '');
+      return code + ' ' + (x.name || '—') + '（' + (x.tier || '候选') + '）';
+    }
+
+    function pickAmbiguous(raw, code) {
+      const r = st.resolve;
+      if (!code) delete r.pick[raw];
+      else r.pick[raw] = String(code).toUpperCase();
+      renderResolve();       /* 选中后立即更新明细与摘要 */
+    }
+
+    /* 歧义未选时把「识别结果」滚入视野，让用户知道卡在哪 */
+    function focusResolve() {
+      if (resolveHost && typeof resolveHost.scrollIntoView === 'function') {
+        try { resolveHost.scrollIntoView({ block: 'center' }); } catch (e) { resolveHost.scrollIntoView(); }
+      }
+    }
+
+    /* 单条明细：原始输入 → 代码 名称（/ 未识别 / 歧义选择） */
+    function resolveRow(it) {
+      const row = h('div', {
+        class: 'legend-inline',
+        style: { alignItems: 'center', gap: '8px', marginTop: '3px', lineHeight: '1.8' },
+      });
+      row.appendChild(h('span', { class: 'num', style: { color: 'var(--text-2)' }, text: it.raw || '—' }));
+      row.appendChild(h('span', { class: 'dim3', text: '→' }));
+
+      if (it.kind === 'ambiguous') {
+        const sel = h('select', {
+          class: 'inp',
+          style: { minWidth: '210px', padding: '3px 6px' },
+          title: '多命中：必须选择一只要分析的标的（不选则无法提交）',
+          on: { change: (e) => pickAmbiguous(it.raw, e.target ? e.target.value : '') },
+        }, [h('option', { value: '', text: '请选择' })].concat(
+          (it.hits || []).map((x) => h('option', { value: String(x.code), text: hitText(x) }))
+        ));
+        sel.value = st.resolve.pick[it.raw] || '';
+        row.appendChild(sel);
+        row.appendChild(h('span', { class: 'chip warn', text: '歧义' }));
+        row.appendChild(h('span', {
+          class: 'dim3',
+          text: (st.resolve.pick[it.raw] ? '已选择 ' + st.resolve.pick[it.raw] + ' · ' : '') +
+            text(it.note, '命中多个候选，请选择'),
+        }));
+        return row;
+      }
+
+      if (it.kind === 'unknown') {
+        row.appendChild(h('span', { class: 'chip down', text: '未识别' }));
+        row.appendChild(h('span', { class: 'dim3', text: text(it.note, '本地名录与远端搜索都没有命中') }));
+        return row;
+      }
+
+      const sym = itemSymbol(it);
+      row.appendChild(h('span', {
+        class: 'num',
+        text: sym ? (sym.market === 'us' ? 'US:' : '') + sym.code : '—',
+      }));
+      const nm = sym && sym.name ? sym.name : '';
+      if (nm) row.appendChild(h('span', { text: nm }));
+      /* 只输代码时服务端会在取行情后回填名称：这里如实显示「待回填」，不显示「—」 */
+      else row.appendChild(h('span', { class: 'dim3', text: '名称待回填' }));
+      if (it.guess) {
+        row.appendChild(h('span', {
+          class: 'chip warn', text: '按代码处理，可能不存在',
+          title: '名称与远端搜索都没有命中，只能按代码处理；并不代表这只股票一定存在',
+        }));
+      }
+      if (it.note) row.appendChild(h('span', { class: 'dim3', text: it.note }));
+      return row;
+    }
+
+    /* 「识别结果」区块（挂在「标的与参数」里、输入框下方） */
+    function renderResolve() {
+      clear(resolveHost);
+      const tokens = readCodes();
+      const r = st.resolve;
+      const items = r.items || [];
+      const c = resolveCounts();
+
+      /* 头部：区块标题 + 摘要 chips + 手动识别按钮（空输入时也保留，按钮位置固定不跳动） */
+      const head = h('div', {
+        class: 'legend-inline', style: { alignItems: 'center', marginTop: '8px', lineHeight: '1.8' },
+      }, [h('span', { class: 'chip accent', text: '识别结果' })]);
+
+      if (items.length) {
+        head.appendChild(h('span', {
+          class: 'chip up', text: '已识别 ' + c.resolved + ' 只',
+          title: '共 ' + c.total + ' 个输入，其中 ' + c.resolved + ' 个可直接提交' +
+            (c.ambiguous ? '；另有 ' + c.ambiguous + ' 个待选择' : ''),
+        }));
+        head.appendChild(h('span', { class: 'chip', text: '名称 ' + c.name, title: '按中文名 / 简称 / 拼音命中的输入' }));
+        head.appendChild(h('span', { class: 'chip', text: '代码 ' + c.code, title: '按代码识别的输入' }));
+        head.appendChild(h('span', {
+          class: 'chip warn', text: '歧义 ' + c.ambiguous,
+          title: '命中多只股票，必须选择后才能提交',
+        }));
+        head.appendChild(h('span', { class: 'chip down', text: '未识别 ' + c.unknown, title: '本地名录与远端搜索都没有命中的输入' }));
+        head.appendChild(h('span', {
+          class: 'chip warn', text: '按代码处理 ' + c.guessed,
+          title: '名称与远端都没命中、只能按代码处理的猜测结果（可能不存在）',
+        }));
+      }
+      head.appendChild(resolveBtn);
+      if (r.loading) head.appendChild(h('span', { class: 'dim3', text: '识别中…' }));
+      resolveHost.appendChild(head);
+
+      /* 空输入：只留引导文案（区块不隐藏，用户知道这里会有识别结果） */
+      if (!tokens.length) {
+        resolveHost.appendChild(h('div', {
+          class: 'dim3', style: { fontSize: '11px', marginTop: '2px', lineHeight: '1.8' },
+          text: '输入代码 / 中文名 / 拼音（如 600519、贵州茅台、gzmt），停顿 0.4 秒自动识别；' +
+            '多命中的标的必须先在下方选择后才能提交。',
+        }));
+        return;
+      }
+
+      /* 输入数与明细数不一致要如实说明：服务端会把解析到同一只股票的重复输入合并
+         （实测 600519 / 茅台 / gzmt 三条输入只回一条 600519），不解释会让人以为丢了输入 */
+      if (items.length && items.length !== tokens.length) {
+        resolveHost.appendChild(h('div', {
+          class: 'dim3', style: { fontSize: '11px', margin: '2px 0 2px' },
+          text: '输入 ' + tokens.length + ' 个 → 明细 ' + items.length + ' 条' +
+            (r.summary && r.summary.truncated ? '（超过单次上限，已截断）' : '（解析到同一只股票的重复输入已合并）'),
+        }));
+      }
+
+      /* 本地名录来源说明（来自服务端 localIndex） */
+      const li2 = r.localIndex || {};
+      if (isNum(li2.count) && li2.count > 0) {
+        resolveHost.appendChild(h('div', {
+          class: 'dim3', style: { fontSize: '11px', margin: '2px 0 2px' },
+          title: r.note || '',
+          text: '本地名录 ' + li2.count + ' 条' + (li2.note ? '：' + li2.note : ''),
+        }));
+      } else if (items.length) {
+        resolveHost.appendChild(h('div', {
+          class: 'dim3', style: { fontSize: '11px', margin: '2px 0 2px' },
+          text: '本地名录当前不可用（所有输入都走了远端搜索）',
+        }));
+      }
+
+      if (r.degraded) {
+        resolveHost.appendChild(h('div', {
+          class: 'legend-inline', style: { alignItems: 'center', marginTop: '4px' },
+        }, [
+          h('span', { class: 'chip warn', text: '识别接口不可用，已降级' }),
+          h('span', {
+            class: 'dim3',
+            text: '原因：' + r.degraded + '；降级为「按输入原样当代码提交」，名称不会自动补全，' +
+              '中文名 / 拼音请改用 6 位代码或字母代码。',
+          }),
+        ]));
+      }
+      if (r.summary && r.summary.truncated) {
+        resolveHost.appendChild(h('div', {
+          class: 'dim3', style: { fontSize: '11px', marginTop: '2px' },
+          text: '输入超过单次上限（' + MAX_SYMBOLS + ' 个），识别只处理了前 ' + MAX_SYMBOLS + ' 个',
+        }));
+      }
+      if (!items.length && !r.loading && !r.degraded) {
+        resolveHost.appendChild(h('div', {
+          class: 'dim3', style: { fontSize: '11px', marginTop: '4px' }, text: '尚未识别到标的',
+        }));
+      }
+
+      items.forEach((it) => resolveHost.appendChild(resolveRow(it)));
+    }
+
+    /* 提交：识别标的 -> 组装 body -> 取数。
+       识别走服务端接口；歧义项未选择前**一律不提交**（不替用户选股票）。 */
     async function submit() {
       if (st.loading) return;
       const raw = readCodes();
@@ -962,13 +1359,29 @@
         ctx.toast('单次最多分析 ' + MAX_SYMBOLS + ' 只，已截断为前 ' + MAX_SYMBOLS + ' 个', 'warn');
       }
 
-      const res = await resolveSymbols(tokens);
-      const list = res.list;
-      const unknown = res.unknown;
-
-      if (unknown.length) ctx.toast('未识别的输入：' + unknown.join('、'), 'warn');
-      if (!list.length) { ctx.toast('没有识别出有效标的，请检查代码格式', 'err'); return; }
+      /* 提交前用最新输入识别一次（已有对应当前输入的结果就直接复用） */
+      const r = await ensureResolved(tokens);
       if (st.destroyed) return;
+
+      const pending = pendingAmbiguous(r.items);
+      if (pending.length) {
+        ctx.toast('有 ' + pending.length + ' 个输入命中多只股票，请在「识别结果」里选择后重试', 'warn');
+        focusResolve();
+        return;
+      }
+
+      const list = usableSymbols(r.items);
+      if (!list.length) {
+        ctx.toast(r.degraded
+          ? '识别接口不可用，且输入里没有可用的代码：请改用 6 位代码或字母代码后重试'
+          : '没有识别出有效标的，请检查代码格式', 'err');
+        focusResolve();
+        return;
+      }
+
+      const unknown = (r.items || []).filter((x) => x.kind === 'unknown').map((x) => x.raw);
+      if (unknown.length) ctx.toast('未识别的输入：' + unknown.join('、'), 'warn');
+      if (r.degraded) ctx.toast('标的识别接口不可用，已降级为按输入原样提交：' + r.degraded, 'warn');
 
       st.symbolMap = {};
       list.forEach((x) => { st.symbolMap[String(x.code).toUpperCase()] = { market: x.market, name: x.name || x.code }; });
@@ -987,7 +1400,8 @@
       const body = {
         market,
         codes: list.map((x) => x.code),
-        symbols: list.map((x) => ({ code: x.code, market: x.market })),
+        /* symbols 必须带名称：名称来自识别结果，为空则不带 name 字段（交给服务端回填） */
+        symbols: list.map(symbolBody),
         horizon: p.horizon,
         capital: p.capital,
         kellyFraction: p.kellyFraction,
@@ -1000,7 +1414,8 @@
     }
 
     /* 生成交易计划：把当前输入的标的交给 /api/trade/plan（模拟交易页负责执行）。
-       这里只生成计划，绝不下单；接口未就绪时只 toast，不改动页面其它状态。 */
+       这里只生成计划，绝不下单；接口未就绪时只 toast，不改动页面其它状态。
+       与 submit() 共用同一套识别结果：歧义未选的输入同样不允许提交。 */
     async function genTradePlan() {
       const raw = readCodes();
       if (!raw.length) { ctx.toast('请先输入标的：代码或中文名，逗号 / 空格 / 换行分隔', 'warn'); return; }
@@ -1009,18 +1424,27 @@
       planBtn.disabled = true;
       try {
         const tokens = raw.length > MAX_SYMBOLS ? raw.slice(0, MAX_SYMBOLS) : raw;
-        const rs = await resolveSymbols(tokens);
+        const r = await ensureResolved(tokens);
         if (st.destroyed) return;
-        if (!rs.list.length) {
-          ctx.toast('没有识别出有效标的，无法生成交易计划', 'err');
+        const pending = pendingAmbiguous(r.items);
+        if (pending.length) {
+          ctx.toast('有 ' + pending.length + ' 个输入命中多只股票，请在「识别结果」里选择后重试', 'warn');
+          focusResolve();
+          return;
+        }
+        const list = usableSymbols(r.items);
+        if (!list.length) {
+          ctx.toast(r.degraded ? '识别接口不可用，且输入里没有可用的代码，无法生成交易计划'
+            : '没有识别出有效标的，无法生成交易计划', 'err');
+          focusResolve();
           return;
         }
         const res = await api.post('trade/plan', {
           market: ctx.state.market,
-          symbols: rs.list.map((x) => x.code),
+          symbols: list.map((x) => x.code),
         });
         if (st.destroyed) return;
-        const n = planCount(res, rs.list.length);
+        const n = planCount(res, list.length);
         ctx.toast('已生成 ' + n + ' 笔交易计划（模拟交易页可执行）', 'ok');
       } catch (e) {
         if (st.destroyed) return;
@@ -2321,7 +2745,7 @@
         submitBtn,
       ]),
       ui.section('模型说明与免责声明', '结论由统计模型给出，字段缺失时按「—」降级展示，不做任何推断填充', [], modelHost),
-      ui.section('标的与参数', '标的支持代码（600519 / AAPL）与中文名，逗号 / 空格 / 换行分隔，也可从自选股导入', [], formHost),
+      ui.section('标的与参数', '标的支持代码（600519 / AAPL）、中文名与简称、拼音首字母（贵州茅台 / 茅台 / gzmt），也可写「代码:名称」；逗号 / 空格 / 换行分隔，也可从自选股导入。识别结果会自动补全名称，命名有歧义时请你选择', [], formHost),
       ui.section('研判结果', '点击行可打开个股详情；每行右侧可直接查看K线、加入自选或转为策略跟踪',
         [], h('div', {}, [bannerHost, tableHost])),
       ui.section('组合分配', '按凯利折扣与单只权重上限折算的权重与金额分配', [], portfolioHost),
@@ -2335,6 +2759,7 @@
     renderDisclaimer();
     renderForm();
     renderCodeHint();
+    renderResolve();        /* 初始：空输入 → 「识别结果」区块只显示引导文案 */
     renderTable();
     renderPortfolio();
     renderBanner();
@@ -2364,6 +2789,7 @@
         st.destroyed = true;
         closePush();                                    /* 关闭两路推送订阅，之后不再有任何回调 */
         if (timer) { clearInterval(timer); timer = null; }
+        if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null; }   /* 识别去抖 */
         flashTimers.splice(0).forEach((t) => clearTimeout(t));
       },
     };

@@ -122,6 +122,12 @@
     searchParams: (body) => post('search/params', body),
     advisorRecommend: (body) => post('advisor/recommend', body),
 
+    /* 标的识别（服务端识别层）：代码 / 中文名 / 简称 / 拼音首字母 → 统一给出
+       { items: [{ raw, kind: code|name|ambiguous|unknown, code, market, name, hits, note, guess }],
+         summary, localIndex, note }
+       ambiguous 必须由用户从 hits 里选择，前端不得替用户挑第一个。 */
+    symbolsResolve: (body) => post('symbols/resolve', body),
+
     /* AI 选股历史记录（持久化）
        - 列表：支持 limit / offset / market / code / action / q / pinned
        - 单条：GET advisor/record?id=...（rows 与 recommend 返回体同构，用于回放）

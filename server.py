@@ -41,6 +41,7 @@ from core import runner as core_runner
 from core import storage as core_storage
 from core import strategies as core_strategies
 from core import stream as core_stream
+from core import symbols as core_symbols
 from core import trader as core_trader
 from providers import features as feat_provider
 
@@ -1119,7 +1120,11 @@ def api_search(q):
                 "secid": d.get("QuoteID"), "type": d.get("SecurityTypeName"),
                 "classify": cls,
             })
-        if not rows and q.upper().isalpha() and len(q) <= 6:
+        # 兜底：像美股代码的字母串在接口没收录时也放行，让用户仍能尝试导航。
+        # 必须限定 ASCII：Python 的 str.isalpha() 对中文也返回 True，于是「不存在的公司」
+        # 这种 6 字以内的中文会被回显成一个同名美股代码 —— 实测过，搜索结果里出现
+        # 一只并不存在的股票，比「搜不到」误导性大得多。
+        if not rows and q.isascii() and q.isalpha() and len(q) <= 6:
             rows.append({"code": q.upper(), "name": q.upper(), "market": "us",
                          "secid": "105." + q.upper(), "type": "美股", "classify": "UsStock"})
         return {"rows": rows[:12], "source": "东方财富"}
@@ -1636,6 +1641,102 @@ def api_advisor_prune(body):
     stats = st.advisor_stats()
     return {"ok": True, "deleted": deleted, "remaining": stats["records"],
             "keep": keep, "pinned": st.advisor_pinned_count()}
+
+
+# --------------------------------------------------------------------------- #
+# 标的名称识别（自动识别股票名称 / 简称 / 拼音 / 代码）
+# --------------------------------------------------------------------------- #
+
+def _symbol_search(query, market):
+    """识别用的远端搜索：复用 /api/search 的实现与缓存，避免两处口径漂移。
+
+    美股语境下把美股结果排到前面 —— 同名时（例如「苹果」）优先给用户想要的那个市场。
+    """
+    res = api_search(query) or {}
+    rows = list(res.get("rows") or [])
+    if str(market or "").startswith("us"):
+        rows.sort(key=lambda r: 0 if (r.get("market") == "us") else 1)
+    return {"rows": rows}
+
+
+def symbol_index(market):
+    """全市场名录索引（名称识别用）：复用个股列表快照，不引入新数据源。
+
+    TTL 取 15 分钟：代码 ↔ 名称一个月也未必变一次，但新股与更名要能跟上；快照本身
+    已有缓存，这里只是把它整理成便于匹配的索引。取不到时返回 None，识别会自动退化为
+    「全部走远端搜索」，而不是整个接口失败。
+    """
+    mkt = "us" if str(market or "").lower().startswith("us") else "cn"
+
+    def build():
+        rows = us_snapshot() if mkt == "us" else cn_snapshot()
+        idx = core_symbols.build_index(rows, mkt)
+        if not idx.get("count"):
+            raise RuntimeError("名录为空")
+        return idx
+
+    try:
+        idx = cached("symbol_index_v1_%s" % mkt, 900, build)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            runner().logger.error("symbols.index_failed", market=mkt, error=str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    return idx if isinstance(idx, dict) else None
+
+
+def _split_tokens(raw):
+    """把输入串切成列表：逗号（含中文逗号）、空格、换行、分号、制表符都算分隔符。"""
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw if str(x).strip()]
+    text = str(raw or "")
+    for ch in ("，", "；", "\n", "\r", "\t", ";", "|", "、"):
+        text = text.replace(ch, ",")
+    text = text.replace(" ", ",")
+    return [s.strip() for s in text.split(",") if s.strip()]
+
+
+def api_symbols_resolve(body):
+    """批量识别标的：代码 / 中文名 / 简称 / 拼音首字母 / 「代码:名称」混合写法。
+
+    返回里每条都带 ``kind``（code / name / ambiguous / unknown）与 ``note``，
+    歧义项另外带 ``hits`` 候选清单 —— 前端据此让用户选择，而不是替用户猜。
+    """
+    body = body or {}
+    market = str(body.get("market") or "cn").strip().lower()
+    tokens = body.get("tokens")
+    if tokens is None:
+        tokens = body.get("q") or body.get("inputs") or body.get("symbols") or []
+    items = _split_tokens(tokens)
+    if not items:
+        raise RuntimeError("请提供 tokens（代码或名称，逗号 / 空格 / 换行分隔）")
+    idx = symbol_index(market)
+    res = core_symbols.resolve(
+        items, market=market, index=idx, search_fn=_symbol_search,
+        limit=int(num(body.get("limit"), 5) or 5),
+        max_tokens=int(num(body.get("max"), core_symbols.MAX_TOKENS) or core_symbols.MAX_TOKENS))
+    res["ok"] = True
+    res["market"] = "us" if market.startswith("us") else "cn"
+    res["updated"] = now_ms()
+    res["localIndex"] = {
+        "available": idx is not None,
+        "count": int((idx or {}).get("count") or 0),
+        "note": ("本地名录来自个股列表快照（A 股为全市场，美股为活跃样本）；"
+                 "本地命中即无需请求远端，拼音与错别字由远端搜索兜底"),
+    }
+    if idx is None:
+        res["note"] = res["note"] + "｜注意：本地名录当前不可用，所有输入都走了远端搜索。"
+    return res
+
+
+def api_symbols_lookup(q):
+    """单条查询的便捷入口：按代码查名称，或按名称查代码。"""
+    q = q or {}
+    text = str(q.get("code") or q.get("q") or "").strip()
+    if not text:
+        raise RuntimeError("请提供 code 或 q")
+    return api_symbols_resolve({"market": q.get("market") or "cn", "tokens": [text]})
 
 
 # --------------------------------------------------------------------------- #
@@ -2438,6 +2539,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_sectors(q.get("kind", "industry")))
             if path == "/api/search":
                 return self.send_json(api_search(q.get("q")))
+            if path == "/api/symbols/resolve":
+                return self.send_json(api_symbols_resolve(
+                    {"market": q.get("market"), "tokens": q.get("tokens") or q.get("q")
+                     or q.get("codes"), "limit": q.get("limit"), "max": q.get("max")}))
+            if path == "/api/symbols/lookup":
+                return self.send_json(api_symbols_lookup(q))
             if path == "/api/news":
                 return self.send_json(api_news(fnum("limit", 30)))
             if path == "/api/strategy/meta":
@@ -2512,6 +2619,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_backtest(body))
             if path == "/api/search/params":
                 return self.send_json(api_params_search(body))
+            if path == "/api/symbols/resolve":
+                return self.send_json(api_symbols_resolve(body))
             if path == "/api/advisor/recommend":
                 return self.send_json(api_advisor_recommend(body))
             if path == "/api/advisor/delete":

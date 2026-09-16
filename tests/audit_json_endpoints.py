@@ -100,6 +100,13 @@ try:
 except Exception as exc:  # noqa: BLE001
     print("  记录链路审计跳过：%s" % exc)
 
+print("=== 标的名称识别 ===")
+hit("/api/symbols/resolve?market=cn&tokens=600519,%E8%8C%85%E5%8F%B0,%E5%B9%B3%E5%AE%89")
+hit("/api/symbols/resolve")                                   # 缺 tokens：错误分支
+hit("/api/symbols/lookup?code=601398")
+hit("/api/symbols/lookup")                                    # 缺 code/q：错误分支
+hit("/api/symbols/resolve", {"market": "cn", "tokens": ["600519", "贵州茅台", "不存在公司"]})
+
 hit("/api/notify", {"webhook": "", "events": ["on_fill", "on_exit", "on_skip", "on_error"]})
 
 print("=== 实时推送与自动交易（含权限门与 SSE 端点）===")
