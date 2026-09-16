@@ -13,17 +13,30 @@ F. TestPlanSizing       open / add / reduce / close 的股数、整手取整、�
 G. TestExecuteDryrun    dryrun 前后现金 / 持仓 / 累计量 / 权益曲线**逐字段不变**；
 H. TestExecutePaper     成交成本与现金 / 持仓 / 均价与手工复算逐位一致（容差 1e-6）；
 I. TestRejected         拒单三情形（无报价、现金不足、无持仓/持仓不足）不部分成交；
-J. TestOrderFlows       撤单、回执 ack、导出待执行意图、手动平仓（不受 enabled 限制）；
+J. TestOrderFlows       撤单、回执 ack、导出待执行意图、手动平仓（不受 enabled 限制，
+                        但同样受 T+1 约束：当日买入的部分手动也卖不掉）；
 K. TestScan             一步到底（symbols 构造、recommend 入参、默认 execute=False）；
 L. TestSnapshotJson     快照结构 + 所有公开返回值都能 json.dumps(allow_nan=False)；
 M. TestDirtyInput       脏输入（advice / rows / quotes / code / orders / config）不抛异常；
-N. TestPersistence      新 Store 实例读回一致（配置 / 账户 / 累计量 / 委托单）。
+N. TestPersistence      新 Store 实例读回一致（配置 / 账户 / 累计量 / 委托单）；
+O. TestAdvisorIntegration  与 core/advisor 的真研判输出联调（计划 / 成交 / 安全属性）；
+P. TestTraderRulesRegression  交易规则接线**回归**（逐项费用的最低佣金 / 印花税、T+1 可卖、
+                          涨跌停封板拒单、todayBought 收缩与持久化）—— 本轮修好的三个接线缺陷
+                          F1（最低佣金没计入费用）/ F2（跨调用丢 todayBought）/ F3（毫秒 ts
+                          让美股成交抛异常）在此由常规用例守着，不再是 expectedFailure。
 
 设计原则（为什么这样造数据）
 ----------------------------
 · **确定性**：不联网、不用 random、不依赖真实时间（时间戳只断言「是正整数」）；
-· **手算对账**：成本类断言一律用与实现同源的公式在测试里重算
-  （``qty × price × (1+滑点) × (1+费率)``），而不是把实现算出来的数字抄一遍；
+  需要跨日的用例用 ``on_day(DAY1_MS)`` / ``on_day(DAY2_MS)`` 把 ``now_ms`` 钉死在
+  北京时间的两个相邻自然日（T+1 现在真的生效，「当日买当日卖」会被拒，
+  所以凡是卖出的用例都必须让卖出落在次日）；
+· **手算对账**：成本类断言一律用与 ``core/rules.fee_of`` 同源的**逐项公式**在测试里重算
+  （含滑点成交额 + 佣金(不足 5 元按 5 元) + 印花税(仅卖出) + 过户费 0.001% + 经手费 0.00341%），
+  并把算式写在断言旁边（例如 1 万元买入 = 5 + 0.1 + 0.341 = 5.441），而不是把实现算出来的
+  数字抄一遍；涉及最低佣金的用例再加一条负向断言，钉住修复前的错误数字不再回来；
+· **不放宽断言**：金额比较一律 ``delta=1e-9``（展示层 6 位小数处用 ``delta=1e-6`` 并注明原因），
+  绝不用「差得不多就算对」的写法 —— 交易规则算错是静默的，放宽断言等于放弃唯一的保护；
 · **用被测 API 造夹具**：建仓走 ``execute_orders``（paper），因此后续断言站在
   「同一个口径」上；只有需要隔离时（例如现金不足）才直接改写 state；
 · **断言的 docstring 说明「为什么断言这件事」**，而不是复述代码。
@@ -33,6 +46,7 @@ N. TestPersistence      新 Store 实例读回一致（配置 / 账户 / 累计�
     python3 -m unittest discover -s tests -p "test_*.py"
 """
 
+import datetime
 import functools
 import json
 import math
@@ -43,6 +57,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date, timedelta
+from unittest import mock
 
 # 让测试既能在 stock-terminal/ 下跑，也能在仓库根目录下跑
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,30 +99,88 @@ ORDER_KEYS = {
 
 
 # --------------------------------------------------------------------------- #
-# 手算公式（与 core/advisor._round_trip 完全同源，故意在测试里重写一遍）
+# 手算公式（与 core/rules.DEFAULT_FEES 完全同源，故意在测试里重写一遍）
 # --------------------------------------------------------------------------- #
-def buy_all_in(qty, price, fee=FEE, slip=SLIP):
-    """买入总成本：qty × price × (1+滑点) × (1+费率)。"""
-    return qty * price * (1.0 + slip) * (1.0 + fee)
+#: 逐项费用的四个费率（core/rules.DEFAULT_FEES["cn"]）
+COMMISSION_RATE = 0.00025      # 佣金万 2.5（双向）
+COMMISSION_MIN = 5.0           # 佣金不足 5 元按 5 元
+STAMP_RATE = 0.0005            # 印花税 0.05%（**仅卖出单边**）
+TRANSFER_RATE = 0.00001        # 过户费 0.001%（双向）
+HANDLING_RATE = 0.0000341      # 经手费 0.00341%（双向，沪深）
 
 
-def sell_net_of(qty, price, fee=FEE, slip=SLIP):
-    """卖出净收入：qty × price × (1−滑点) × (1−费率)。"""
-    return qty * price * (1.0 - slip) * (1.0 - fee)
+def fee_cn(side, qty, fill_price, min_applied=True):
+    """A 股逐项费用手算（元）：佣金 + [印花税] + 过户费 + 经手费，逐项四舍五入到 0.0001 元后求和。
+
+    算式（1 万元成交额、买入）：
+      佣金   max(10000 × 0.00025, 5) = 5          ← 命中最低值 5 元
+      过户费  10000 × 0.00001       = 0.1
+      经手费  10000 × 0.0000341     = 0.341
+      → 合计 5 + 0.1 + 0.341 = **5.441**（卖出再把佣金之外的印花税 10000 × 0.0005 = 5 加上 → 10.441）
+
+    ``min_applied=False`` 复刻**修复前的错误口径**（缺陷 F1：命中最低佣金时佣金项记的仍是
+    按费率算出的数）。它现在只用于负向断言（钉住那个错误数字不再回来），
+    正常断言一律用默认的 ``min_applied=True`` —— 只有「佣金不足 5 元」的单子
+    （沪深成交额 < 2 万元）两者才不同，其余单子两种口径本来就相等。
+    """
+    notional = qty * fill_price
+    comm = notional * COMMISSION_RATE
+    if comm < COMMISSION_MIN and min_applied:
+        comm = COMMISSION_MIN
+    items = [comm]
+    if str(side).strip().lower() in ("sell", "reduce", "close"):
+        items.append(notional * STAMP_RATE)
+    items.append(notional * TRANSFER_RATE)
+    items.append(notional * HANDLING_RATE)
+    return round(sum(round(x, 4) for x in items), 4)
 
 
 def fill_buy_price(price, slip=SLIP):
+    """买入含滑点成交价：price × (1+滑点)。"""
     return price * (1.0 + slip)
 
 
 def fill_sell_price(price, slip=SLIP):
+    """卖出含滑点成交价：price × (1−滑点)。"""
     return price * (1.0 - slip)
 
 
-def new_avg(q_old, avg_old, qty, price, fee, slip=SLIP):
-    """加仓均价：new_avg = (qty_old×avg_old + qty×fillPrice + fee) / (qty_old + qty)。"""
+def buy_all_in(qty, price, slip=SLIP, min_applied=True):
+    """买入现金流出 = 含滑点成交金额 + 逐项费用（费用不再按单一费率算）。"""
     fill = fill_buy_price(price, slip)
-    return (q_old * avg_old + qty * fill + qty * fill * fee) / (q_old + qty)
+    return qty * fill + fee_cn("buy", qty, fill, min_applied)
+
+
+def sell_net_of(qty, price, slip=SLIP, min_applied=True):
+    """卖出净收入 = 含滑点成交金额 − 逐项费用（卖出另含 0.05% 印花税）。"""
+    fill = fill_sell_price(price, slip)
+    return qty * fill - fee_cn("sell", qty, fill, min_applied)
+
+
+def new_avg(q_old, avg_old, qty, price, slip=SLIP, min_applied=True):
+    """加仓均价：new_avg = (老成本 + 新成交金额 + 新单费用) / (老股数 + 新股数)。
+
+    费用进成本（与 ``_settle`` 的 ``avg = (q_old×avg_old + qty×fill + fee) / q_new`` 同口径）。
+    """
+    fill = fill_buy_price(price, slip)
+    return (q_old * avg_old + qty * fill + fee_cn("buy", qty, fill, min_applied)) / (q_old + qty)
+
+
+# --------------------------------------------------------------------------- #
+# T+1 的时间夹具（为什么必须钉死时间）
+# --------------------------------------------------------------------------- #
+#: ``core/trader._trade_day`` 按**北京时间（UTC+8）**把毫秒时间戳归到 ``YYYY-MM-DD``，
+#: 而 ``_sellable_of`` 用「今日买入的归属日 == 本次成交日」判断可卖量。因此「当日买、次日卖」
+#: 这类用例必须让两次调用落在**不同的北京时间日期**上：这里固定两个**北京时间的白天时刻
+#: （10:30）**，既避开 00:00 的跨日边界，也不依赖跑测试的机器时区与当天日期。
+BJ_TZ = datetime.timezone(datetime.timedelta(hours=8))
+DAY1_MS = int(datetime.datetime(2026, 9, 17, 10, 30, tzinfo=BJ_TZ).timestamp() * 1000)  # 周四
+DAY2_MS = int(datetime.datetime(2026, 9, 18, 10, 30, tzinfo=BJ_TZ).timestamp() * 1000)  # 次日（周五）
+
+
+def on_day(ms):
+    """把 ``core/trader`` 眼里的「现在」钉在指定毫秒（``execute_orders`` 内部调 ``now_ms()``）。"""
+    return mock.patch.object(T, "now_ms", return_value=ms)
 
 
 # --------------------------------------------------------------------------- #
@@ -564,12 +637,18 @@ class TestAccount(TraderCase):
         self.json_ok(view, "account_view")
 
     def test_reset_account_keeps_history(self):
-        """重置只清账户与累计量，**不删委托单**（审计需要），并在返回值里说明。"""
+        """重置只清账户与累计量，**不删委托单**（审计需要），并在返回值里说明。
+
+        时间夹具：建仓 DAY1 → 清仓 DAY2（北京时间白天时刻）。本用例验证的是「重置语义」，
+        而清仓是卖出、当日买入的部分受 T+1 约束，所以必须跨日，否则会被 T+1 正确拒单。
+        """
         store = self.make_store()
         cfg = paper_cfg()
-        self.seed(store, cfg, qty=200, price=100.0)
-        view = T.execute_orders(store, cfg, [sell_order(qty=200, intent="close")],
-                                {"600519": 100.0})
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=200, price=100.0)
+        with on_day(DAY2_MS):
+            view = T.execute_orders(store, cfg, [sell_order(qty=200, intent="close")],
+                                    {"600519": 100.0})
         self.assertEqual(view["account"]["positionCount"], 0)
         orders_before = store.list_trade_orders(limit=100)["total"]
         self.assertGreater(orders_before, 0)
@@ -1108,7 +1187,12 @@ class TestExecutePaper(TraderCase):
         self.assertEqual(fo["qty"], qty)
         self.assertAlmostEqual(fo["fillPrice"], fill_buy_price(price), delta=1e-6)
         self.assertAlmostEqual(fo["amount"], qty * fill_buy_price(price), delta=1e-6)
-        self.assertAlmostEqual(fo["fee"], qty * fill_buy_price(price) * FEE, delta=1e-6)
+        # 费用逐项：200 股 × 含滑点价 100.1 = 20020 元 →
+        #   佣金 20020 × 0.00025 = 5.005（≥ 5，未命中最低值）+ 过户费 0.2002
+        #   + 经手费 20020 × 0.0000341 = 0.6827 → 合计 5.8879 元
+        expected_fee = fee_cn("buy", qty, fill_buy_price(price))
+        self.assertAlmostEqual(expected_fee, 5.8879, delta=1e-9, msg="先核对算式本身")
+        self.assertAlmostEqual(fo["fee"], expected_fee, delta=1e-9)
         self.assertAlmostEqual(fo["slippage"], qty * price * SLIP, delta=1e-6)
         self.assertIsInstance(fo["filledAt"], int)
         self.assertEqual(fo["error"], "")
@@ -1121,7 +1205,7 @@ class TestExecutePaper(TraderCase):
         self.assertEqual(view["positionCount"], 1)
         self.assertAlmostEqual(view["marketValue"], qty * price, delta=1e-6)
         self.assertAlmostEqual(view["realizedPnl"], 0.0, delta=1e-9)
-        self.assertAlmostEqual(view["feeTotal"], qty * fill_buy_price(price) * FEE, delta=1e-6)
+        self.assertAlmostEqual(view["feeTotal"], expected_fee, delta=1e-9)
         pos = view["positions"][0]
         self.assertEqual(pos["qty"], qty)
         self.assertAlmostEqual(pos["avgPrice"], buy_all_in(qty, price) / qty, delta=1e-6)
@@ -1134,7 +1218,20 @@ class TestExecutePaper(TraderCase):
         self.json_ok(res, "execute_orders(paper)")
 
     def test_paper_add_uses_add_average_formula(self):
-        """加仓均价 = (老成本 + 新成交金额 + 费用) / 总股数，逐位对齐手算。"""
+        """加仓均价 = (老成本 + 新成交金额 + 费用) / 总股数，逐位对齐手算。
+
+        加仓 100 股 × 110 元 → 含滑点成交价 110.11、成交额 11011 元（本单**命中最低佣金档**）：
+          · 佣金 max(11011 × 0.00025, 5) = max(2.7528, 5) = **5.00**（不足 5 元按 5 元，
+            F1 修复后这个最低值真的落进 amount/total）；
+          · 过户费 11011 × 0.00001 = 0.1101；经手费 11011 × 0.0000341 = 0.3754751 → 0.3755。
+          → 本单费用 = 5 + 0.1101 + 0.3755 = **5.4856** 元。
+        老成本 200 股 × 100.1294395 = 20025.8879（建仓费用 5.8879 = 5.005 + 0.2002 + 0.6827，
+        成交额 20020 已超过 2 万元，未命中最低值）：
+          → 新均价 = (20025.8879 + 11011 + 5.4856) / 300 = 31042.3735 / 300 = **103.474578**
+
+        负向断言：修复前（佣金只记 2.7528 → 本单费用 3.2384）会得到 103.467088 老口径值，
+        这个数字必须不再出现 —— 否则「最低佣金」又被漏掉了。
+        """
         store = self.make_store()
         cfg = paper_cfg()
         self.seed(store, cfg, qty=200, price=100.0)
@@ -1149,55 +1246,98 @@ class TestExecutePaper(TraderCase):
         view = res["account"]
         pos = view["positions"][0]
         self.assertEqual(pos["qty"], 300)
-        expected_avg = new_avg(200, avg_old, 100, 110.0, FEE)
-        self.assertAlmostEqual(pos["avgPrice"], expected_avg, delta=1e-6)
+        expected_fee = fee_cn("buy", 100, fill_buy_price(110.0))
+        self.assertAlmostEqual(round(expected_fee, 4), 5.4856, delta=1e-9,
+                               msg="先核对本单费用的算式本身：5 + 0.1101 + 0.3755")
+        expected_avg = new_avg(200, avg_old, 100, 110.0)
+        self.assertAlmostEqual(round(expected_avg, 6), 103.474578, delta=1e-6)
+        self.assertAlmostEqual(pos["avgPrice"], round(expected_avg, 6), delta=1e-9)
         self.assertAlmostEqual(pos["cost"], expected_avg * 300, delta=1e-6)
         self.assertAlmostEqual(view["cash"], cash_old - buy_all_in(100, 110.0), delta=1e-6)
+        # 负向断言：F1 时代的错误均价（佣金只记 2.7528）不得回来
+        wrong_avg = round(new_avg(200, avg_old, 100, 110.0, min_applied=False), 6)
+        self.assertAlmostEqual(wrong_avg, 103.467088, delta=1e-6,
+                               msg="旧口径均价 = (20025.8879 + 11011 + 3.2384) / 300")
+        self.assertNotAlmostEqual(pos["avgPrice"], wrong_avg, delta=1e-6,
+                                  msg="均价必须含最低佣金 5.00 元（F1 回归）")
         self.assertAlmostEqual(view["feeTotal"],
-                               200 * fill_buy_price(100.0) * FEE
-                               + 100 * fill_buy_price(110.0) * FEE, delta=1e-6)
+                               fee_cn("buy", 200, fill_buy_price(100.0))
+                               + fee_cn("buy", 100, fill_buy_price(110.0)),
+                               delta=1e-9)
 
     def test_paper_reduce_keeps_avg_and_accumulates_realized(self):
-        """减仓不动均价，已实现盈亏 = 净收入 − 卖出部分的账面成本。"""
+        """减仓不动均价，已实现盈亏 = 净收入 − 卖出部分的账面成本。
+
+        卖出 100 股 × 100 元 → 含滑点价 99.9、成交额 9990 元（本单命中最低佣金档）：
+          · 佣金 max(9990 × 0.00025, 5) = max(2.4975, 5) = **5.00**；
+          · 印花税 9990 × 0.0005 = 4.995（仅卖出）；过户费 9990 × 0.00001 = 0.0999；
+            经手费 9990 × 0.0000341 = 0.340659 → 0.3407。
+          → 本单费用 = 5 + 4.995 + 0.0999 + 0.3407 = **10.4356** 元，净收入 = 9990 − 10.4356。
+
+        时间夹具：建仓在 DAY1（北京时间 2026-09-17 10:30）、减仓在 DAY2（次日同一时刻）——
+        本用例验证的是「减仓不动均价」而不是 T+1，当日买当日卖会被 T+1 正确拒单（见
+        TestTraderRulesRegression 的同日用例），因此必须让卖出落在次日的白天时刻。
+        """
         store = self.make_store()
         cfg = paper_cfg()
-        self.seed(store, cfg, qty=300, price=100.0)
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=300, price=100.0)
         st = store.get_trade_state("paper:cn")
         avg_old = st["positions"][0]["avgPrice"]
         cash_old = st["cash"]
 
-        res = T.execute_orders(store, cfg, [sell_order(qty=100, intent="reduce")],
-                               {"600519": 100.0})
+        with on_day(DAY2_MS):
+            res = T.execute_orders(store, cfg, [sell_order(qty=100, intent="reduce")],
+                                   {"600519": 100.0})
         self.assertEqual(res["filled"], 1)
         view = res["account"]
         pos = view["positions"][0]
         self.assertEqual(pos["qty"], 200)
-        self.assertAlmostEqual(pos["avgPrice"], avg_old, delta=1e-9)
+        # 减仓**不动均价**：原始状态里逐位等于减仓前的均价（视图按 6 位小数展示，
+        # 因此这里分开断言：状态用 delta=1e-9，展示值用 round(..., 6)）
+        st_after = store.get_trade_state("paper:cn")
+        self.assertAlmostEqual(st_after["positions"][0]["avgPrice"], avg_old, delta=1e-9)
+        self.assertAlmostEqual(pos["avgPrice"], round(avg_old, 6), delta=1e-9)
         self.assertAlmostEqual(pos["cost"], avg_old * 200, delta=1e-6)
-        expected_realized = sell_net_of(100, 100.0) - avg_old * 100
+        self.assertAlmostEqual(round(fee_cn("sell", 100, fill_sell_price(100.0)), 4), 10.4356,
+                               delta=1e-9, msg="先核对本单费用的算式本身")
+        sell_net = sell_net_of(100, 100.0)
+        expected_realized = sell_net - avg_old * 100
         self.assertAlmostEqual(view["realizedPnl"], expected_realized, delta=1e-6)
         self.assertAlmostEqual(res["realizedPnl"], expected_realized, delta=1e-6)
-        self.assertAlmostEqual(view["cash"], cash_old + sell_net_of(100, 100.0), delta=1e-6)
+        self.assertAlmostEqual(view["cash"], cash_old + sell_net, delta=1e-6)
         self.assertAlmostEqual(view["feeTotal"],
-                               300 * fill_buy_price(100.0) * FEE
-                               + 100 * fill_sell_price(100.0) * FEE, delta=1e-6)
+                               fee_cn("buy", 300, fill_buy_price(100.0))
+                               + fee_cn("sell", 100, fill_sell_price(100.0)),
+                               delta=1e-9)
         self.assertEqual(len(store.list_trade_equity("paper:cn")), 2)
 
     def test_paper_close_removes_position_and_books_pnl(self):
-        """清仓后持仓消失、权益 = 现金、已实现盈亏累计到累计量里。"""
+        """清仓后持仓消失、权益 = 现金、已实现盈亏累计到累计量里。
+
+        卖出 300 股 × 100 元 → 成交额 29970 元：佣金 max(29970 × 0.00025, 5) = 7.4925
+        （≥ 5，**未**命中最低值）+ 印花税 14.985 + 过户费 0.2997 + 经手费 1.022 = 23.7992 元。
+
+        时间夹具：建仓 DAY1 → 清仓 DAY2。清仓是**卖出**，当日买入的部分受 T+1 约束，
+        因此必须跨日（T+1 生效后同一批持仓在当日无法卖出）。
+        """
         store = self.make_store()
         cfg = paper_cfg()
-        self.seed(store, cfg, qty=300, price=100.0)
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=300, price=100.0)
         st = store.get_trade_state("paper:cn")
         avg_old = st["positions"][0]["avgPrice"]
 
-        res = T.execute_orders(store, cfg, [sell_order(qty=300, intent="close")],
-                               {"600519": 100.0})
+        with on_day(DAY2_MS):
+            res = T.execute_orders(store, cfg, [sell_order(qty=300, intent="close")],
+                                   {"600519": 100.0})
         self.assertEqual(res["filled"], 1)
         view = res["account"]
         self.assertEqual(view["positionCount"], 0)
         self.assertEqual(view["positions"], [])
         self.assertAlmostEqual(view["equity"], view["cash"], delta=1e-6)
+        self.assertAlmostEqual(sell_net_of(300, 100.0), 29970 - 23.7992, delta=1e-6,
+                               msg="先核对卖出净收入的算式本身")
         self.assertAlmostEqual(view["realizedPnl"],
                                sell_net_of(300, 100.0) - avg_old * 300, delta=1e-6)
         self.assertAlmostEqual(view["marketValue"], 0.0, delta=1e-9)
@@ -1205,26 +1345,55 @@ class TestExecutePaper(TraderCase):
                                (view["equity"] / CAP - 1.0) * 100.0, delta=1e-4)
 
     def test_paper_recomputes_qty_from_live_quote(self):
-        """执行时用最新报价重算股数：价格涨了自动少买，跌了可多买（同计划金额）。"""
+        """执行时用最新报价重算股数：价格涨了自动少买，跌了可多买（同计划金额）。
+
+        场景改成**规则内**的波动（涨停价 ±10% 以内）：信号价 10 元、计划 2500 股，
+          · 报价 10.5（+5%）→ 2500 × 10 ÷ 10.5 = 2380.95 → 整手向下取整 2300 股（少买）；
+          · 报价 9.6（−4%）→ 2500 × 10 ÷ 9.6 = 2604.17 → 整手向下取整 2600 股（多买）。
+        原来用的 +25%（100 → 125）已经**超过涨停价**，会被本轮新增的封板校验拒单 ——
+        那正是这条规则该做的事，「报价超涨停被拒」单列在下一个用例。
+        """
         store = self.make_store()
         cfg = paper_cfg()
-        plan = self.plan(store, cfg, [make_row(price=100.0, weight=0.25)], {"600519": 100.0})
+        plan = self.plan(store, cfg, [make_row(price=10.0, weight=0.25)], {"600519": 10.0})
         o = plan["orders"][0]
-        self.assertEqual(o["qty"], 200)
+        self.assertEqual(o["qty"], 2500)
 
-        res_up = T.execute_orders(store, cfg, [dict(o, id=T.order_id())], {"600519": 125.0})
+        res_up = T.execute_orders(store, cfg, [dict(o, id=T.order_id())], {"600519": 10.5})
         self.assertEqual(res_up["filled"], 1)
-        self.assertEqual(res_up["orders"][0]["qty"], 100)       # 200×100/125 = 160 → 100 股
+        self.assertEqual(res_up["orders"][0]["qty"], 2300)      # 2500×10/10.5 = 2380 → 2300
         self.assertAlmostEqual(res_up["account"]["cash"],
-                               CAP - buy_all_in(100, 125.0), delta=1e-6)
+                               CAP - buy_all_in(2300, 10.5), delta=1e-6)
 
         store2 = self.make_store()
-        plan2 = self.plan(store2, cfg, [make_row(price=100.0, weight=0.25)], {"600519": 100.0})
-        res_down = T.execute_orders(store2, cfg, plan2["orders"], {"600519": 40.0})
+        plan2 = self.plan(store2, cfg, [make_row(price=10.0, weight=0.25)], {"600519": 10.0})
+        res_down = T.execute_orders(store2, cfg, plan2["orders"], {"600519": 9.6})
         self.assertEqual(res_down["filled"], 1)
-        self.assertEqual(res_down["orders"][0]["qty"], 500)     # 200×100/40 = 500 股
+        self.assertEqual(res_down["orders"][0]["qty"], 2600)    # 2500×10/9.6 = 2604 → 2600
         self.assertAlmostEqual(res_down["account"]["cash"],
-                               CAP - buy_all_in(500, 40.0), delta=1e-6)
+                               CAP - buy_all_in(2600, 9.6), delta=1e-6)
+
+    def test_paper_rejects_buy_above_limit_up(self):
+        """报价**超过涨停价**（信号价 100 → 涨停 110，最新报价 125）必须拒单，
+        error 里带「交易规则」并说清是封板 —— 不判封板会在连板股上凭空造出
+        「每天都买在涨停价」的虚假收益（纸面漂亮，实盘根本成交不了）。"""
+        store = self.make_store()
+        cfg = paper_cfg()
+        res = T.execute_orders(store, cfg,
+                               [buy_order(qty=200, price=125.0, signalPrice=100.0)],
+                               {"600519": 125.0})
+        self.assertEqual(res["filled"], 0)
+        self.assertEqual(res["rejected"], 1)
+        o = res["orders"][0]
+        self.assertEqual(o["status"], "rejected")
+        self.assertIn("交易规则", o["error"])
+        self.assertIn("涨停", o["error"])
+        # 被拒的一笔不得动账户：现金与持仓分毫不变
+        self.assertEqual(res["account"]["cash"], CAP)
+        self.assertEqual(res["account"]["positionCount"], 0)
+        self.assertEqual(res["feeTotal"], 0.0)
+        self.assertEqual(len(store.list_trade_equity("paper:cn")), 0,
+                         "被拒单不得追加权益点")
 
     def test_paper_only_appends_one_equity_point_per_call(self):
         """一次 execute_orders 只追加一个权益点（否则曲线被重复点污染）。"""
@@ -1396,15 +1565,26 @@ class TestOrderFlows(TraderCase):
         self.json_ok(res, "export_intents")
 
     def test_close_position_manual_ignores_enabled(self):
-        """手动平仓是用户显式意图：不受 enabled 限制，但仍按 paper 报价成交。"""
+        """手动平仓是用户显式意图：不受 ``enabled`` 限制，但仍按 paper 报价成交。
+
+        时间夹具（为什么必须跨日）：``close_position`` 本轮**新增了 T+1 校验** ——
+        「不受 enabled 限制」指的是不受总开关限制，**不等于**不受交易规则限制；
+        当日买入的持仓在手动路径上同样卖不掉（见
+        :meth:`test_close_position_same_day_is_rejected_t_plus_1`），
+        所以「验证 enabled 开关与费用口径」这件事必须让卖出落在次日：
+        ``on_day(DAY1_MS)`` 建仓、``on_day(DAY2_MS)`` 手动平仓
+        （``_sellable_of`` 用 ``_trade_day`` 比较买卖归属日，跨日后整仓都算昨仓）。
+        """
         store = self.make_store()
         cfg = paper_cfg(enabled=False, mode="paper")
-        self.seed(store, cfg, qty=200, price=100.0)
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=200, price=100.0)
         st = store.get_trade_state("paper:cn")
         cash_old = st["cash"]
         avg_old = st["positions"][0]["avgPrice"]
 
-        res = T.close_position(store, cfg, "600519", {"600519": 100.0})
+        with on_day(DAY2_MS):
+            res = T.close_position(store, cfg, "600519", {"600519": 100.0})
         self.assertTrue(res["ok"])
         self.assertEqual(res["filled"], 1)
         self.assertEqual(res["qty"], 200)
@@ -1416,22 +1596,110 @@ class TestOrderFlows(TraderCase):
         self.assertIn("手动平仓", o["reason"])
         self.assertIn("不受 enabled", o["reason"])
         self.assertEqual(res["account"]["positionCount"], 0)
-        self.assertAlmostEqual(res["account"]["cash"], cash_old + sell_net_of(200, 100.0),
+        # 卖出 200 股 × 100 元 → 含滑点价 99.9、成交额 19980 元：
+        #   佣金 max(19980 × 0.00025, 5) = max(4.995, 5) = 5.00（命中最低值）；
+        #   印花税 19980 × 0.0005 = 9.99；过户费 19980 × 0.00001 = 0.1998；
+        #   经手费 19980 × 0.0000341 = 0.681318 → 0.6813
+        #   → 合计 5 + 9.99 + 0.1998 + 0.6813 = 15.8711 元 → 净收入 19980 − 15.8711
+        self.assertAlmostEqual(sell_net_of(200, 100.0), 19980 - 15.8711, delta=1e-9,
+                               msg="先核对卖出净收入的算式本身")
+        self.assertAlmostEqual(res["account"]["cash"],
+                               cash_old + sell_net_of(200, 100.0),
                                delta=1e-6)
         self.assertAlmostEqual(res["account"]["realizedPnl"],
-                               sell_net_of(200, 100.0) - avg_old * 200, delta=1e-6)
+                               sell_net_of(200, 100.0) - avg_old * 200,
+                               delta=1e-6)
         self.assertEqual(store.get_trade_order(o["id"])["status"], "filled")
         self.json_ok(res, "close_position")
 
     def test_close_position_partial_qty(self):
-        """可以只平一部分（按整手向下取整）；剩余持仓保持均价不变。"""
+        """可以只平一部分（按整手向下取整）；剩余持仓保持均价不变。
+
+        时间夹具：与上一条同样的理由 —— 平仓受 T+1 约束，建仓必须落在**前一交易日**，
+        否则被卖的那部分（300 股全部当日买入）不可卖。
+        """
         store = self.make_store()
         cfg = paper_cfg()
-        self.seed(store, cfg, qty=300, price=100.0)
-        res = T.close_position(store, cfg, "600519", {"600519": 100.0}, qty=100)
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=300, price=100.0)
+        avg_old = store.get_trade_state("paper:cn")["positions"][0]["avgPrice"]
+        with on_day(DAY2_MS):
+            res = T.close_position(store, cfg, "600519", {"600519": 100.0}, qty=100)
         self.assertTrue(res["ok"])
         self.assertEqual(res["qty"], 100)
         self.assertEqual(res["account"]["positions"][0]["qty"], 200)
+        # 清仓/减仓只累计 realizedPnl，不动 avgPrice（与 core/trader._settle 的卖出口径一致）
+        pos_after = store.get_trade_state("paper:cn")["positions"][0]
+        self.assertAlmostEqual(pos_after["avgPrice"], avg_old, delta=1e-9,
+                               msg="部分平仓不得改变剩余持仓均价（卖出只动 realizedPnl）")
+        self.assertAlmostEqual(res["account"]["positions"][0]["avgPrice"], avg_old,
+                               delta=1e-6,
+                               msg="account_view 里的均价是 6 位小数的展示值，故这里取 1e-6")
+
+    def test_close_position_same_day_is_rejected_t_plus_1(self):
+        """**新增回归（手动路径的 T+1）**：当日买入 → 当日**手动**平仓必须被拒，账户分毫不动。
+
+        为什么手动路径也必须守 T+1：此前 ``close_position`` 直接走 ``_settle``、
+        绕过了执行前的 T+1 校验，于是同一件事出现两种答案 —— 自动路径卖当日买入被拒、
+        手动路径却成功，等于给模拟盘留了一个 T+0 后门（纸面收益凭空多出一截）。
+        「不受 enabled 限制」说的是不受**总开关**限制，不是不受**交易规则**限制。
+
+        期望值（逐条核对，不是抄实现）：
+          · ``ok=False`` / ``filled=0`` / ``order is None``（拒单不建半截委托）；
+          · ``note`` 含「T+1」且点明是「当日买入」（第一分支文案：
+            「T+1 限制：该持仓 200 股为当日买入，当日不可卖出（手动平仓同样遵守 T+1）。」）；
+          · 账户快照（现金 / 持仓 / 均价 / 更新时间戳以外的全部字段）与平仓前**逐字段相同**。
+        """
+        store = self.make_store()
+        cfg = paper_cfg(enabled=False, mode="paper")     # 总开关关着，T+1 依然要拦
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=200, price=100.0)
+        before = self.state_json(store, "paper:cn")
+
+        with on_day(DAY1_MS):
+            res = T.close_position(store, cfg, "600519", {"600519": 100.0})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["filled"], 0)
+        self.assertIsNone(res["order"])
+        self.assertIn("T+1", res["note"])
+        self.assertIn("当日买入", res["note"])
+        self.assertEqual(self.state_json(store, "paper:cn"), before,
+                         "被 T+1 拒绝的手动平仓不得动账户（现金与持仓都不许变）")
+
+    def test_close_position_only_yesterday_part_is_sellable(self):
+        """**新增回归**：部分持仓里「今日买入的那部分」不可卖，可卖量 = 持仓 − 今日买入。
+
+        构造（跨日）：DAY1 买入 300 股 → DAY2 再买入 200 股，合计 500 股，
+        其中 ``todayBought=200``（``_settle`` 在 DAY2 把上一日的标记归零后重新累计）。
+        于是 ``_sellable_of`` = 500 − 200 = **300** 股。
+        期望值（手算）：
+          · ``qty=400`` → 400 > 300 → 拒单，note 里写「可卖 300 股」，账户不变；
+          · ``qty=300`` → 300 ≤ 300 → 成交（且是整手），持仓剩 500 − 300 = 200 股。
+        """
+        store = self.make_store()
+        cfg = paper_cfg(enabled=False, mode="paper")
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=300, price=100.0)          # 昨仓 300
+        with on_day(DAY2_MS):
+            self.seed(store, cfg, qty=200, price=100.0)          # 今日买入 200 → 合计 500
+        pos = store.get_trade_state("paper:cn")["positions"][0]
+        self.assertEqual(pos["qty"], 500)
+        self.assertEqual(pos["todayBought"], 200)
+        before = self.state_json(store, "paper:cn")
+
+        with on_day(DAY2_MS):
+            too_much = T.close_position(store, cfg, "600519", {"600519": 100.0}, qty=400)
+        self.assertFalse(too_much["ok"], "要卖 400 股超过可卖的 300 股，必须拒单")
+        self.assertIn("T+1", too_much["note"])
+        self.assertIn("可卖 300", too_much["note"])
+        self.assertIsNone(too_much["order"])
+        self.assertEqual(self.state_json(store, "paper:cn"), before, "被拒的平仓不得动账户")
+
+        with on_day(DAY2_MS):
+            ok = T.close_position(store, cfg, "600519", {"600519": 100.0}, qty=300)
+        self.assertTrue(ok["ok"], "正好等于可卖量（300 股）应当成交")
+        self.assertEqual(ok["qty"], 300)
+        self.assertEqual(ok["account"]["positions"][0]["qty"], 200)
 
     def test_close_position_dryrun_protects_account(self):
         """dryrun 下手动平仓也只出计划：账户状态与累计量一律不动。"""
@@ -1763,13 +2031,19 @@ class TestDirtyInput(TraderCase):
 # --------------------------------------------------------------------------- #
 class TestPersistence(TraderCase):
     def test_roundtrip_new_store_instance(self):
-        """换 Store 实例读回：账户 / 累计量 / 委托单 / 配置全部一致（重启不丢状态）。"""
+        """换 Store 实例读回：账户 / 累计量 / 委托单 / 配置全部一致（重启不丢状态）。
+
+        时间夹具：建仓 DAY1 → 减仓 DAY2（北京时间白天时刻）。减仓是卖出，当日买入的部分
+        受 T+1 约束，跨日才能成交；本用例验证的是「持久化往返」，不是 T+1。
+        """
         store, path = self.file_store()
         cfg = T.save_config(store, {"enabled": True, "mode": "paper",
                                     "universe": ["600519"], "capital": CAP})
-        self.seed(store, cfg, qty=300, price=100.0)
-        T.execute_orders(store, cfg, [sell_order(qty=100, intent="reduce")],
-                         {"600519": 100.0})
+        with on_day(DAY1_MS):
+            self.seed(store, cfg, qty=300, price=100.0)
+        with on_day(DAY2_MS):
+            T.execute_orders(store, cfg, [sell_order(qty=100, intent="reduce")],
+                             {"600519": 100.0})
         state_before = store.get_trade_state("paper:cn")
         meta_before = store.meta_get("trade:meta:paper:cn", None)
         orders_before = store.list_trade_orders(limit=100)
@@ -1901,6 +2175,336 @@ class TestAdvisorIntegration(TraderCase):
         self.assertLessEqual(view["marketValue"] / CAP, 0.25 + 1e-6,
                              "单只权重不得超过 maxWeight（含整手取整误差）")
         self.assertGreaterEqual(view["cash"], 0.0, "模拟账户不允许透支")
+
+
+# --------------------------------------------------------------------------- #
+# P. 交易规则接线回归（本轮新增：逐项费用 / T+1 可卖 / 涨跌停封板拒单）
+# --------------------------------------------------------------------------- #
+class TestTraderRulesRegression(TraderCase):
+    """trade 引擎接到 ``core/rules`` 之后的**口径回归**（含本轮修好的三个接线缺陷）：
+
+    ① 买入费用命中最低佣金 → 逐项口径（F1 修复后最低值真的落进 fee）；
+    ② 卖出费用含印花税、且大于买入同额费用；
+    ③ 当日买入当日卖出被拒（error 含「T+1」）—— **同批次**与**跨批次**两种调用形态都要拒；
+    ④ 跨日后可卖（T+1 只锁「当日买入」）；
+    ⑤ 涨停价买入被拒（error 含「交易规则」）；
+    ⑥ todayBought 随部分卖出正确收缩，且 todayBought / todayBoughtOn 随账户持久化。
+
+    本轮之前这里有 3 个 ``@unittest.expectedFailure``，现都已成为常规回归用例：
+      F1 命中最低佣金时最低值没进 ``total``；
+      F2 ``_positions()`` 丢掉 ``todayBought`` → 跨调用的「当日买当日卖」不被拦截；
+      F3 毫秒 ts 交给秒口径的 rules → 美股 paper 成交抛 ``ValueError: year 58679 ...``。
+
+    逐项费用算式（与 core/rules.DEFAULT_FEES 同源，测试里重写）：
+      1 万元买入 = 佣金 max(10000×0.00025, 5) + 过户费 10000×0.00001 + 经手费 10000×0.0000341
+                 = 5 + 0.1 + 0.341 = 5.441（佣金命中最低值）
+      1 万元卖出 = 5.441 + 印花税 10000×0.0005 = 10.441（印花税仅卖出单边）
+      100 万元买入 = 250 + 10 + 34.1 = 294.1（佣金 250 ≥ 5，不再命中最低值）
+
+    时间夹具：凡涉及卖出 / 平仓的用例一律 ``on_day(DAY1_MS)`` 建仓、``on_day(DAY2_MS)``
+    卖出（北京时间的白天时刻，且确为相邻两个自然日）—— T+1 现在真的生效，同日卖出会被拒。
+    """
+
+    # ---- ① 费用逐项口径（含 F1 回归） ------------------------------------- #
+    def test_buy_fee_is_itemized_not_a_single_rate(self):
+        """费用确实换成了**逐项口径**：1 万元买入不再是「成交额 × 单一费率」。
+        单一 0.03% 口径给 100 × 100.1 × 0.0003 = 3.003 元；逐项口径（F1 修复后）
+        = 佣金 5.00（最低值）+ 过户费 10010×0.00001 = 0.1001
+        + 经手费 10010×0.0000341 = 0.3413 = **5.4414 元**，两者必须不同。"""
+        store = self.make_store()
+        cfg = paper_cfg()
+        res = T.execute_orders(store, cfg, [buy_order(qty=100, price=100.0)],
+                               {"600519": 100.0})
+        self.assertEqual(res["filled"], 1)
+        fo = res["orders"][0]
+        single_rate = 100 * fill_buy_price(100.0) * FEE          # 10010 × 0.0003 = 3.003
+        self.assertNotAlmostEqual(fo["fee"], single_rate, delta=1e-6,
+                                  msg="费用必须走逐项口径，不能再是单一费率")
+        fee_min = fee_cn("buy", 100, fill_buy_price(100.0))
+        self.assertEqual(round(fee_min, 4), 5.4414,
+                         "逐项口径 = 5.00(最低佣金) + 0.1001(过户费) + 0.3413(经手费)")
+        self.assertAlmostEqual(fo["fee"], fee_min, delta=1e-9)
+        self.assertAlmostEqual(res["account"]["feeTotal"], fee_min, delta=1e-9)
+        # 负向断言：F1 时代「佣金只记 2.5025」的错误口径（合计 2.9439）不得回来
+        self.assertNotAlmostEqual(fo["fee"],
+                                  fee_cn("buy", 100, fill_buy_price(100.0), min_applied=False),
+                                  delta=1e-6, msg="最低佣金必须计入费用（F1 回归）")
+
+    def test_buy_fee_hits_min_commission(self):
+        """①买入费用命中最低佣金（**F1 回归**）：1 万元买入（100 股 × 100 元，含滑点成交价
+        100.1）的费用 = 佣金 5.00（最低值）+ 过户费 0.1001 + 经手费 0.3413 = **5.4414 元**；
+        现金流出按同一口径：CAP − (10010 + 5.4414)。"""
+        store = self.make_store()
+        cfg = paper_cfg()
+        res = T.execute_orders(store, cfg, [buy_order(qty=100, price=100.0)],
+                               {"600519": 100.0})
+        self.assertEqual(res["filled"], 1)
+        self.assertAlmostEqual(res["orders"][0]["fee"], 5.00 + 0.1001 + 0.3413, delta=1e-9)
+        self.assertAlmostEqual(res["account"]["cash"], CAP - buy_all_in(100, 100.0), delta=1e-6)
+
+    # ---- ② 卖出含印花税且大于买入 ---------------------------------------- #
+    def test_sell_fee_includes_stamp_tax_and_exceeds_buy(self):
+        """②同一成交额（500 股 × 100 元 ≈ 5 万元，避开最低佣金档）下：
+          · 买入费用 = 佣金 12.5125 + 过户费 0.5005 + 经手费 1.7067 = 14.7197 元；
+          · 卖出费用 = 12.4875 + 印花税 24.975 + 0.4995 + 1.7033 = 39.6653 元；
+          · 差额恰为印花税 0.05%（单边），且卖出 > 买入。
+        买入与卖出跨日执行（``on_day`` 钉在北京时间的相邻两天），否则会先被 T+1 拦下。
+        """
+        store = self.make_store()
+        cfg = paper_cfg()
+        day1, day2 = DAY1_MS, DAY2_MS
+        with on_day(day1):
+            first = T.execute_orders(store, cfg, [buy_order(qty=500, price=100.0, oid="b1")],
+                                     {"600519": 100.0})
+        self.assertEqual(first["filled"], 1)
+        buy_fee = first["orders"][0]["fee"]
+        self.assertAlmostEqual(buy_fee, fee_cn("buy", 500, fill_buy_price(100.0)), delta=1e-9)
+        self.assertAlmostEqual(buy_fee, 14.7197, delta=1e-9)      # 已核对算式
+
+        with on_day(day2):
+            second = T.execute_orders(store, cfg,
+                                      [sell_order(qty=500, price=100.0, intent="close",
+                                                  oid="s1")],
+                                      {"600519": 100.0})
+        self.assertEqual(second["filled"], 1)
+        sell_fee = second["orders"][0]["fee"]
+        stamp = 500 * fill_sell_price(100.0) * STAMP_RATE         # 49950 × 0.0005 = 24.975
+        self.assertAlmostEqual(sell_fee, fee_cn("sell", 500, fill_sell_price(100.0)), delta=1e-9)
+        self.assertAlmostEqual(sell_fee, 39.6653, delta=1e-9)     # 已核对算式
+        # 手算差额（两腿成交价不同：买入 100.1 / 卖出 99.9，因此除印花税外还有费率差）：
+        #   印花税 24.975 − 佣金差 0.025 − 过户费差 0.001 − 经手费差 0.0034 = 24.9456
+        self.assertAlmostEqual(round(sell_fee - buy_fee, 4),
+                               round(stamp - 0.025 - 0.001 - 0.0034, 4), delta=1e-9,
+                               msg="差额 = 印花税 + 三项因成交价不同产生的费率差")
+        self.assertAlmostEqual(round(sell_fee - buy_fee, 4), 24.9456, delta=1e-9)
+        self.assertGreater(sell_fee - buy_fee, stamp * 0.99, msg="差额的主体就是印花税")
+        self.assertGreater(sell_fee, buy_fee)
+
+    # ---- ③ 当日买入当日卖出被拒（T+1） ------------------------------------ #
+    def test_same_day_sell_rejected_t_plus_1(self):
+        """③当日买入当日卖出被拒（**同一批次**）：error 含「T+1」，且被拒的那笔不动账户。
+
+        夹具把买单与卖单放在**同一个 execute_orders 批次**里：批次内持仓对象会被
+        ``_settle`` 就地打上 ``todayBought`` 标记，因此 T+1 校验能看到它。
+        跨批次（先买一个调用、再卖另一个调用）的形态见
+        :meth:`test_same_day_sell_across_calls_is_rejected_t_plus_1`。
+        """
+        store = self.make_store()
+        cfg = paper_cfg()
+        res = T.execute_orders(store, cfg,
+                               [buy_order(qty=200, price=100.0, oid="b1"),
+                                sell_order(qty=100, price=100.0, intent="reduce", oid="s1")],
+                               {"600519": 100.0})
+        self.assertEqual(res["filled"], 1)
+        self.assertEqual(res["rejected"], 1)
+        by_id = {o["id"]: o for o in res["orders"]}
+        self.assertEqual(by_id["b1"]["status"], "filled")
+        self.assertEqual(by_id["s1"]["status"], "rejected")
+        self.assertIn("T+1", by_id["s1"]["error"])
+        self.assertIn("今日买入", by_id["s1"]["error"])
+        # 账户只吃了买入那一笔：持仓 200 股、没有变成 100 股
+        self.assertEqual(res["account"]["positions"][0]["qty"], 200)
+        self.assertAlmostEqual(res["account"]["cash"], CAP - buy_all_in(200, 100.0), delta=1e-6)
+
+    # ---- ④ 跨日后可卖 ------------------------------------------------------ #
+    def test_next_day_sell_is_allowed(self):
+        """④跨日后可卖：第一天买入、第二天卖出同一批股票应成交（T+1 只锁「当日买入」）。
+
+        F2 修好后这条用例才真正有区分度：**同一天**卖出会被拒（③），**跨日**才放行。
+        夹具把 ``now_ms`` 钉在 DAY1 / DAY2 两个北京时间的白天时刻 —— 不依赖机器时区与
+        当天日期，跨日边界也不会因为「其实还是同一天」而假通过。
+        """
+        store = self.make_store()
+        cfg = paper_cfg()
+        with on_day(DAY1_MS):
+            first = T.execute_orders(store, cfg, [buy_order(qty=200, price=100.0, oid="b1")],
+                                     {"600519": 100.0})
+        self.assertEqual(first["filled"], 1)
+        self.assertEqual(first["account"]["positions"][0]["todayBought"], 200,
+                         "成交当日必须标记「今日买入 200 股」（T+1 的唯一依据）")
+        with on_day(DAY2_MS):
+            second = T.execute_orders(store, cfg,
+                                      [sell_order(qty=100, price=100.0, intent="reduce",
+                                                  oid="s1")],
+                                      {"600519": 100.0})
+        self.assertEqual(second["filled"], 1)
+        self.assertEqual(second["orders"][0]["error"], "")
+        self.assertIn("已成交", second["orders"][0]["reason"])
+        self.assertEqual(second["account"]["positions"][0]["qty"], 100)
+        expected_cash = (CAP - buy_all_in(200, 100.0)
+                         + sell_net_of(100, 100.0))
+        self.assertAlmostEqual(second["account"]["cash"], expected_cash, delta=1e-6)
+
+    def test_sellable_of_counts_only_yesterday_position(self):
+        """T+1 口径的单元级核对：``_sellable_of`` = 持仓 − 今日买入（跨日自动归零）。
+        这是「可卖数量」的唯一真相来源，公共路径的拒单文案也用它。"""
+        today = now_ms()
+        self.assertEqual(T._sellable_of({"qty": 1000, "todayBought": 300}, today), 700)
+        self.assertEqual(T._sellable_of({"qty": 1000}, today), 1000)
+        # 今日买入标记属于昨天 → 整仓都是昨仓，可卖 1000
+        self.assertEqual(T._sellable_of({"qty": 1000, "todayBought": 300,
+                                         "todayBoughtOn": "1999-01-01"}, today), 1000)
+        self.assertEqual(T._sellable_of(None, today), 0)
+
+    # ---- ⑤ 涨停价买入被拒 -------------------------------------------------- #
+    def test_limit_up_buy_rejected_by_rules(self):
+        """⑤涨停价买入被拒：信号价 100 元 → 涨停 110 元，报价正好 110 元时买单排不上队，
+        error 必须含「交易规则」并说明是封板（不写清原因，用户会以为是自己填错了字段）。"""
+        store = self.make_store()
+        cfg = paper_cfg()
+        res = T.execute_orders(store, cfg,
+                               [buy_order(qty=200, price=110.0, signalPrice=100.0)],
+                               {"600519": 110.0})
+        self.assertEqual(res["filled"], 0)
+        self.assertEqual(res["rejected"], 1)
+        err = res["orders"][0]["error"]
+        self.assertIn("交易规则", err)
+        self.assertIn("涨停封板", err)
+        self.assertEqual(res["account"]["cash"], CAP)
+
+    # ---- ⑥ todayBought 随部分卖出收缩 ------------------------------------- #
+    def test_today_bought_shrinks_on_partial_sell(self):
+        """⑥``todayBought`` 随部分卖出收缩为 ``min(剩余持仓, 今日买入)``。
+
+        直接调用撮合核心 ``_settle``：公共路径（execute_orders）在 T+1 校验之后再也卖不到
+        「今日买入」那部分，所以 ``left < bought`` 这个分支只能从内部验证 ——
+        它是防御性代码，用来保证不会留下「已不存在的今日买入」把可卖数量算少。
+        夹具：持仓 500 股、其中今日买入 300 股；卖 400 股（跨过了今日买入的边界）→
+        剩余 100 股，今日买入标记同步收缩到 100 股。
+        """
+        positions = [{"code": "600519", "name": "600519", "market": "cn", "qty": 500,
+                      "avgPrice": 100.0, "cost": 50000.0, "openedAt": 0, "lastPrice": 100.0,
+                      "updatedAt": 0, "todayBought": 300, "todayBoughtOn": "2026-09-17"}]
+        fill = T._settle("sell", 400, "600519", "600519", "cn", 100.0, FEE, SLIP,
+                         10000.0, positions, 0.0, now_ms())
+        self.assertEqual(positions[0]["qty"], 100)
+        self.assertEqual(positions[0]["todayBought"], 100, "300 今日买入 − 400 卖出 → 收缩到 100")
+        self.assertLessEqual(positions[0]["todayBought"], positions[0]["qty"])
+        # 撮合费用同样走逐项口径（400 股 × 99.9 = 39960 元）
+        self.assertAlmostEqual(fill["fee"], fee_cn("sell", 400, fill_sell_price(100.0)), delta=1e-9)
+        self.assertAlmostEqual(fill["fee"], 31.7322, delta=1e-9)
+        # 剩余 100 股全是今日买入 → 可卖 0（ts=None 表示不按跨日放宽）
+        self.assertEqual(T._sellable_of(positions[0], None), 0)
+
+    # ---- F2 回归：跨两次调用的 T+1 ---------------------------------------- #
+    def test_same_day_sell_across_calls_is_rejected_t_plus_1(self):
+        """**F2 回归**（本轮前是 ``@unittest.expectedFailure``）：同一 Store、同一天，
+        **分两次** ``execute_orders`` —— 跨调用的「当日买入当日卖出」也必须被拒。
+
+        缺陷原状：``_positions()`` 归一化持仓时只保留
+        code/name/market/qty/avgPrice/cost/openedAt/lastPrice/updatedAt，
+        ``_settle`` 写下的 ``todayBought`` / ``todayBoughtOn`` 在下一次调用读回时被丢掉，
+        于是 ``_sellable_of`` 认为整仓都是昨仓 → **T+1 形同虚设**（等于给模拟盘开了 T+0
+        后门，纸面收益凭空多一截）。现已保留这两个字段。
+
+        为什么必须用「两次调用」而不是同一批次：同一批次里持仓对象被 ``_settle`` 就地
+        打上标记，缺陷不会暴露（见 ③ 的同批次用例）。
+        """
+        store = self.make_store()
+        cfg = paper_cfg()
+        with on_day(DAY1_MS):
+            first = T.execute_orders(store, cfg, [buy_order(qty=200, price=100.0, oid="b1")],
+                                     {"600519": 100.0})
+            second = T.execute_orders(store, cfg,
+                                      [sell_order(qty=100, price=100.0, intent="reduce",
+                                                  oid="s1")],
+                                      {"600519": 100.0})
+        self.assertEqual(first["filled"], 1)
+        self.assertEqual(second["rejected"], 1, "当日买入的部分不可当日卖出（T+1）")
+        self.assertEqual(second["filled"], 0)
+        self.assertIn("T+1", second["orders"][0]["error"])
+        self.assertIn("今日买入", second["orders"][0]["error"])
+        # 被拒的那笔不得动账户：持仓仍 200 股、现金只少了买入那一笔、没有已实现盈亏
+        self.assertEqual(second["account"]["positions"][0]["qty"], 200)
+        self.assertAlmostEqual(second["account"]["cash"], CAP - buy_all_in(200, 100.0),
+                               delta=1e-6)
+        self.assertAlmostEqual(second["account"]["realizedPnl"], 0.0, delta=1e-9)
+
+    def test_cross_day_sell_in_two_calls_succeeds(self):
+        """**F2 回归 · 反向**：把 ``ts`` 换成**次日同一时刻**（北京时间白天）→ 卖出成功。
+
+        ``todayBoughtOn`` 记的是 DAY1，与 DAY2 不同 → 整仓都算昨仓、可卖。
+        先断言夹具**真的跨日**（两个时间戳的交易日不同），否则这条用例会「假通过」。
+        """
+        store = self.make_store()
+        cfg = paper_cfg()
+        day1_label = T._trade_day(DAY1_MS)
+        day2_label = T._trade_day(DAY2_MS)
+        self.assertNotEqual(day1_label, day2_label, "夹具前提：DAY1/DAY2 必须落在不同的交易日")
+        with on_day(DAY1_MS):
+            first = T.execute_orders(store, cfg, [buy_order(qty=200, price=100.0, oid="b1")],
+                                     {"600519": 100.0})
+        self.assertEqual(first["filled"], 1)
+        self.assertEqual(first["account"]["positions"][0]["todayBoughtOn"], day1_label)
+        with on_day(DAY2_MS):
+            second = T.execute_orders(store, cfg,
+                                      [sell_order(qty=100, price=100.0, intent="reduce",
+                                                  oid="s1")],
+                                      {"600519": 100.0})
+        self.assertEqual(second["filled"], 1, "跨日后可卖（T+1 只锁「当日买入」）")
+        self.assertEqual(second["orders"][0]["error"], "")
+        self.assertEqual(second["account"]["positions"][0]["qty"], 100)
+        self.assertAlmostEqual(second["account"]["cash"],
+                               CAP - buy_all_in(200, 100.0) + sell_net_of(100, 100.0),
+                               delta=1e-6)
+
+    def test_today_bought_and_day_survive_persistence(self):
+        """**F2 持久化回归**：买入成交后 ``account_view`` 的持仓里
+        ``todayBought`` == 持仓数量、``todayBoughtOn`` == **北京时间的当日**；
+        换一个 Store 实例读回（走 ``account_view`` / ``execute_orders``，不直接读字典）
+        这两个字段仍在，且 T+1 依然生效。
+
+        为什么盯持久化：F2 的根因就是这两个字段在「读回账户」时被归一化丢掉 ——
+        只要它们过不了一次往返，T+1 就会在任何第二次调用里失效。
+        """
+        store, path = self.file_store()
+        cfg = T.save_config(store, {"mode": "paper", "enabled": True, "capital": CAP})
+        with on_day(DAY1_MS):
+            res = T.execute_orders(store, cfg, [buy_order(qty=200, price=100.0, oid="b1")],
+                                   {"600519": 100.0})
+        self.assertEqual(res["filled"], 1)
+        pos = res["account"]["positions"][0]
+        self.assertEqual(pos["qty"], 200)
+        self.assertEqual(pos["todayBought"], pos["qty"],
+                         "整仓都是当日买入 → todayBought 必须等于持仓数量")
+        self.assertEqual(pos["todayBoughtOn"], "2026-09-17",
+                         "归属日是北京时间（UTC+8）的当日，与 DAY1 一致")
+        store.close()
+
+        again = Store(path)
+        self.addCleanup(again.close)
+        view = T.account_view(again, T.get_config(again), {"600519": 100.0})
+        pos2 = view["positions"][0]
+        self.assertEqual(pos2["todayBought"], 200, "持久化往返后 todayBought 仍保留")
+        self.assertEqual(pos2["todayBoughtOn"], "2026-09-17",
+                         "持久化往返后 todayBoughtOn 仍保留")
+        # 换实例后的 T+1 必须依然生效：同一天（DAY1）再卖一次仍被拒
+        with on_day(DAY1_MS):
+            sell = T.execute_orders(again, T.get_config(again),
+                                    [sell_order(qty=100, price=100.0, intent="reduce",
+                                                oid="s1")],
+                                    {"600519": 100.0})
+        self.assertEqual(sell["filled"], 0)
+        self.assertEqual(sell["rejected"], 1)
+        self.assertIn("T+1", sell["orders"][0]["error"])
+
+    # ---- F3 回归：毫秒 ts 下的美股成交 ------------------------------------ #
+    def test_us_paper_fill_should_not_crash(self):
+        """**F3 回归**（本轮前是 ``@unittest.expectedFailure``）：
+        ``execute_orders`` 全链路用**毫秒** ``now_ms()``，而美股没有涨跌停价，必然走到
+        ``core/rules.session_of``（正是缺陷 F3 的爆炸点：毫秒被当秒 →
+        ``ValueError: year 58679 is out of range``，服务端 500）。
+
+        现在必须正常成交：美股 paper 模式从「完全不可用」变成可用。
+        """
+        store = self.make_store()
+        cfg = paper_cfg(market="us")
+        res = T.execute_orders(store, cfg,
+                               [buy_order(code="AAPL", qty=10, price=200.0, market="us")],
+                               {"AAPL": 200.0})
+        self.assertEqual(res["filled"], 1)
+        self.assertEqual(res["account"]["positions"][0]["code"], "AAPL")
+        self.assertEqual(res["account"]["positions"][0]["qty"], 10)
 
 
 if __name__ == "__main__":  # pragma: no cover

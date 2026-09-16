@@ -84,7 +84,7 @@ horizon : 未来K线根数（>= 1）。
 from __future__ import annotations
 
 import math
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 from datetime import datetime, timedelta
 
 from .indicators import RSI, SMA
@@ -220,20 +220,26 @@ def _volatility(closes, n):
 
 
 def _rank_quantile(values):
-    """把一维序列映射为「在自身历史中的平均秩分位」（[0, 1]，缺失值保持 None）。
+    """把一维序列映射为「在**截至该点**的历史中的平均秩分位」（[0, 1]，缺失值保持 None）。
 
-    并列值取平均秩，保证同一个值得到同一个分位；历史样本 <= 1 时全部返回 None。
+    **必须是 expanding（只用 t 时刻及之前的数据）**，不能对全样本排序后再取分位。
+    用全样本算分位等于把未来信息编进了特征：同一根K线在「当时」与「事后」会得到不同的
+    分位值，于是「找出与当前状态最相似的历史窗口」这一步在实盘中根本无法复现 ——
+    这就是典型的前视偏差（look-ahead bias），也是本模块最需要守住的一条。
+    代价是 O(n log n) 的增量插入，对几百根K线可以忽略。
+
+    并列值取平均秩，保证同一个值得到同一个分位（含自身在内共 len(seen)+1 个样本）；
+    序列首点没有参照样本，返回 None。
     """
-    valid = sorted(v for v in values if v is not None)
-    n = len(valid)
     out = [None] * len(values)
-    if n <= 1:
-        return out
+    seen = []                                    # 已出现过的值，保持有序
     for i, v in enumerate(values):
         if v is None:
             continue
-        lo, hi = bisect_left(valid, v), bisect_right(valid, v)   # [lo, hi) 为并列区
-        out[i] = ((lo + hi - 1) / 2.0) / (n - 1)
+        if seen:
+            lo, hi = bisect_left(seen, v), bisect_right(seen, v)
+            out[i] = ((lo + hi) / 2.0) / len(seen)
+        insort(seen, v)
     return out
 
 

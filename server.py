@@ -42,6 +42,10 @@ from core import storage as core_storage
 from core import strategies as core_strategies
 from core import stream as core_stream
 from core import symbols as core_symbols
+from core import rules as core_rules
+from core import scanner as core_scanner
+from core import levels as core_levels
+from core import review as core_review
 from core import trader as core_trader
 from providers import features as feat_provider
 
@@ -1740,6 +1744,192 @@ def api_symbols_lookup(q):
 
 
 # --------------------------------------------------------------------------- #
+# 买入扫描 / 买卖点位 / 交易规则 / 复盘（对接 core/scanner、core/levels、core/rules、core/review）
+# --------------------------------------------------------------------------- #
+#: 扫描参数的持久化键（存在 meta 里，重启后保留用户阈值）
+SCAN_PARAMS_KEY = "scan:params"
+
+
+def scan_params(body=None, store=None):
+    """合并「持久化参数 + 请求覆盖」，并剔除非法键（scanner 自带夹取）。"""
+    st = store if store is not None else advisor_store()
+    saved = st.meta_get(SCAN_PARAMS_KEY) or {}
+    if not isinstance(saved, dict):
+        saved = {}
+    merged = dict(saved)
+    body = body if isinstance(body, dict) else {}
+    for key, value in body.items():
+        if key in ("market", "symbols", "limit", "barsLimit", "analyze"):
+            continue
+        merged[key] = value
+    return merged
+
+
+def api_scan_config(body=None):
+    """扫描参数读写：GET 返回当前生效参数与默认值，POST 局部更新。"""
+    body = body or {}
+    st = advisor_store()
+    if body.get("patch") is not None or body.get("save"):
+        patch = body.get("patch") if isinstance(body.get("patch"), dict) else body
+        saved = dict(st.meta_get(SCAN_PARAMS_KEY) or {})
+        saved.update({k: v for k, v in patch.items()
+                      if k not in ("patch", "save", "market")})
+        st.meta_set(SCAN_PARAMS_KEY, saved)
+    saved = st.meta_get(SCAN_PARAMS_KEY) or {}
+    defaults = core_scanner.DEFAULT_SCAN_PARAMS
+    return {"ok": True, "params": {**defaults, **(saved if isinstance(saved, dict) else {})},
+            "saved": saved if isinstance(saved, dict) else {},
+            "defaults": defaults,
+            "note": ("参数键与默认值来自 core/scanner.py；硬闸门（流动性 / 反追高 / 量能）"
+                     "先过滤，再按复合评分排序取候选。修改后立即生效，扫描时可用请求体覆盖。")}
+
+
+def api_scan_run(body):
+    """全市场扫描「值得买入」的候选。
+
+    执行顺序（性能与诚实性都要求这样排）：
+    ① 用快照行跑**硬闸门**（不取K线，几千只几毫秒）；
+    ② 通过的按成交额排序，只对前 ``barsLimit`` 名取K线（默认 60 只，避免几千次网络请求）；
+    ③ 用K线做复合评分，取前 ``topN`` 名。
+    第 ③ 步之前被截断的数量会在 ``stats.truncatedByBarsLimit`` 里如实报出 ——
+    不能让用户以为「全市场都算过了」。
+    """
+    body = body or {}
+    market = str(body.get("market") or "cn").strip().lower()
+    market = "us" if market.startswith("us") else "cn"
+    cfg = scan_params(body)
+    limit = int(num(body.get("limit"), 20) or 20)
+    bars_limit = int(num(body.get("barsLimit"), 60) or 60)
+    t0 = time.time()
+    rows = us_snapshot() if market == "us" else cn_snapshot()
+    rows = [r for r in (rows or []) if isinstance(r, dict) and r.get("code")]
+    if not rows:
+        raise RuntimeError("行情快照为空，无法扫描（可能上游不可用）")
+
+    passed, rejected, missing = [], [], {}
+    for row in rows:
+        res = core_scanner.hard_filters(row, cfg)
+        if res.get("pass"):
+            passed.append(row)
+        else:
+            for reason in res.get("reasons") or ["未通过硬闸门"]:
+                rejected.append({"code": row.get("code"), "name": row.get("name"),
+                                 "reasons": res.get("reasons") or [], "gate": reason})
+            for key, cnt in (res.get("missingFieldCounts") or {}).items():
+                missing[key] = missing.get(key, 0) + int(cnt or 0)
+
+    def _amount(row):
+        for key in ("amount", "turnover", "amt", "成交额"):
+            v = num(row.get(key))
+            if v:
+                return v
+        return 0.0
+
+    passed.sort(key=_amount, reverse=True)
+    focus = passed[:max(1, bars_limit)]
+    bars_map, bars_failed = {}, []
+    for row in focus:
+        code = str(row.get("code"))
+        try:
+            bars = _runner_fetch_bars(market, code, "day", 260) or []
+        except Exception:  # noqa: BLE001  单只取数失败不影响整轮扫描
+            bars = []
+        if bars:
+            bars_map[code] = bars
+        else:
+            bars_failed.append(code)
+
+    result = core_scanner.scan_candidates(focus, bars_map, cfg, limit=limit)
+    stats = dict(result.get("stats") or {})
+    stats.update({
+        "universe": len(rows),
+        "hardPassed": len(passed),
+        "hardRejected": len(rejected),
+        "barsRequested": len(focus),
+        "barsFailed": len(bars_failed),
+        "barsFailedCodes": bars_failed[:10],
+        # 诚实性：因「只取前 N 只K线」而没被评分的数量必须报出来
+        "truncatedByBarsLimit": max(0, len(passed) - len(focus)),
+        "elapsedMs": int((time.time() - t0) * 1000),
+    })
+    # 被截断的候选也如实列出（数量可能很大，故只给计数 + 前 10 个代码）
+    truncated_codes = [r.get("code") for r in passed[len(focus):]]
+    return {
+        "ok": True, "market": market, "params": cfg,
+        "candidates": result.get("candidates") or [],
+        "rejected": (result.get("rejected") or [])[:200],
+        "hardRejectedSample": rejected[:100],
+        "missingFieldCounts": missing,
+        "stats": stats,
+        "truncatedByBarsLimit": {"count": stats["truncatedByBarsLimit"],
+                                 "codes": truncated_codes[:10],
+                                 "note": "这些标的通过了硬闸门但未取K线评分（受 barsLimit 限制）；"
+                                         "提高 barsLimit 可纳入。"},
+        "note": (result.get("note") or "") + "｜扫描结果不构成投资建议。",
+        "updated": now_ms(),
+        "durationMs": stats["elapsedMs"],
+    }
+
+
+def api_rules(q):
+    """交易规则表（版本、来源、板块涨跌幅、费用、时段、未证实项）。"""
+    q = q or {}
+    market = str(q.get("market") or "cn").strip().lower()
+    market = "us" if market.startswith("us") else "cn"
+    table = core_rules.rules_table(market)
+    table["ok"] = True
+    table["updated"] = now_ms()
+    return table
+
+
+def api_levels(q):
+    """单只标的的买卖点位（支撑阻力 / 分批建仓 / 三段式止损 / 目标 / 优先级退出 / 风险预算）。"""
+    q = q or {}
+    market = str(q.get("market") or "cn").strip().lower()
+    market = "us" if market.startswith("us") else "cn"
+    code = str(q.get("code") or q.get("symbol") or "").strip().upper()
+    if not code:
+        raise RuntimeError("请提供 code")
+    horizon = int(num(q.get("horizon"), 20) or 20)
+    capital = num(q.get("capital"))
+    bars = _runner_fetch_bars(market, code, "day", 260) or []
+    name = str(q.get("name") or "").strip() or None
+    if not name:
+        try:
+            idx = symbol_index(market)
+            name = (idx or {}).get("byCode", {}).get(code)
+        except Exception:  # noqa: BLE001
+            name = None
+    res = core_levels.plan_levels(bars, horizon=horizon)
+    if not isinstance(res, dict):
+        raise RuntimeError("点位计算未返回结果")
+    # 交易规则信息一起返回：止损/目标是否已越过涨跌停、可卖数量等，用户才能判断可行性
+    limit = core_rules.limit_prices(code, res.get("price"), market, name)
+    res.update({
+        "ok": bool(res.get("ok")), "code": code, "market": market, "name": name,
+        "limit": limit, "rules": {"version": core_rules.RULES_VERSION,
+                                  "lot": core_rules.lot_of(code, market, name),
+                                  "minQty": core_rules.min_qty_of(code, market, name)},
+        "session": core_rules.session_of(None, market),
+        "updated": now_ms(),
+    })
+    if capital:
+        res["risk"] = dict(res.get("risk") or {}, capitalSizedFor=capital)
+    return res
+
+
+def api_review_summary(q):
+    """复盘：逐笔口径 + 周期口径 + 回撤 + 按档位分组（口径说明随结果一起返回）。"""
+    q = q or {}
+    market = str(q.get("market") or "").strip().lower() or None
+    days = int(num(q.get("days"), 0) or 0) or None
+    res = core_review.review_report(trade_store(), market=market, days=days)
+    res["ok"] = True
+    res["updated"] = now_ms()
+    return res
+
+
+# --------------------------------------------------------------------------- #
 # 实时推送中枢（SSE：行情 / 研判变化 / 交易事件）
 # --------------------------------------------------------------------------- #
 
@@ -2672,6 +2862,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_trade_config_get())
             if path == "/api/trade/account":
                 return self.send_json(api_trade_account(q))
+            if path == "/api/scan/run":
+                return self.send_json(api_scan_run({**q, "market": q.get("market")}))
+            if path == "/api/scan/config":
+                return self.send_json(api_scan_config({"patch": None, "save": False}))
+            if path == "/api/rules":
+                return self.send_json(api_rules(q))
+            if path == "/api/levels":
+                return self.send_json(api_levels(q))
+            if path == "/api/review/summary":
+                return self.send_json(api_review_summary(q))
             if path == "/api/trade/status":
                 return self.send_json(api_trade_status(q))
             if path == "/api/trade/orders":
@@ -2748,6 +2948,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(api_trade_ack(body))
             if path == "/api/trade/scheduler":
                 return self.send_json(api_trade_scheduler(body))
+            if path == "/api/scan/run":
+                return self.send_json(api_scan_run(body))
+            if path == "/api/scan/config":
+                return self.send_json(api_scan_config(body))
             if path == "/api/notify":
                 return self.send_json(api_notify_update(body))
             if path == "/api/notify/test":

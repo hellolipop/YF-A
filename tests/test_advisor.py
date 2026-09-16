@@ -162,7 +162,15 @@ FIXTURES = {
     "BUY2": wave_closes(300, 0.01, 9.0, 0.002),        # 上行（另一种波动节奏）→ buy
     "BUY3": wave_closes(300, 0.005, 5.0, 0.002),       # 小振幅上行 → buy
     "ADD": wave_closes(300, 0.02, 15.0, 0.0),          # 震荡偏多 → add
-    "ADD0": wave_closes(300, 0.04, 9.0, 0.002),        # 评分达标但凯利为 0 → add（0 仓）
+    # ADD0：评分够到 add、但条件分布均值 ≤ 0 → 连续凯利 f* = 0（「档位允许 ≠ 一定有仓位」）。
+    # 振幅 0.04 → 0.05 是**重新标定的结果**（本轮）：core/forecast._rank_quantile 由
+    # 「全样本分位」改成 expanding 分位（只用 t 时刻及之前的数据、去掉前视偏差）之后，
+    # 旧参数 (0.04, 9.0, 0.002) 的前提失效 —— 条件分布均值由负转正
+    # （μ = +0.0992%、upProb 0.25 → fStar = 0.958），于是「档位达标但凯利为 0」不再成立。
+    # 振幅 0.05 下：μ = −0.9888%、fStar = 0.0，且评分 63.5 ≥ 58 仍判 add。
+    # **该夹具对预测口径敏感**：以后动 core/forecast（分位口径 / 近邻权重 / 窗口）都要重新标定，
+    # 详见 TestNoCapitalForExit.test_add_with_zero_kelly_is_not_funded 的 docstring。
+    "ADD0": wave_closes(300, 0.05, 9.0, 0.002),        # 评分达标但凯利为 0 → add（0 仓）
     "HOLD": wave_closes(300, 0.02, 9.0, 0.0),          # 方向未一致 → hold
     "WATCH": wave_closes(300, 0.02, 15.0, -0.002),     # 偏弱但空方共识不足 → watch
     "REDUCE": wave_closes(300, 0.02, 5.0, 0.0),        # 偏弱 → reduce（凯利分权重却 > 0）
@@ -775,8 +783,30 @@ class TestNoCapitalForExit(unittest.TestCase):
     def test_add_with_zero_kelly_is_not_funded(self):
         """档位允许建仓不代表一定有仓位：凯利为 0 时同样 0 股（两道闸门串联）。
 
-        ADD0 的评分够到 add（entryAction=True），但凯利值为 0（无优势），
+        断言本身**没有放宽**（仍是「fStar 必须逐位等于 0.0」「weight / shares 必须为 0」），
+        业务含义也保持不变：ADD0 的评分够到 add（entryAction=True），但凯利为 0（无优势），
         于是它既不在组合里，也不该出现「0 股但非零权重」的怪状态。
+
+        为什么改夹具（振幅 0.04 → 0.05），以及原来依赖了什么：
+          · 旧夹具 ``wave_closes(300, 0.04, 9.0, 0.002)`` 的前提是「条件分布均值为负」。
+            它在**旧口径**下成立 —— 当时 ``core/forecast._rank_quantile`` 用**全样本分位**
+            给状态特征归一（先对整段序列排序再取分位），于是「与当前状态最相似的 60 个
+            历史窗口」里混进了**当前 K 线之后**才出现的信息，条件分布均值 μ = −0.717%、
+            upProb = 0.20 → 凯利 f* = 0。
+          · 上一轮主程把 ``_rank_quantile`` 改成 **expanding 分位**（只用 t 时刻及之前的数据，
+            修掉前视偏差）后，同样的波形得到 μ = +0.0992%（**由负转正**）、upProb = 0.25
+            → 连续凯利 f* = min(1.2773, KELLY_CAP) × shrink = 0.958，夹具的**前提失效**，
+            而不是断言错。这是「修掉前视偏差后样本的行为变了」这类连带影响，必须显式记录。
+          · 处理方式：只重新标定 ``wave_closes`` 的参数（扫描振幅 / 周期 / 斜率后取
+            ``amp = 0.05``）：新口径下 μ = −0.9888%、upProb = 0.25 → f* = 0，
+            且评分 63.5 ≥ 58 仍落在 add 档（entryAction=True），原意完整保留。
+            振幅取 0.05 而不是「刚好让 f* 归零」的边界值，是为了留出余量：
+            0.045–0.055 这一带在新口径下都是「fStar = 0 且 add」。
+
+        **注意：该夹具对预测口径敏感** —— 以后任何改动 ``core/forecast``（分位口径、近邻数 k、
+        特征窗口、权重）或 ``core/advisor._kelly_input``（μ/σ 的取法）的改动，
+        都要回来重新标定 ADD0，否则这条用例会以「fStar 不再是 0」的形式失败，
+        而那并不代表业务逻辑坏了。
         """
         row = row_of(batch_result(), "ADD0")
         self.assertEqual(row["action"], "add")
@@ -784,6 +814,9 @@ class TestNoCapitalForExit(unittest.TestCase):
         self.assertEqual(row["kelly"]["fStar"], 0.0)
         self.assertEqual(row["kelly"]["weight"], 0.0)
         self.assertEqual(row["kelly"]["shares"], 0)
+        # 顺带钉住夹具前提本身：条件分布均值 ≤ 0（否则 f* 为 0 就只是巧合）
+        self.assertLessEqual(row["forecast"]["expectedReturn"], 0.0,
+                             "ADD0 的前提是「条件分布均值 ≤ 0 → 无优势」，夹具需重新标定")
 
     def test_entry_action_flag_matches_action(self):
         for row in batch_result()["rows"]:

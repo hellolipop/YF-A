@@ -57,6 +57,14 @@ Z. ``TestKnownGaps``           六个 ``unittest.expectedFailure`` 缺陷锚点�
   ``nextRunAt`` 都是 **毫秒**（与 ``storage.now_ms()`` 同单位）。
 本文件里毫秒与秒的换算一律显式 ``* 1000`` / ``/ 1000``，不靠记忆（这个不对称本身
 也在 TestKnownGaps 里被记录为缺陷锚点）。
+
+时间来源有两处，别只改一处
+--------------------------
+``TradeScheduler`` 的调度判断（``interval`` / ``in_session`` / ``status``）只读注入的
+``FakeClock``；而 ``execute_orders`` 内部的 T+1 判定与 ``todayBought`` 盖章用的是
+``core.trader.now_ms()``（真实时钟）。凡是「跨越交易日」的用例（例如两轮 tick 里
+先买后卖）都必须**同时**推进 ``self.clock``（越过 interval）与 ``on_day(…)``（推进交易日），
+否则下一轮会被 T+1 正确拒单 —— 详见 ``test_counters_accumulate_over_rounds`` 的 docstring。
 """
 
 import datetime
@@ -69,6 +77,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
+from unittest import mock
 
 # 兼容「在 stock-terminal/ 下跑」与「在仓库根目录下跑」
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -82,7 +91,8 @@ from core.storage import Store        # noqa: E402
 # --------------------------------------------------------------------------- #
 # 常量与时间锚点（全部用 aware UTC 构造，因此与运行机器的时区无关）
 # --------------------------------------------------------------------------- #
-FEE = T.DEFAULT_FEE                 # 0.0003
+FEE = T.DEFAULT_FEE                 # 0.0003（单一费率：只在 fee_of 认不出标的时退化使用，
+                                    #         不再是手算口径；手算见 fee_cn/buy_math）
 SLIP = T.DEFAULT_SLIPPAGE           # 0.001
 CAP = T.DEFAULT_CONFIG["capital"]   # 100000.0
 LOT = 100                           # A 股一手
@@ -90,6 +100,7 @@ LOT = 100                           # A 股一手
 #: 三个新配置键（本轮的增量）
 NEW_KEYS = ("scheduler", "autoExecute", "ignoreMarketHours")
 
+#: 跨日夹具（本轮新增）的完整说明见下面 ``DAY1_MS`` / ``on_day`` 附近的注释块。
 WED = (2026, 9, 16)     # 周三（今天）
 SAT = (2026, 9, 19)     # 周六（需求指定）
 SUN = (2026, 9, 20)     # 周日（需求指定）
@@ -120,17 +131,73 @@ T_US_OPEN = utc(*WED, 14, 0)     # 14:00 UTC（美股并集窗口内，开市）
 
 
 # --------------------------------------------------------------------------- #
+# 跨日夹具（本轮新增）：**为什么必须同时控住两处时间**
+# --------------------------------------------------------------------------- #
+# ``TradeScheduler.tick_once`` 里的「现在」有两个来源，彼此独立：
+#   · 调度判断（interval 是否到期 / in_session / status）只读注入的 ``clock``；
+#   · ``core/trader.execute_orders`` 内部用的是模块级 ``now_ms()``（真实时钟）——
+#     T+1 校验与 ``todayBought`` / ``todayBoughtOn`` 的盖章都以它为准。
+# 因此只把 ``clock`` 往前推 61 秒（越过 interval）**不会**让第二轮变成次日：
+# 两轮仍落在同一个交易日，第二轮卖出的正是「当日买入」的仓位，会被 T+1 正确拒单
+# （实测 (orders, filled) = (2, 0)）。要还原「两轮都成交」的原意，必须把
+# ``execute_orders`` 看到的时间也推到次日 —— 用 ``on_day()`` 打桩 ``now_ms``。
+# 两个锚点取北京时间的相邻两个交易日（01:40 UTC = 北京 09:40，处于 A 股上午时段，
+# 既跨日又远离 00:00 的日期边界）。
+DAY1_MS = int(T_CN_OPEN * 1000)              # 周三 01:40 UTC = 北京 09:40
+DAY2_MS = DAY1_MS + 24 * 60 * 60 * 1000      # 次日 01:40 UTC = 北京 09:40
+
+
+def on_day(ms):
+    """把 ``core/trader`` 眼里的「现在」（``now_ms``）钉在指定毫秒（跨日夹具用）。"""
+    return mock.patch.object(T, "now_ms", return_value=ms)
+
+
+# --------------------------------------------------------------------------- #
 # 手算口径（故意在测试里重写一遍，而不是抄实现算出来的数字）
 # --------------------------------------------------------------------------- #
-def buy_math(qty, price, fee=FEE, slip=SLIP):
-    """买入手算：含滑点成交价 = 报价×(1+滑点)，费用 = 成交额×费率。
+#: 逐项费用的四个费率（与 core/rules.DEFAULT_FEES["cn"] 同源，故意在测试里重写一遍）
+COMMISSION_RATE = 0.00025      # 佣金万 2.5（双向）
+COMMISSION_MIN = 5.0           # 佣金**不足 5 元按 5 元**（小单成本的主要来源）
+TRANSFER_RATE = 0.00001        # 过户费 0.001%（双向）
+HANDLING_RATE = 0.0000341      # 经手费 0.00341%（沪深，双向）
+STAMP_RATE = 0.0005            # 印花税 0.05%（**仅卖出单边**）
 
-    为什么重写：如果直接把实现算出来的金额抄进断言，公式一旦被改错（滑点方向、费率乘错边），
-    断言会跟着一起错，等于没测。这里与 core/advisor._round_trip / trader._fill_buy 同源。
+
+def fee_cn(side, qty, fill_price):
+    """A 股逐项费用手算（元）：佣金（含最低值）+ [印花税] + 过户费 + 经手费。
+
+    每项各自四舍五入到 0.0001 元后再求和，与 ``core/rules.fee_of`` / ``trader._fee_items``
+    的口径一致（这也是「1 万元买入 = 5.4414」而不是 5.441 的原因：0.341341 → 0.3413）。
     """
-    notional = qty * price * (1.0 + slip)
-    fee_amt = notional * fee
-    return {"price": price * (1.0 + slip), "notional": notional, "fee": fee_amt,
+    notional = qty * fill_price
+    items = [max(notional * COMMISSION_RATE, COMMISSION_MIN)]
+    if str(side).strip().lower() == "sell":
+        items.append(notional * STAMP_RATE)
+    items.append(notional * TRANSFER_RATE)
+    items.append(notional * HANDLING_RATE)
+    return round(sum(round(x, 4) for x in items), 4)
+
+
+def buy_math(qty, price, slip=SLIP):
+    """买入手算：含滑点成交价 = 报价×(1+滑点)；费用走**逐项口径**（不再是成交额×单一费率）。
+
+    为什么重写：如果直接把实现算出来的金额抄进断言，公式一旦被改错（滑点方向、费率乘错边、
+    或者悄悄退回「成交额 × 单一费率」）断言会跟着一起错，等于没测。
+    ``core/trader._fee_items`` 早已改为逐项口径（佣金**不足 5 元按 5 元** + 过户费 + 经手费），
+    因此这里按同一口径手算（费率与 ``core/rules.DEFAULT_FEES["cn"]`` 同源）：
+
+      本文件用到的 1 万元档 = 100 股 × 100 元，含滑点成交价 100.1 → 成交额 10010 元
+        佣金   max(10010 × 0.00025, 5) = max(2.5025, 5) → **5.00**（命中最低佣金）
+        过户费  10010 × 0.00001   = 0.1001
+        经手费  10010 × 0.0000341 = 0.341341 → 0.3413（四舍五入到 0.0001）
+        合计 5 + 0.1001 + 0.3413 = **5.4414 元**
+      旧的单一费率口径只给 10010 × 0.0003 = 3.003 元，系统性低估小资金策略的成本约 81%。
+      卖出时另加印花税（**仅卖出单边**）10010 × 0.0005 = 5.005 → 合计 10.4464 元。
+    """
+    fill = price * (1.0 + slip)
+    notional = qty * fill
+    fee_amt = fee_cn("buy", qty, fill)
+    return {"price": fill, "notional": notional, "fee": fee_amt,
             "cost": notional + fee_amt, "avg": (notional + fee_amt) / qty}
 
 
@@ -912,9 +979,22 @@ class TestPaper(SchedCase):
     def test_paper_auto_execute_fills_and_matches_manual_math(self):
         """paper + autoExecute=true → 成交：状态 filled、持仓出现、现金减少，且**金额手算一致**。
 
-        手算口径（与 trader._fill_buy 同源，故意在测试里重写）：
-        含滑点成交价 = 报价×(1+滑点)，成交额 = 股数×含滑点价，费用 = 成交额×费率，
-        现金减少 = 成交额 + 费用，持仓均价 = (成交额 + 费用)/股数。
+        手算口径（与 ``core/trader._fee_items`` → ``core/rules.fee_of`` 同源，故意在测试里重写）：
+        含滑点成交价 = 报价×(1+滑点)；成交额 = 股数×含滑点价；费用走**逐项口径**
+        （佣金 max(成交额×0.00025, 5) + 过户费 0.00001 + 经手费 0.0000341，每项四舍五入到
+        0.0001 后求和）；现金减少 = 成交额 + 费用；持仓均价 = (成交额 + 费用)/股数。
+
+        本用例的数字（手算，写清算式）：
+          研判给的 kelly.amount = 10000 元、报价 100 元、A 股 100 股一手
+            → 股数 = floor(10000 / 100 / 100) × 100 = **100 股**
+            → 含滑点成交价 = 100 × (1 + 0.001) = 100.1，成交额 = 100 × 100.1 = **10010 元**
+            → 费用 = 佣金 max(10010 × 0.00025, 5) = max(2.5025, 5) = **5.00（命中最低佣金）**
+                     + 过户费 10010 × 0.00001 = 0.1001
+                     + 经手费 10010 × 0.0000341 = 0.341341 → 0.3413
+                     = **5.4414 元**
+            → 现金减少 = 10010 + 5.4414 = 10015.4414，持仓均价 = 10015.4414 / 100 = 100.154414
+          （旧的「成交额 × 单一费率」口径只给 3.003 元，比逐项口径低 2.4384 元 —— 这正是
+            本用例此前失败的原因，`buy_math` 已同步改成逐项口径。）
         容差 1e-6：实现里对金额做过 round(…, 6)，除此之外两边应当逐位相同。
         """
         cfg = self.set_cfg(mode="paper", autoExecute=True)
@@ -932,10 +1012,18 @@ class TestPaper(SchedCase):
         order = rows[0]
         self.assertEqual(order["status"], "filled")
         qty, price = int(order["qty"]), 100.0
+        self.assertEqual(qty, 100, "股数 = floor(kelly.amount / 报价 / 一手) × 一手，手算式同 docstring")
         math = buy_math(qty, price)
+        # 先把「手算式本身」钉住，再拿它去核对实现；否则公式写错时两边会一起错
+        self.assertAlmostEqual(math["fee"], 5.00 + 0.1001 + 0.3413, delta=1e-9,
+                               msg="逐项费用 = 5.00(最低佣金) + 0.1001(过户费) + 0.3413(经手费)")
+        self.assertEqual(round(math["fee"], 4), 5.4414)
         self.assertAlmostEqual(order["fillPrice"], math["price"], delta=1e-6)
         self.assertAlmostEqual(order["amount"], math["notional"], delta=1e-6)
         self.assertAlmostEqual(order["fee"], math["fee"], delta=1e-6)
+        # 负向断言：旧的「成交额 × 单一费率」口径（10010 × 0.0003 = 3.003）不得回来
+        self.assertNotAlmostEqual(order["fee"], math["notional"] * FEE, delta=1e-6,
+                                  msg="费用必须走逐项口径，不能再等于「成交额 × 单一费率」")
 
         state = self.store.get_trade_state(T.account_id("cn", "paper"))
         self.assertAlmostEqual(state["cash"], before - math["cost"], delta=1e-6,
@@ -1306,18 +1394,32 @@ class TestCounters(SchedCase):
         或把跳过也算进去，用户对自动化的判断就会失真（例如「本轮 0 笔」被显示成「共 0 笔」）。
         做法：两轮（买入 2 只 → 清仓 2 只），把每轮返回值加总与被测计数器比对，
         并与存储里的委托单数量交叉验证。
+
+        **为什么必须同时控住两处时间**（本轮踩到的坑）：
+          · 第一轮在 ``on_day(DAY1_MS)`` 里成交，于是两笔买入的持仓被 ``_settle`` 盖上
+            ``todayBoughtOn = DAY1``（T+1 的判定完全依赖它）；
+          · 第二轮是**卖出**，``execute_orders`` 用真实 ``now_ms()`` 判 T+1 ——
+            只把注入的 ``clock`` 推 61 秒只够越过 ``interval`` 限流，两轮仍落在**同一个交易日**，
+            「卖当日买入」会被正确拒单，实测第二轮 ``(orders, filled) = (2, 0)``；
+          · 所以还要用 ``on_day(DAY2_MS)`` 把 ``execute_orders`` 看到的时间推到次日：
+            DAY2 ≠ DAY1 → 整仓都是昨仓、可卖 → 两轮各自 (2, 2) 成交。
+        只改 ``clock.advance(61)`` 的秒数（例如改成一天）也能让时段判断跨日，但那会让
+        「调度间隔」这条断言的语义跟着变；这里选择「clock 只负责间隔、now_ms 负责交易日」，
+        两个变量各管一件事，改坏了更容易定位。
         """
         self.set_cfg(mode="paper", autoExecute=True, universe=["600519", "000001"])
         rec = FakeRecommend([buy_row("600519", 100.0), buy_row("000001", 20.0)])
         s = self.scheduler(recommend=rec)
 
-        r1 = s.tick_once()
+        with on_day(DAY1_MS):
+            r1 = s.tick_once()
         planned, filled = r1["orders"], r1["filled"]
         self.assertEqual((planned, filled), (2, 2), "第一轮：两只都开仓成交")
 
-        self.clock.advance(61)                                # 越过 interval
+        self.clock.advance(61)                                # 越过 interval（同一交易日内）
         rec.rows = [sell_row("600519", 100.0), sell_row("000001", 20.0)]
-        r2 = s.tick_once()
+        with on_day(DAY2_MS):                                 # 交易日推进一天 → T+1 放行
+            r2 = s.tick_once()
         planned += r2["orders"]
         filled += r2["filled"]
         self.assertEqual((r2["orders"], r2["filled"]), (2, 2), "第二轮：两只都清仓成交")

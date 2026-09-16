@@ -103,6 +103,7 @@ import uuid
 
 from . import advisor as A
 from . import kelly as K
+from . import rules as RULES
 from .storage import now_ms
 
 __all__ = [
@@ -422,22 +423,73 @@ def sell_net(qty, price, fee_rate, slippage):
     return q * p * (1.0 - (0.0 if s is None else s)) * (1.0 - (0.0 if f is None else f))
 
 
-def _fill_buy(qty, price, fee_rate, slippage):
+def _trade_day(ts):
+    """成交归属的交易日（北京时间 UTC+8，``YYYY-MM-DD``）。
+
+    T+1 需要按「天」区分「今日买入」与「昨仓」，因此必须有一个明确的交易日口径。
+    用固定偏移而不是本机时区：用户机器未必在北京时区，否则「今天买的」会算错一天。
+    """
+    stamp = _num(ts) or 0.0
+    dt = datetime.datetime.fromtimestamp(stamp / 1000.0, datetime.timezone.utc) \
+        + datetime.timedelta(hours=8)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _sellable_of(pos, ts=None):
+    """T+1 可卖数量 = 持仓 − 今日买入（跨日自动归零）。
+
+    不能用总持仓当可卖量：那会让当日买入立刻可卖，等于给模拟盘开了 T+0 后门，
+    纸面收益会凭空多出一截（这是 T+1 最常见的实现错误）。
+    """
+    if not isinstance(pos, dict):
+        return 0
+    total = _int_of(pos.get("qty"))
+    bought = _int_of(pos.get("todayBought"))
+    if bought <= 0:
+        return max(0, total)
+    if ts is not None and pos.get("todayBoughtOn") and pos.get("todayBoughtOn") != _trade_day(ts):
+        return max(0, total)          # 跨日：昨仓全部可卖
+    return max(0, total - bought)
+
+
+def _fee_items(side, qty, price, fee_rate, code=None, market=None, board=None, name=None):
+    """成交费用：**优先走交易规则引擎的逐项口径**，退化时用单一费率。
+
+    为什么要换口径：把费用写成单一双边费率会系统性低估小资金策略的成本 ——
+    1 万元买入按单一 0.03% 只有 3 元，按真实 A 股口径是「最低 5 元佣金 + 过户费 0.1 元
+    + 经手费 0.341 元 ≈ 5.44 元」，高出 80%；卖出还多一道 0.05% 印花税（单边）。
+    只有在能识别标的代码时才启用规则口径，否则保持旧行为（老调用不受影响）。
+    """
+    if code:
+        try:
+            res = RULES.fee_of(side, qty, price, market=market or "cn", board=board)
+            items = res.get("items") or []
+            if items:
+                return items, float(res.get("total") or 0.0)
+        except Exception:  # noqa: BLE001  规则引擎异常不应让成交失败
+            pass
+    rate = _num(fee_rate) or 0.0
+    return [], qty * price * rate
+
+
+def _fill_buy(qty, price, fee_rate, slippage, code=None, market=None, board=None, name=None):
     """买入成交明细（成交价含滑点、费用单列，便于与 trades 表的 fee/slippage 对账）。"""
     fill = price * (1.0 + slippage)
     notional = qty * fill
-    fee = notional * fee_rate
+    fee_items, fee = _fee_items("buy", qty, fill, fee_rate, code, market, board, name)
     return {"qty": qty, "price": fill, "notional": notional, "fee": fee,
-            "amount": notional, "slippage": qty * price * slippage, "cash": notional + fee}
+            "feeItems": fee_items, "amount": notional,
+            "slippage": qty * price * slippage, "cash": notional + fee}
 
 
-def _fill_sell(qty, price, fee_rate, slippage):
+def _fill_sell(qty, price, fee_rate, slippage, code=None, market=None, board=None, name=None):
     """卖出成交明细（卖出价 = 中间价 × (1−滑点)）。"""
     fill = price * (1.0 - slippage)
     notional = qty * fill
-    fee = notional * fee_rate
+    fee_items, fee = _fee_items("sell", qty, fill, fee_rate, code, market, board, name)
     return {"qty": qty, "price": fill, "notional": notional, "fee": fee,
-            "amount": notional, "slippage": qty * price * slippage, "cash": notional - fee}
+            "feeItems": fee_items, "amount": notional,
+            "slippage": qty * price * slippage, "cash": notional - fee}
 
 
 # --------------------------------------------------------------------------- #
@@ -644,6 +696,12 @@ def _positions(account):
             "openedAt": _ms(item.get("openedAt")),
             "lastPrice": _clean(_num(item.get("lastPrice")) or avg),
             "updatedAt": _ms(item.get("updatedAt")),
+            # T+1 判定**只依赖这两个字段**，而归一化会把未列出的字段全丢掉 ——
+            # 漏掉它们等于每次读回账户都把「今日买入」清零，同一笔买单在第二次调用里
+            # 就能立刻卖出（等于给模拟盘开了 T+0 后门）。实测正是这个原因导致
+            # 「同一天、分两次 execute_orders」时 T+1 校验形同虚设。
+            "todayBought": _int_of(item.get("todayBought")),
+            "todayBoughtOn": _text(item.get("todayBoughtOn")),
         })
     return out
 
@@ -1366,12 +1424,15 @@ def _settle(side, qty, code, name, market, price, fee_rate, slippage, cash, posi
         idx = _pos_index(positions, code)
         pos = positions[idx]
         avg = pos["avgPrice"]
-        f = _fill_sell(qty, price, fee_rate, slippage)
+        f = _fill_sell(qty, price, fee_rate, slippage, code, market, name=name)
         realized_delta = f["notional"] - f["fee"] - avg * qty
         left = int(pos["qty"]) - int(qty)
         if left > 0:
             pos = dict(pos)
-            pos.update({"qty": left, "cost": avg * left, "lastPrice": price, "updatedAt": ts})
+            # 今日买入的标记随剩余持仓收缩（卖出的一定是昨仓：T+1 已在执行前校验）
+            bought = _int_of(pos.get("todayBought"))
+            pos.update({"qty": left, "cost": avg * left, "lastPrice": price, "updatedAt": ts,
+                        "todayBought": min(left, bought) if bought > 0 else 0})
             positions[idx] = pos
         else:
             positions.pop(idx)
@@ -1379,15 +1440,18 @@ def _settle(side, qty, code, name, market, price, fee_rate, slippage, cash, posi
                   "realized": realized + realized_delta})
         return f
 
-    f = _fill_buy(qty, price, fee_rate, slippage)
+    f = _fill_buy(qty, price, fee_rate, slippage, code, market, name=name)
+    day = _trade_day(ts)
     idx = _pos_index(positions, code)
     if idx >= 0:
         pos = dict(positions[idx])
         q_old, avg_old = int(pos["qty"]), pos["avgPrice"]
         q_new = q_old + int(qty)
         avg = (q_old * avg_old + qty * f["price"] + f["fee"]) / q_new
+        bought = _int_of(pos.get("todayBought")) if pos.get("todayBoughtOn") == day else 0
         pos.update({"qty": q_new, "avgPrice": avg, "cost": avg * q_new,
-                    "lastPrice": price, "updatedAt": ts})
+                    "lastPrice": price, "updatedAt": ts,
+                    "todayBought": bought + int(qty), "todayBoughtOn": day})
         positions[idx] = pos
     else:
         avg = (qty * f["price"] + f["fee"]) / qty
@@ -1395,6 +1459,7 @@ def _settle(side, qty, code, name, market, price, fee_rate, slippage, cash, posi
             "code": code, "name": name or code, "market": market, "qty": int(qty),
             "avgPrice": avg, "cost": avg * qty, "openedAt": ts,
             "lastPrice": price, "updatedAt": ts,
+            "todayBought": int(qty), "todayBoughtOn": day,
         })
     f.update({"cash": cash - f["cash"], "realizedDelta": 0.0, "realized": realized})
     return f
@@ -1562,6 +1627,19 @@ def execute_orders(store, config, orders, quotes):
                     reject = "无对应持仓：%s 当前不在持仓中" % code
                 elif qty > pos["qty"]:
                     reject = "持仓不足：需卖 %d 股，当前持有 %d 股" % (qty, pos["qty"])
+                elif qty > _sellable_of(pos, ts):
+                    reject = ("T+1 限制：可卖 %d 股（持仓 %d 股，其中今日买入 %d 股不可当日卖出）"
+                              % (_sellable_of(pos, ts), pos["qty"],
+                                 _int_of(pos.get("todayBought"))))
+
+        # 交易规则校验（涨跌停封板）：涨停买不到、跌停卖不出。这是「价格可取即成交」
+        # 与「遵守交易规则」的分界线 —— 不判封板会在连板股上凭空造出每天都能买在涨停价的
+        # 虚假收益（纸面收益漂亮，实盘根本成交不了）
+        if not reject:
+            fillable = RULES.can_fill(side, price, prev_close=_num(o2.get("signalPrice")) or price,
+                                      code=code, market=market, name=o2.get("name"), ts=ts)
+            if not fillable.get("ok"):
+                reject = "交易规则：%s" % fillable.get("reason")
 
         if reject:
             o2.update({"status": "rejected", "error": reject, "mode": mode,
@@ -1707,6 +1785,20 @@ def close_position(store, config, code, quotes, qty=None):
             out["note"] = ("平仓数量不足一手（要卖 %s 股，%d 股/手；持仓 %d 股）"
                            % (qty, lot, pos["qty"]))
             return out
+
+    # T+1：手动平仓同样不能卖当日买入的部分 —— 「不受 enabled 限制」指的是不受总开关
+    # 限制，不等于不受交易规则限制。此前手动路径绕过了 T+1 校验，等于给模拟盘留了一个
+    # 能当日买卖的后门（自动路径被拒、手动路径放行，同一件事两种答案）
+    sellable = _sellable_of(pos, now_ms())
+    if sellable <= 0:
+        out["note"] = ("T+1 限制：该持仓 %d 股为当日买入，当日不可卖出（手动平仓同样遵守 T+1）。"
+                       % _int_of(pos.get("todayBought")))
+        return out
+    if sell_qty > sellable:
+        out["note"] = ("T+1 限制：可卖 %d 股（持仓 %d 股，其中今日买入 %d 股不可当日卖出），"
+                       "本次要卖 %d 股。"
+                       % (sellable, pos["qty"], _int_of(pos.get("todayBought")), sell_qty))
+        return out
 
     ts = now_ms()
     reason = ("手动平仓：用户显式操作（不受 enabled 总开关限制），卖出 %d 股（持仓 %d 股，%d 股/手）；%s"

@@ -117,6 +117,16 @@ hit("/api/trade/config")
 hit("/api/trade/account")
 hit("/api/trade/orders?limit=5")
 hit("/api/trade/export")
+print("=== 买入扫描 / 交易规则 / 买卖点位 / 复盘 ===")
+hit("/api/rules?market=cn")
+hit("/api/rules?market=us")
+hit("/api/scan/config")
+hit("/api/scan/config", {"patch": {}})                      # 保存（空 patch，无副作用）
+hit("/api/levels?code=600519")                             # 单只买卖点位
+hit("/api/levels")                                         # 缺 code：错误分支
+hit("/api/levels?code=__NOT_EXIST__")                      # 无效代码：降级分支
+hit("/api/review/summary")
+hit("/api/scan/run", {"market": "cn", "limit": 3, "barsLimit": 6})   # 小样本扫描（重操作，只取 6 只K线）
 hit("/api/trade/status")                                 # 调度器状态（含为什么没动作）
 hit("/api/trade/scheduler", {"running": False})           # 停调度（幂等）
 hit("/api/trade/scheduler", {"once": True})               # 试跑：跳过时段限制，但仍要求 enabled
