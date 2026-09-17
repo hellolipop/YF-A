@@ -332,6 +332,49 @@ async function partB() {
   }
   if (errs.length) console.log('  （jsdom 捕获到 ' + errs.length + ' 条控制台/错误输出，未影响断言）');
 
+  /* ---------------- B5 复权口径降级：接口给了 fqNote 就必须显示出来 ---------------- */
+  /* 场景：腾讯/东财都挂掉时后端会落到新浪源（只有不复权），此时响应带 fqActual/fqNote。
+     界面绝不能继续只写「复权方式 前复权」，否则标签与价格口径不符。 */
+  const origKline = w.AD.api.kline;
+  w.AD.api.kline = async (mkt, cd, period, fq, limit) => {
+    const res = await origKline(mkt, cd, period, fq, limit);
+    if (res && res.bars && res.bars.length) {
+      res.source = '新浪财经（不复权）';
+      res.fqActual = 0;
+      res.fqNote = '该来源只有不复权口径（本次请求的是「前复权」），价格与其它复权口径不可直接比较';
+    }
+    return res;
+  };
+  w.AD.app.ctx.state.symbol = { market: 'cn', code: '600667', name: '太极实业' };
+  w.AD.app.switchView('detail');
+  await wait(4000);
+  const segs2 = root.querySelector('.chart-toolbar .seg');
+  const dayBtn2 = segs2 && Array.prototype.find.call(segs2.querySelectorAll('button'),
+    (b) => b.textContent.trim() === '日K');
+  check('B5 找到「日K」按钮', !!dayBtn2);
+  if (dayBtn2) {
+    click(dayBtn2);
+    await wait(4500);
+    const meta = root.querySelector('.page-head .head-actions .hint');
+    const txt = meta ? meta.textContent : '';
+    check('B5 数据源标注为不复权来源', txt.indexOf('新浪财经') >= 0, txt.slice(0, 140));
+    check('B5 降级口径说明显示在图上（不谎报复权方式）', txt.indexOf('只有不复权口径') >= 0, txt.slice(0, 140));
+  }
+  w.AD.api.kline = origKline;
+
+  /* ---------------- B6 用户报的那只票：真实 600667 日K 必须能出图且不再报错 ---------------- */
+  live().refresh();
+  await wait(4500);
+  const host6 = root.querySelector('.chart-canvas-wrap');
+  const meta6 = root.querySelector('.page-head .head-actions .hint');
+  const txt6 = meta6 ? meta6.textContent : '';
+  check('B6 600667 日K 画布已就绪', !!(host6 && host6.querySelector('canvas')));
+  check('B6 页面不再出现「图表加载失败」', root.textContent.indexOf('图表加载失败') < 0,
+    root.textContent.indexOf('图表加载失败') >= 0
+      ? root.textContent.slice(root.textContent.indexOf('图表加载失败'), 200) : '');
+  check('B6 复权方式如实显示（真实上游为复权源时不应带降级说明）',
+    txt6.indexOf('复权方式 前复权') >= 0 && txt6.indexOf('只有不复权口径') < 0, txt6.slice(0, 140));
+
   w.close();
   return 'ran';
 }

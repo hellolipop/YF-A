@@ -420,12 +420,23 @@ def indices(market):
 PERIOD_MAP_TX = {"day": "day", "week": "week", "month": "month",
                  "5m": "m5", "15m": "m15", "30m": "m30", "60m": "m60", "1m": "m1"}
 
+# 腾讯日/周/月K 的两个域名（同一份数据、同样的 param 与返回结构）
+#   2026-09 实测：A股日K 走 web.ifzq.gtimg.cn/appstock/app/fqkline/get 会被腾讯 WAF 拦成
+#   HTTP 501（返回一段 HTML 而不是 JSON），而行情 App 用的 proxy.finance.qq.com
+#   .../app/newfqkline/get 仍正常，所以 A 股优先走后者、前者留作兜底；
+#   美股反之（usfqkline 在 web.ifzq 上正常，newusfqkline 拿不到 bars）。
+TX_FQ_ENDPOINTS = {
+    "cn": ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
+           "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"),
+    "us": ("https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get",
+           "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newusfqkline/get"),
+}
+
 
 def tx_kline(market, code, period, fq, limit):
     sym = tx_symbols(market, [code])[0]
     if period in ("day", "week", "month"):
         fq_tag = {1: "qfq", 2: "hfq"}.get(fq, "")
-        ep = "usfqkline" if market == "us" else "fqkline"
         cand = [sym]
         if market == "us":
             full = tx_full_symbol(code)
@@ -433,23 +444,30 @@ def tx_kline(market, code, period, fq, limit):
                 cand.insert(0, full)
         rows = None
         used = sym
-        for s in cand:
-            try:
-                url = "https://web.ifzq.gtimg.cn/appstock/app/%s/get?param=%s,%s,,,%d,%s" % (
-                    ep, s, PERIOD_MAP_TX[period], limit, fq_tag)
-                res = http_get(url, referer="https://gu.qq.com/")
-                node = ((res or {}).get("data") or {}).get(s) or {}
-                for key in (("%s%s" % (fq_tag, PERIOD_MAP_TX[period])), PERIOD_MAP_TX[period]):
-                    got = node.get(key)
-                    if isinstance(got, list) and len(got) >= 3:
-                        rows, used = got, s
-                        break
-            except Exception:  # noqa: BLE001
-                continue
+        last_err = None
+        for base in TX_FQ_ENDPOINTS.get(market, TX_FQ_ENDPOINTS["cn"]):
+            for s in cand:
+                try:
+                    url = "%s?param=%s,%s,,,%d,%s" % (
+                        base, s, PERIOD_MAP_TX[period], min(int(limit or 320), 1000), fq_tag)
+                    res = http_get(url, referer="https://gu.qq.com/")
+                    node = ((res or {}).get("data") or {}).get(s) or {}
+                    for key in (("%s%s" % (fq_tag, PERIOD_MAP_TX[period])), PERIOD_MAP_TX[period]):
+                        got = node.get(key)
+                        if isinstance(got, list) and len(got) >= 3:
+                            rows, used = got, s
+                            break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                if rows:
+                    break
             if rows:
                 break
         if not rows:
-            raise RuntimeError("腾讯K线为空（%s）" % code)
+            # 把上游真实原因带出去：WAF 拦截/连接被拒与「该股当天没有K线」是两回事，
+            # 只报「腾讯K线为空」会让这类故障无法定位（2026-09 就出过一次）
+            raise RuntimeError("腾讯K线为空（%s）%s" % (
+                code, ("：%s" % str(last_err)[:100]) if last_err else ""))
         bars = []
         for r in rows:
             bars.append({
@@ -529,6 +547,50 @@ def em_kline(market, code, period, fq, limit):
     return bars, "东方财富"
 
 
+# 新浪日/周/月K 的 scale 取值（该接口只认这几个刻度，不接受任意周期）
+SINA_KLINE_SCALE = {"day": 240, "week": 1200, "month": 7200}
+
+
+def sina_kline(market, code, period, fq, limit):
+    """A股日/周/月K 的第三来源（新浪财经）。
+
+    两个必须讲清的口径差异，否则会静默给出错数据：
+      1) 该接口的 volume 单位是「股」，本项目 A 股口径是「手」（腾讯/东财都是手），
+         所以这里统一除以 100 再返回；
+      2) 该接口只有**不复权**价格（带不带 fq 参数返回完全一致，实测已确认）。
+         因此来源标注为「新浪财经（不复权）」，并由 api_kline 在 fq≠0 时附上口径说明，
+         绝不让「前复权」的标签配上不复权的价格。
+    """
+    if market != "cn":
+        raise RuntimeError("新浪K线仅支持 A 股")
+    scale = SINA_KLINE_SCALE.get(period)
+    if not scale:
+        raise RuntimeError("新浪K线不支持该周期：%s" % period)
+    sym = tx_symbols("cn", [code])[0]           # 新浪与腾讯同用 sh600519 / sz000001 形式
+    n = max(30, min(int(limit or 320), 1500))
+    url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           "CN_MarketData.getKLineData?symbol=%s&scale=%d&ma=no&datalen=%d" % (sym, scale, n))
+    rows = http_get(url, referer="https://finance.sina.com.cn/")
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("新浪K线为空（%s）" % code)
+    bars = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        vol = num(r.get("volume"))
+        bars.append({
+            "t": str(r.get("day") or "")[:10],
+            "open": num(r.get("open")), "close": num(r.get("close")),
+            "high": num(r.get("high")), "low": num(r.get("low")),
+            "volume": (vol / 100.0) if vol is not None else None,
+            "amount": None,
+        })
+    bars = [b for b in bars if b["t"] and b["close"] is not None]
+    if len(bars) < 3:
+        raise RuntimeError("新浪K线解析为空（%s）" % code)
+    return bars, "新浪财经（不复权）"
+
+
 def aggregate_bars(bars, minutes):
     """把 1 分钟序列聚合成 N 分钟K线"""
     out, bucket = [], None
@@ -553,21 +615,46 @@ def aggregate_bars(bars, minutes):
     return out
 
 
+FQ_LABEL = {0: "不复权", 1: "前复权", 2: "后复权"}
+
+
+def fq_note_of(source, fq):
+    """来源口径与请求口径不一致时必须显式说明。
+
+    目前只有新浪日/周/月K 是不复权的；不能让它顶着「前复权」的标签出图。
+    """
+    if source and "不复权" in source and int(fq or 0) != 0:
+        return "该来源只有不复权口径（本次请求的是「%s」），价格与其它复权口径不可直接比较" % (
+            FQ_LABEL.get(int(fq or 0), fq))
+    return None
+
+
 def api_kline(market, code, period, fq, limit):
     def build():
         attempts = []
         errors = []
         if period in ("day", "week", "month", "5m", "15m", "30m", "60m"):
-            attempts.append(lambda: tx_kline(market, code, period, fq, limit))
-        attempts.append(lambda: em_kline(market, code, period, fq, limit))
-        for fn in attempts:
+            attempts.append(("腾讯", lambda: tx_kline(market, code, period, fq, limit)))
+        attempts.append(("东财", lambda: em_kline(market, code, period, fq, limit)))
+        # A股日/周/月K 再加一层**独立来源**：腾讯与东财是两条路，
+        # 2026-09 实测两者会同时不可用（腾讯 WAF 501 + 东财 push2his 连接被重置），
+        # 那时详情页的 K 线、扫描器的取样 K 线、策略跟踪的历史窗口会一起断掉
+        if market == "cn" and period in ("day", "week", "month"):
+            attempts.append(("新浪", lambda: sina_kline(market, code, period, fq, limit)))
+        for name, fn in attempts:
             try:
                 bars, src = fn()
                 if bars:
-                    return {"code": code, "market": market, "period": period, "fq": fq,
-                            "bars": bars, "source": src, "updated": now_ms()}
+                    out = {"code": code, "market": market, "period": period, "fq": fq,
+                           "bars": bars, "source": src, "updated": now_ms()}
+                    note = fq_note_of(src, fq)
+                    if note:
+                        out["fqActual"] = 0
+                        out["fqNote"] = note
+                    return out
             except Exception as exc:  # noqa: BLE001
-                errors.append(str(exc)[:120])
+                # 带上来源名：否则「谁挂了、挂在哪一步」只能靠猜
+                errors.append("%s：%s" % (name, str(exc)[:120]))
         # 美股分钟线兜底：用分时数据聚合
         if market == "us" and period in ("5m", "15m", "30m", "60m", "1m"):
             try:
@@ -582,7 +669,7 @@ def api_kline(market, code, period, fq, limit):
                             "bars": aggregate_bars(bars, n),
                             "source": "由分时数据聚合（估算）", "updated": now_ms()}
             except Exception as exc:  # noqa: BLE001
-                errors.append(str(exc)[:120])
+                errors.append("分时聚合：%s" % str(exc)[:120])
         return {"code": code, "market": market, "period": period, "fq": fq, "bars": [],
                 "source": None, "error": "；".join(errors) or "无数据", "updated": now_ms()}
 
@@ -689,7 +776,7 @@ def em(path, params):
             return http_get(host + path + "?" + urllib.parse.urlencode(params))
         except Exception as exc:  # noqa: BLE001
             last = exc
-    raise RuntimeError("东财接口不可用: %s" % str(last)[:120])
+    raise RuntimeError("东财接口不可用（push2 / push2his 均失败）: %s" % str(last)[:120])
 
 
 CN_LIST_FIELDS = ",".join([

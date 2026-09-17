@@ -515,8 +515,10 @@
           chart.setData(res.bars, { keepView: keepView });
           chartSeries = series;
           applyAdvisorToChart(res.bars);
+          /* 复权口径以「实际拿到的数据」为准：上游只有不复权数据时（如新浪兜底）
+             必须把差异写出来，不能让「前复权」的标签配着不复权的价格 */
           metaHost.textContent = res.bars.length + ' 根K线 · ' + (res.source || '') + ' · 复权方式 ' +
-            (['不复权', '前复权', '后复权'][st.fq] || '—');
+            (['不复权', '前复权', '后复权'][st.fq] || '—') + (res.fqNote ? ' · ' + res.fqNote : '');
           if (st.period !== 'day') loadSignals();
           else runAnalysis(res.bars);
         }
