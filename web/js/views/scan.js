@@ -66,7 +66,7 @@
 (function () {
   'use strict';
 
-  const { h, clear } = window.AD.dom;
+  const { h, clear, paint } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -309,6 +309,10 @@
       class: 'monospaced', dataset: { act: 'run-hint', host: 'run-hint' },
       style: { marginTop: '8px' },
     });
+    /* 状态行只有一个常驻文本节点：paintStatus 由 1 秒定时器驱动，
+       计时刷新只改它的 nodeValue，不重建任何节点，也不影响页面其它部分 */
+    const statusText = document.createTextNode('');
+    statusHost.appendChild(statusText);
     const cfgHost = h('div', { dataset: { host: 'config' }, style: { marginTop: '8px' } });
     const summaryHost = h('div', { dataset: { host: 'summary' } });
     const candHost = h('div', { dataset: { host: 'candidates' } });
@@ -339,23 +343,35 @@
       marketChip.textContent = '市场：' + (MARKET_LABEL[st.market] || st.market) + '（跟随全局）';
     }
 
+    /* 只改文本节点的值：内容没变就不碰 DOM（1 秒一次的计时刷新不应该造成任何闪动） */
+    function setText(node, t) {
+      if (node.nodeValue !== t) node.nodeValue = t;
+    }
+
+    /* 按钮文案同样只改文本节点，不重建按钮 */
+    function setLabel(node, t) {
+      const tn = node.firstChild;
+      if (tn && tn.nodeType === 3) setText(tn, t);
+      else node.textContent = t;
+    }
+
     function paintStatus() {
       runBtn.disabled = !!st.running;
-      runBtn.textContent = st.running ? '扫描中…' : '开始扫描';
+      setLabel(runBtn, st.running ? '扫描中…' : '开始扫描');
       if (st.running) {
         const secs = Math.max(0, Math.round((Date.now() - st.startedAt) / 1000));
-        statusHost.textContent = '扫描中… 已用时 ' + secs + ' 秒（真实计时，不做假进度条）。' +
+        setText(statusText, '扫描中… 已用时 ' + secs + ' 秒（真实计时，不做假进度条）。' +
           '扫描会先过硬闸门，再对成交额最大的 ' + intOr(barsInp.value, 60, 1) + ' 只逐只取 K 线，' +
-          '通常需要 10–60 秒，请勿重复点击。';
+          '通常需要 10–60 秒，请勿重复点击。');
         return;
       }
       if (st.ran && st.lastAt) {
-        statusHost.textContent = '上次扫描完成 ' + F.clock(st.lastAt) +
+        setText(statusText, '上次扫描完成 ' + F.clock(st.lastAt) +
           ' · 耗时 ' + msText(st.lastMs) +
-          (st.lastBody ? '（limit ' + st.lastBody.limit + ' / barsLimit ' + st.lastBody.barsLimit + '）' : '');
+          (st.lastBody ? '（limit ' + st.lastBody.limit + ' / barsLimit ' + st.lastBody.barsLimit + '）' : ''));
         return;
       }
-      statusHost.textContent = '尚未扫描：点「开始扫描」调用 POST /api/scan/run。';
+      setText(statusText, '尚未扫描：点「开始扫描」调用 POST /api/scan/run。');
     }
 
     function startElapsed() {
@@ -558,27 +574,28 @@
     }
 
     function renderSummary() {
-      clear(summaryHost);
       if (st.running) {
-        summaryHost.appendChild(ui.loading('扫描中… 已用时 ' +
-          Math.max(0, Math.round((Date.now() - st.startedAt) / 1000)) + ' 秒。结果出来后本区域会被替换。'));
+        paint(summaryHost, [ui.loading('扫描中… 已用时 ' +
+          Math.max(0, Math.round((Date.now() - st.startedAt) / 1000)) + ' 秒。结果出来后本区域会被替换。')]);
         return;
       }
       if (st.resultErr) {
-        summaryHost.appendChild(ui.empty('扫描失败：' + st.resultErr +
-          '（接口失败时不在本页伪造结果；可稍后重试，或把「K线取样上限」调小）'));
+        paint(summaryHost, [ui.empty('扫描失败：' + st.resultErr +
+          '（接口失败时不在本页伪造结果；可稍后重试，或把「K线取样上限」调小）')]);
         return;
       }
       if (!st.result) {
-        summaryHost.appendChild(ui.empty('尚未扫描（没跑过）：点上方「开始扫描」。' +
-          '这一空态表示本次会话还没有发起过 POST /api/scan/run，与「跑了但没候选」是两回事。'));
+        paint(summaryHost, [ui.empty('尚未扫描（没跑过）：点上方「开始扫描」。' +
+          '这一空态表示本次会话还没有发起过 POST /api/scan/run，与「跑了但没候选」是两回事。')]);
         return;
       }
       const res = st.result;
       const stats = res.stats || {};
       const limit = arr(res.candidates).length;
+      /* 统计区不改结构、不换父节点：先按顺序攒好子节点，最后一次性原位改写 */
+      const kids = [];
 
-      summaryHost.appendChild(h('div', { class: 'monospaced', style: { marginBottom: '8px' } }, [
+      kids.push(h('div', { class: 'monospaced', style: { marginBottom: '8px' } }, [
         h('span', { text: scanLineOf(res) }),
         h('span', { class: 'dim3', text: '　·　数据截至 ' + timeText(res.updated) }),
         h('span', { class: 'dim3', text: '　·　耗时 ' + msText(isNum(res.durationMs) ? res.durationMs : stats.elapsedMs) }),
@@ -601,7 +618,7 @@
       if (isNum(stats.barsFailed) && stats.barsFailed > 0) {
         chips.appendChild(chipEl('K线取样失败 ' + stats.barsFailed + ' 只', 'warn'));
       }
-      if (chips.children.length) summaryHost.appendChild(chips);
+      if (chips.children.length) kids.push(chips);
 
       const grid = h('div', { class: 'metric-list' });
       grid.appendChild(cell('候选返回 / 截断', cntText(stats.returned) + ' / ' + cntText(stats.truncated),
@@ -624,11 +641,11 @@
         grid.appendChild(cell('本次参数', 'limit ' + st.lastBody.limit + ' / barsLimit ' + st.lastBody.barsLimit,
           '', '本次请求体里的 limit 与 barsLimit'));
       }
-      summaryHost.appendChild(grid);
+      kids.push(grid);
 
       const trunc = res.truncatedByBarsLimit;
       if (trunc && isNum(trunc.count) && trunc.count > 0) {
-        summaryHost.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center' } }, [
+        kids.push(h('div', { class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center' } }, [
           chipEl('未评分 ' + trunc.count + ' 只', 'warn'),
           h('span', {
             class: 'dim3',
@@ -638,16 +655,19 @@
         ]));
       }
       if (res.note) {
-        summaryHost.appendChild(h('div', { class: 'hint dim3', style: { marginTop: '8px' }, text: res.note }));
+        kids.push(h('div', { class: 'hint dim3', style: { marginTop: '8px' }, text: res.note }));
       }
       const miss = res.missingFieldCounts;
       if (miss && typeof miss === 'object' && Object.keys(miss).length) {
-        summaryHost.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center' } }, [
+        kids.push(h('div', { class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center' } }, [
           h('span', { class: 'dim3', text: '字段缺失计数（对应闸门被跳过）：' }),
         ].concat(Object.keys(miss).map((k) => chipEl(k + ' ' + miss[k], 'warn')))));
       }
-      summaryHost.appendChild(h('div', { class: 'dim3', style: { marginTop: '6px' },
+      kids.push(h('div', { class: 'dim3', style: { marginTop: '6px' },
         text: '候选数 ' + limit + '（本页实际渲染的卡片数）；统计字段缺失时显示「—」。' }));
+
+      /* 原位改写：结构一致时只改文本，统计区不再整块重建 */
+      paint(summaryHost, kids);
     }
 
     /* ---------------------------------------------------------- 候选卡片 */
@@ -1100,46 +1120,64 @@
 
     /* -------------------------------------------------------- 交易规则 */
 
+    /* 规则区常驻槽位：刷新（refresh() → loadRules()）时就地改写，
+       板块表实例只建一次——否则每次刷新都会重建整张表，肉眼可见闪一下 */
+    let rulesTbl = null;
+    const rulesMsgSlot = h('div');
+    const rulesHeadSlot = h('div');
+    const rulesTblSlot = h('div');
+    const rulesFootSlot = h('div');
+    rulesHost.appendChild(h('div', {}, [rulesMsgSlot, rulesHeadSlot, rulesTblSlot, rulesFootSlot]));
+
     function renderRules() {
-      clear(rulesHost);
       if (st.rulesErr) {
-        rulesHost.appendChild(ui.empty('交易规则获取失败：' + st.rulesErr +
-          '（GET /api/rules 无有效返回；本页不会用记忆中的规则表顶替）'));
+        rulesTbl = null;
+        paint(rulesMsgSlot, [ui.empty('交易规则获取失败：' + st.rulesErr +
+          '（GET /api/rules 无有效返回；本页不会用记忆中的规则表顶替）')]);
+        paint(rulesHeadSlot, []); paint(rulesTblSlot, []); paint(rulesFootSlot, []);
         return;
       }
       const d = st.rules;
       if (!d) {
-        rulesHost.appendChild(ui.empty('交易规则尚未加载：GET /api/rules?market=' + st.market));
+        rulesTbl = null;
+        paint(rulesMsgSlot, [ui.empty('交易规则尚未加载：GET /api/rules?market=' + st.market)]);
+        paint(rulesHeadSlot, []); paint(rulesTblSlot, []); paint(rulesFootSlot, []);
         return;
       }
+      paint(rulesMsgSlot, []);
       const unverified = arr(d.unverified).map((u) => String(u));
       const head = h('div', { class: 'legend-inline', style: { marginBottom: '8px', alignItems: 'center' } });
       head.appendChild(chipEl('规则版本 ' + text(d.version), 'accent', text(d.version)));
       head.appendChild(chipEl('市场 ' + (MARKET_LABEL[d.market] || text(d.market))));
       head.appendChild(chipEl('数据截至 ' + timeText(d.updated)));
       if (unverified.length) head.appendChild(chipEl('未证实 ' + unverified.length + ' 项', 'warn'));
-      rulesHost.appendChild(head);
-
+      const headKids = [head];
       if (unverified.length) {
         const line = h('div', { class: 'legend-inline', style: { marginBottom: '8px', alignItems: 'center' } });
         line.appendChild(h('span', { class: 'dim3', text: '以下项未取得权威来源，仅作可配置默认值：' }));
         unverified.forEach((u) => line.appendChild(chipEl(clip(u, 30), 'warn', u)));
-        rulesHost.appendChild(line);
+        headKids.push(line);
       }
+      paint(rulesHeadSlot, headKids);
 
-      rulesHost.appendChild(ui.tbl({
-        compact: true,
-        maxHeight: 'none',
-        cols: [
-          { key: 'label', label: '板块', noSort: true, render: (r) => h('span', { text: text(r.label, r.board) }) },
-          { key: 'limit', label: '涨跌幅', noSort: true, render: (r) => h('span', { class: 'num', text: text(r.limit) }) },
-          { key: 'lot', label: '最小单位', noSort: true, render: (r) => h('span', { text: text(r.lot) }) },
-          { key: 'note', label: '备注', noSort: true, render: (r) => h('span', { class: 'dim', text: text(r.note, '') }) },
-        ],
-        rows: arr(d.boards),
-        emptyText: '服务端未返回板块表',
-      }));
+      if (!rulesTbl) {
+        rulesTbl = ui.tbl({
+          compact: true,
+          maxHeight: 'none',
+          cols: [
+            { key: 'label', label: '板块', noSort: true, render: (r) => h('span', { text: text(r.label, r.board) }) },
+            { key: 'limit', label: '涨跌幅', noSort: true, render: (r) => h('span', { class: 'num', text: text(r.limit) }) },
+            { key: 'lot', label: '最小单位', noSort: true, render: (r) => h('span', { text: text(r.lot) }) },
+            { key: 'note', label: '备注', noSort: true, render: (r) => h('span', { class: 'dim', text: text(r.note, '') }) },
+          ],
+          rows: [],
+          emptyText: '服务端未返回板块表',
+        });
+      }
+      rulesTbl.update(arr(d.boards));
+      paint(rulesTblSlot, [rulesTbl]);
 
+      const foot = [];
       const extra = arr(d.extra);
       if (extra.length) {
         const line = h('div', { class: 'legend-inline', style: { marginTop: '8px', lineHeight: '1.9' } });
@@ -1150,7 +1188,7 @@
             h('span', { class: 'dim3', text: '：' + text(e.value, '') }),
           ]));
         });
-        rulesHost.appendChild(line);
+        foot.push(line);
       }
 
       const sess = d.sessions;
@@ -1161,19 +1199,20 @@
           if (!w || typeof w !== 'object') return;
           line.appendChild(chipEl(text(w.label, w.key) + ' ' + text(w.from) + '–' + text(w.to)));
         });
-        rulesHost.appendChild(line);
-        if (sess.note) rulesHost.appendChild(h('div', { class: 'hint dim3', text: String(sess.note) }));
+        foot.push(line);
+        if (sess.note) foot.push(h('div', { class: 'hint dim3', text: String(sess.note) }));
       }
 
       const sources = arr(d.sources).map((s) => String(s));
       if (sources.length) {
         const body = h('div', { class: 'monospaced', style: { lineHeight: '1.9' } });
         sources.forEach((s) => body.appendChild(h('div', { text: s })));   /* 只显示文本，不做跳转 */
-        rulesHost.appendChild(fold('规则来源（' + sources.length + ' 条，点开；纯文本不跳转）', body));
+        foot.push(fold('规则来源（' + sources.length + ' 条，点开；纯文本不跳转）', body));
       }
       if (d.note) {
-        rulesHost.appendChild(h('div', { class: 'hint dim3', style: { marginTop: '6px' }, text: String(d.note) }));
+        foot.push(h('div', { class: 'hint dim3', style: { marginTop: '6px' }, text: String(d.note) }));
       }
+      paint(rulesFootSlot, foot);
     }
 
     /* -------------------------------------------------------- 复盘摘要 */

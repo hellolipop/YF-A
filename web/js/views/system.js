@@ -7,7 +7,7 @@
 (function () {
   'use strict';
 
-  const { h, clear } = window.AD.dom;
+  const { h, clear, paint, reconcile } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -144,6 +144,14 @@
     let timer = null;
     let ticking = false;
 
+    /* 常驻实例（放在 mount 内，避免跨页面串数据）：
+       表格首次 appendChild，之后只 update(rows)；列表按 key 原位复用。
+       10 秒自动刷新因此不再重建表体 / 日志行，滚动位置与 hover 都不会丢 */
+    let countsTbl = null;          // 存储各表行数
+    let countsColsSig = '';        // 行数列标签带合计，变了才 setCols
+    let providerTbl = null;        // 数据源链路
+    const logList = h('div', { class: 'news-list' });   // 日志列表常驻容器
+
     /* 持久节点：自动刷新只重绘内容，不重建表单，避免打断输入 */
     const engineChip = h('span', { class: 'engine-chip off' });
     const engineHost = h('div', { class: 'metric-list' });
@@ -182,21 +190,22 @@
     function renderEngine() {
       const info = st.info;
       const e = (info && info.engine) || {};
-      clear(engineChip);
       engineChip.className = 'engine-chip' + (e.running ? '' : ' off');
-      engineChip.appendChild(h('i', { class: 'dot' }));
-      engineChip.appendChild(h('span', { text: e.running ? '引擎运行中' : '引擎未运行' }));
-      engineChip.appendChild(h('span', {
-        class: 'meta',
-        text: '间隔 ' + (e.interval || '—') + 's · 轮次 ' + (e.ticks || 0),
-      }));
+      /* 页头 chip 与指标卡都只原位改写：结构不变时不换节点 */
+      paint(engineChip, [
+        h('i', { class: 'dot' }),
+        h('span', { text: e.running ? '引擎运行中' : '引擎未运行' }),
+        h('span', {
+          class: 'meta',
+          text: '间隔 ' + (e.interval || '—') + 's · 轮次 ' + (e.ticks || 0),
+        }),
+      ]);
 
-      clear(engineHost);
       if (!info) {
-        engineHost.appendChild(ui.empty('运行摘要获取失败，点右上「刷新」重试'));
+        paint(engineHost, [ui.empty('运行摘要获取失败，点右上「刷新」重试')]);
         return;
       }
-      const cells = [
+      paint(engineHost, [
         metricCell('引擎状态', e.running ? '运行中' : '未运行（启动 server.py 即自动开启）'),
         metricCell('推进间隔', e.interval ? e.interval + ' 秒' : '—'),
         metricCell('最近 tick', e.lastTick ? F.clock(e.lastTick) : '等待首次推进'),
@@ -206,136 +215,185 @@
         metricCell('最近错误', '', e.lastError
           ? h('span', { class: 'chip up', text: clip(e.lastError, 40), title: String(e.lastError) })
           : h('span', { class: 'dim3', text: '无' })),
-      ];
-      cells.forEach((c) => engineHost.appendChild(c));
+      ]);
     }
 
     function renderStorage() {
-      clear(storageHost);
-      clear(countsHost);
       const info = st.info;
-      if (!info) return;
+      if (!info) {
+        paint(storageHost, []);
+        paint(countsHost, []);
+        countsTbl = null;                      /* 空态替换掉了表体，实例随之失效 */
+        return;
+      }
       const s = info.storage || {};
       const journal = String(s.journal || '').toUpperCase();
-      storageHost.appendChild(metricCell('存储引擎', s.engine || 'sqlite'));
-      storageHost.appendChild(metricCell('journal 模式', '', h('span', {
-        class: 'chip ' + (journal === 'WAL' ? 'accent' : 'warn'),
-        text: journal || '未知',
-      })));
-      storageHost.appendChild(metricCell('schema 版本', 'v' + (s.schemaVersion === undefined || s.schemaVersion === null ? '—' : s.schemaVersion)));
-      storageHost.appendChild(metricCell('库文件路径', '', h('span', {
-        class: 'monospaced', text: clip(s.path || '—', 46), title: s.path || '',
-      })));
+      paint(storageHost, [
+        metricCell('存储引擎', s.engine || 'sqlite'),
+        metricCell('journal 模式', '', h('span', {
+          class: 'chip ' + (journal === 'WAL' ? 'accent' : 'warn'),
+          text: journal || '未知',
+        })),
+        metricCell('schema 版本', 'v' + (s.schemaVersion === undefined || s.schemaVersion === null ? '—' : s.schemaVersion)),
+        metricCell('库文件路径', '', h('span', {
+          class: 'monospaced', text: clip(s.path || '—', 46), title: s.path || '',
+        })),
+      ]);
 
       const counts = s.counts || {};
       const rows = Object.keys(counts).map((k) => ({ table: k, rows: counts[k] }));
       if (!rows.length) {
-        countsHost.appendChild(ui.empty('暂无数据表统计'));
+        countsTbl = null;
+        paint(countsHost, [ui.empty('暂无数据表统计')]);
         return;
       }
       let total = 0;
       rows.forEach((r) => { total += Number(r.rows) || 0; });
-      countsHost.appendChild(ui.tbl({
-        cols: [
-          {
-            key: 'table', label: '数据表', noSort: true,
-            render: (r) => h('span', { class: 'monospaced', text: TABLE_TEXT[r.table] || r.table }),
-          },
-          {
-            key: 'rows', label: '行数（合计 ' + fmtInt(total) + '）', cls: 'n', noSort: true,
-            render: (r) => h('span', { class: 'num', text: fmtInt(r.rows) }),
-          },
-        ],
-        rows, compact: true, emptyText: '暂无数据表统计',
-      }));
+      const cols = [
+        {
+          key: 'table', label: '数据表', noSort: true,
+          render: (r) => h('span', { class: 'monospaced', text: TABLE_TEXT[r.table] || r.table }),
+        },
+        {
+          key: 'rows', label: '行数（合计 ' + fmtInt(total) + '）', cls: 'n', noSort: true,
+          render: (r) => h('span', { class: 'num', text: fmtInt(r.rows) }),
+        },
+      ];
+      /* 行数列标签里带合计，只有它变化时才换列定义；其余情况只 update 行 */
+      const sig = cols.map((c) => c.key + '\u0001' + c.label).join('\u0002');
+      if (!countsTbl) {
+        countsTbl = ui.tbl({ cols, rows, compact: true, emptyText: '暂无数据表统计' });
+        clear(countsHost);
+        countsHost.appendChild(countsTbl);
+      } else {
+        if (countsTbl.parentNode !== countsHost) {   /* 曾被空态替换过：重新挂载 */
+          clear(countsHost);
+          countsHost.appendChild(countsTbl);
+        }
+        if (sig !== countsColsSig) countsTbl.setCols(cols);
+        countsTbl.update(rows);
+      }
+      countsColsSig = sig;
     }
 
     /* --------------------------------------------- 缓存与数据源清单 */
 
     function renderCache() {
-      clear(cacheHost);
       const info = st.info;
-      if (!info) return;
+      if (!info) { paint(cacheHost, []); return; }
       const c = info.cache || {};
-      [
+      paint(cacheHost, [
         metricCell('缓存条目', (c.keys || 0) + ' 个'),
         metricCell('缓存体积', fmtBytes(c.bytes)),
         metricCell('服务运行', fmtUptime(info.uptimeSec)),
         metricCell('服务端时间', info.serverTime ? F.clock(info.serverTime) : '—'),
         metricCell('接口版本', info.version || '—'),
         metricCell('时区', info.tz || '—'),
-      ].forEach((cell) => cacheHost.appendChild(cell));
+      ]);
     }
 
     function renderProviders() {
-      clear(providerHost);
       const info = st.info;
-      if (!info) return;
+      if (!info) {
+        providerTbl = null;
+        paint(providerHost, []);
+        return;
+      }
       const p = info.providers || {};
       const rows = Object.keys(p).map((k) => ({ key: k, chain: p[k] }));
       if (!rows.length) {
-        providerHost.appendChild(ui.empty('暂无数据源清单'));
+        providerTbl = null;
+        paint(providerHost, [ui.empty('暂无数据源清单')]);
         return;
       }
-      providerHost.appendChild(ui.tbl({
-        cols: [
-          {
-            key: 'key', label: '数据域', noSort: true, width: '230px',
-            render: (r) => h('span', { class: 'dim', text: PROVIDER_TEXT[r.key] || r.key }),
-          },
-          {
-            key: 'chain', label: '数据源链路（左优先，异常自动降级）', noSort: true,
-            render: (r) => h('span', { class: 'monospaced', text: r.chain }),
-          },
-        ],
-        rows, compact: true, emptyText: '暂无数据源清单',
-      }));
+      const cols = [
+        {
+          key: 'key', label: '数据域', noSort: true, width: '230px',
+          render: (r) => h('span', { class: 'dim', text: PROVIDER_TEXT[r.key] || r.key }),
+        },
+        {
+          key: 'chain', label: '数据源链路（左优先，异常自动降级）', noSort: true,
+          render: (r) => h('span', { class: 'monospaced', text: r.chain }),
+        },
+      ];
+      if (!providerTbl) {
+        providerTbl = ui.tbl({ cols, rows, compact: true, emptyText: '暂无数据源清单' });
+        clear(providerHost);
+        providerHost.appendChild(providerTbl);
+      } else {
+        if (providerTbl.parentNode !== providerHost) {
+          clear(providerHost);
+          providerHost.appendChild(providerTbl);
+        }
+        providerTbl.update(rows);              /* 列固定：只更新行，不重建表体 */
+      }
     }
 
     /* ------------------------------------------------- ② 日志流 */
 
     function renderLevelSeg() {
-      clear(levelHost);
-      levelHost.appendChild(ui.seg(LEVELS, st.level, (v) => {
+      /* 级别按钮固定 5 个、取值不变：原位改写只会切 active 类，回调里的取值也不会错位 */
+      paint(levelHost, [ui.seg(LEVELS, st.level, (v) => {
         st.level = v;
         renderLevelSeg();
         refreshLogs();
-      }));
+      })]);
+    }
+
+    /* 日志行没有稳定 id（来自 /api/logs，最新在前）：
+       用 ts + 级别 + 事件 + 同键出现序号做 key，轮询时只有新增的行会插入到列表头部 */
+    function logKeys(rows) {
+      const seen = {};
+      return rows.map((r) => {
+        const base = String(r.ts) + '|' + String(r.level || '') + '|' + String(r.event || '');
+        seen[base] = (seen[base] || 0) + 1;
+        return base + '#' + seen[base];
+      });
+    }
+
+    function logItem(r) {
+      const lv = String(r.level || 'info').toLowerCase();
+      const body = h('div', { class: 'body' });
+      body.appendChild(h('div', { class: 'txt' }, [
+        h('span', { class: LEVEL_CLS[lv] || 'chip', text: LEVEL_TEXT[lv] || lv, title: '级别：' + lv }),
+        h('span', {
+          class: 'monospaced', style: { marginLeft: '8px' },
+          text: r.event || '(未命名事件)',
+        }),
+      ]));
+      const fields = fieldsText(r);
+      if (fields) {
+        body.appendChild(h('div', {
+          class: 'monospaced dim',
+          style: { marginTop: '3px', whiteSpace: 'pre-wrap', wordBreak: 'break-all' },
+          text: fields,
+        }));
+      }
+      return h('div', { class: 'news-item' }, [
+        h('div', { class: 'time', text: F.hhmmss(r.time) || F.clock(r.ts) }),
+        body,
+      ]);
     }
 
     function renderLogs() {
-      clear(logHost);
       if (!st.logs.length) {
-        logHost.appendChild(ui.empty(st.level
+        /* 空态与列表是两种结构：先把常驻列表摘下来（节点留在内存里），再原位换成空态 */
+        if (logList.parentNode === logHost) logHost.removeChild(logList);
+        paint(logHost, [ui.empty(st.level
           ? '当前筛选下没有日志，可切回「全部」级别'
-          : '暂无日志记录（引擎未产生事件）'));
+          : '暂无日志记录（引擎未产生事件）')]);
         return;
       }
-      const list = h('div', { class: 'news-list' });
-      st.logs.forEach((r) => {
-        const lv = String(r.level || 'info').toLowerCase();
-        const body = h('div', { class: 'body' });
-        body.appendChild(h('div', { class: 'txt' }, [
-          h('span', { class: LEVEL_CLS[lv] || 'chip', text: LEVEL_TEXT[lv] || lv, title: '级别：' + lv }),
-          h('span', {
-            class: 'monospaced', style: { marginLeft: '8px' },
-            text: r.event || '(未命名事件)',
-          }),
-        ]));
-        const fields = fieldsText(r);
-        if (fields) {
-          body.appendChild(h('div', {
-            class: 'monospaced dim',
-            style: { marginTop: '3px', whiteSpace: 'pre-wrap', wordBreak: 'break-all' },
-            text: fields,
-          }));
-        }
-        list.appendChild(h('div', { class: 'news-item' }, [
-          h('div', { class: 'time', text: F.hhmmss(r.time) || F.clock(r.ts) }),
-          body,
-        ]));
+      if (logList.parentNode !== logHost) {
+        clear(logHost);
+        logHost.appendChild(logList);
+      }
+      const keys = logKeys(st.logs);
+      /* 按 key 复用行节点：日志每 10 秒刷新一次，只有新行会插到最前面，不再整块重建 */
+      reconcile(logList, st.logs, {
+        key: (r, i) => keys[i],
+        render: (r) => logItem(r),
       });
-      logHost.appendChild(list);
     }
 
     /* ------------------------------------------------- ③ 通知渠道 */
@@ -355,14 +413,13 @@
     }
 
     function renderNotifyState() {
-      clear(lastHost);
       const infoNotify = st.info && st.info.notify;
       const n = infoNotify || st.notify || {};
       const infoLast = n.last || null;
       let last = infoLast;
       if (st.testLast && (!infoLast || (st.testLast.ts || 0) >= (infoLast.ts || 0))) last = st.testLast;
 
-      [
+      paint(lastHost, [
         metricCell('通道状态', '', h('span', {
           class: 'chip ' + (n.enabled ? 'accent' : ''),
           text: n.enabled ? '已启用' : '未启用（未配置 Webhook）',
@@ -382,7 +439,7 @@
         metricCell('失败原因', '', last && last.error
           ? h('span', { class: 'chip warn', text: clip(last.error, 40), title: String(last.error) })
           : h('span', { class: 'dim3', text: '无' })),
-      ].forEach((cell) => lastHost.appendChild(cell));
+      ]);
 
       if (!st.notifyEdited) {
         notifyStat.textContent = n.enabled
@@ -467,9 +524,10 @@
         renderLogs();
       } catch (e) {
         st.logs = [];
-        clear(logHost);
         logStat.textContent = '日志获取失败';
-        logHost.appendChild(ui.empty('日志获取失败：' + e.message));
+        /* 列表与失败空态结构不同：先摘下常驻列表，再原位换成错误提示 */
+        if (logList.parentNode === logHost) logHost.removeChild(logList);
+        paint(logHost, [ui.empty('日志获取失败：' + e.message)]);
       }
     }
 
@@ -484,11 +542,11 @@
         renderNotifyState();
       } catch (e) {
         st.info = null;
+        /* 失败时各区块回到空态（render* 内部走 paint / 空实现，不重建父节点） */
         renderEngine();
-        clear(storageHost);
-        clear(countsHost);
-        clear(cacheHost);
-        clear(providerHost);
+        renderStorage();
+        renderCache();
+        renderProviders();
       }
     }
 

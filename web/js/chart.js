@@ -77,12 +77,18 @@
     return { canvas, ctx };
   }
 
+  /* 只在画布尺寸真的变了才重新分配：给 canvas.width 赋值会清空并重建位图，
+     每次重绘都赋值等于每帧重建一次，白白多出一轮重排/合成 */
   function prepare(wrap, canvas, ctx, height) {
     const dpr = window.devicePixelRatio || 1;
     const w = Math.max(240, wrap.clientWidth || 600);
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(height * dpr);
-    canvas.style.height = height + 'px';
+    const pw = Math.round(w * dpr);
+    const ph = Math.round(height * dpr);
+    if (canvas.width !== pw || canvas.height !== ph) {
+      canvas.width = pw;
+      canvas.height = ph;
+    }
+    if (canvas.style.height !== height + 'px') canvas.style.height = height + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, height);
     ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -119,14 +125,24 @@
     }
 
     setData(bars, opts) {
+      const o = opts || {};
+      const prevN = this.bars.length;
       this.bars = bars || [];
-      this.marks = (opts && opts.marks) || this.opts.marks || [];
+      this.marks = o.marks || this.opts.marks || [];
       const n = this.bars.length;
-      this.vis.count = Math.min(n, this.vis.count || 120);
-      this.vis.start = Math.max(0, n - this.vis.count);
+      /* keepView：轮询刷新时保持用户当前的缩放/平移位置（按新增根数同步右移），
+         否则每次刷新都会跳回最右端，看起来像「图被重建了」 */
+      const keep = o.keepView === true && prevN > 0;
+      this.vis.count = Math.max(1, Math.min(n || 1, this.vis.count || 120));
+      if (keep) {
+        this.vis.start = Math.max(0, Math.min(Math.max(0, n - this.vis.count), this.vis.start + (n - prevN)));
+      } else {
+        this.vis.start = Math.max(0, n - this.vis.count);
+      }
       this.compute();
       this.render();
-      this._syncLegend(n - 1);
+      const li = this.hover >= 0 ? Math.min(this.hover, n - 1) : n - 1;
+      this._syncLegend(li);
     }
 
     setOptions(patch) {
@@ -701,13 +717,14 @@
     }
 
     setData(points, opts) {
+      const o = opts || {};
       this.points = points || [];
-      if (opts && opts.prevClose) this.opts.prevClose = opts.prevClose;
+      if (o.prevClose) this.opts.prevClose = o.prevClose;
       const last = this.points.length ? this.points[this.points.length - 1].price : null;
       if (!this.opts.prevClose && this.points.length) this.opts.prevClose = this.points[0].price;
-      if (last && !this._lockedPrev && !opts.prevClose) this.opts.prevClose = this.opts.prevClose || last;
+      if (last && !this._lockedPrev && !o.prevClose) this.opts.prevClose = this.opts.prevClose || last;
       this.render();
-      this._syncLegend(this.points.length - 1);
+      this._syncLegend(this.hover >= 0 && this.hover < this.points.length ? this.hover : this.points.length - 1);
     }
 
     setPrevClose(v) { if (isNum(v)) { this.opts.prevClose = v; this._lockedPrev = true; this.render(); } }

@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  const { h, clear } = window.AD.dom;
+  const { h, reconcile } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -23,8 +23,40 @@
   function mount(root, ctx) {
     let timer = null;
     const state = { rows: [], kw: '', auto: true };
+    const EMPTY = { __adEmpty: true };                    /* 空态哨兵：交给 reconcile 统一管理 */
     const listHost = h('div');
+    const listWrap = h('div', { class: 'news-list' });    /* 列表容器只创建一次 */
+    listWrap.__adKeep = true;                             /* 缓存实例标记：不与普通块做 morph 合并 */
     const statHost = h('span', { class: 'hint', text: '加载中…' });
+
+    /* 原位挂载：同一状态内只做增量改写，实现见 ui.js（listWrap 带 __adKeep 不会被合并） */
+    const mountInto = ui.mountInto;
+
+    /* 单条快讯：结构与原来一致，节点由 reconcile 按 url / id 复用 */
+    function newsItem(r) {
+      const body = h('div', { class: 'body' });
+      body.appendChild(h('div', {
+        class: 'txt',
+        html: ('<strong>' + (r.title || '') + '</strong>' +
+          (r.title ? '<br>' : '') +
+          (r.summary || '').replace(/[<>]/g, '')).replace(/\n/g, '<br>'),
+      }));
+      const codes = extractCodes(r.summary + ' ' + r.title);
+      if (codes.length) {
+        const chips = h('div', { style: { marginTop: '7px', display: 'flex', gap: '6px', flexWrap: 'wrap' } });
+        codes.forEach((c) => {
+          const chip = h('button', { class: 'chip accent', text: c, style: { cursor: 'pointer' } });
+          /* 节点会被原位复用：点击时以按钮上的文本（即代码）为准，避免读到首次渲染的旧闭包 */
+          chip.addEventListener('click', () => { const code = chip.textContent || c; ctx.openSymbol('cn', code, code); });
+          chips.appendChild(chip);
+        });
+        body.appendChild(chips);
+      }
+      return h('div', { class: 'news-item' }, [
+        h('div', { class: 'time', text: F.timeOf(r.time) }),
+        body,
+      ]);
+    }
 
     function render() {
       const rows = state.rows.filter((r) => {
@@ -32,37 +64,14 @@
         const k = state.kw.toUpperCase();
         return (r.title + r.summary).toUpperCase().indexOf(k) >= 0;
       });
-      clear(listHost);
-      const list = h('div', { class: 'news-list' });
-      if (!rows.length) {
-        list.appendChild(ui.empty(state.kw ? '没有匹配「' + state.kw + '」的快讯' : '暂无快讯'));
-      }
-      rows.forEach((r) => {
-        const body = h('div', { class: 'body' });
-        body.appendChild(h('div', {
-          class: 'txt',
-          html: ('<strong>' + (r.title || '') + '</strong>' +
-            (r.title ? '<br>' : '') +
-            (r.summary || '').replace(/[<>]/g, '')).replace(/\n/g, '<br>'),
-        }));
-        const codes = extractCodes(r.summary + ' ' + r.title);
-        if (codes.length) {
-          const chips = h('div', { style: { marginTop: '7px', display: 'flex', gap: '6px', flexWrap: 'wrap' } });
-          codes.forEach((c) => {
-            chips.appendChild(h('button', {
-              class: 'chip accent', text: c,
-              style: { cursor: 'pointer' },
-              on: { click: () => ctx.openSymbol('cn', c, c) },
-            }));
-          });
-          body.appendChild(chips);
-        }
-        list.appendChild(h('div', { class: 'news-item' }, [
-          h('div', { class: 'time', text: F.timeOf(r.time) }),
-          body,
-        ]));
+      mountInto(listHost, listWrap);
+      /* 按 url / id 做 key 复用节点：顺序不变时列表 DOM 完全不动，滚动位置也不会被重置 */
+      reconcile(listWrap, rows.length ? rows : [EMPTY], {
+        key: (r, i) => (r === EMPTY ? '__ad-empty' : String(r.url || r.id || r.code || ('#' + i))),
+        render: (r) => (r === EMPTY
+          ? ui.empty(state.kw ? '没有匹配「' + state.kw + '」的快讯' : '暂无快讯')
+          : newsItem(r)),
       });
-      listHost.appendChild(list);
     }
 
     async function refresh() {
@@ -74,8 +83,7 @@
         render();
       } catch (e) {
         statHost.textContent = '获取失败';
-        clear(listHost);
-        listHost.appendChild(ui.empty('资讯获取失败：' + e.message));
+        mountInto(listHost, ui.empty('资讯获取失败：' + e.message));   /* 失败提示同样原位挂载 */
       }
     }
 

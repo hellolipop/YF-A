@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  const { h, clear, pct } = window.AD.dom;
+  const { h, pct, paint } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -45,6 +45,11 @@
     { value: 'mainInflow', label: '主力净额' }, { value: 'chg60d', label: '60日涨幅' },
   ];
 
+  /* 列定义指纹：列没变就只更新行，避免动表头（setCols 会重建表头并打断 hover） */
+  function colsSig(cols) {
+    return (cols || []).map((c) => c.key + '\u0001' + (c.label || '') + '\u0001' + (c.width || '')).join('\u0002');
+  }
+
   function mount(root, ctx) {
     const market = ctx.state.market;
     const isCn = market === 'cn';
@@ -65,6 +70,10 @@
     const state = { page: 1, size: 50, sort: 'changePct', order: 'desc', total: 0, preset: null, kw: '' };
     const tableHost = h('div');
     const statHost = h('span', { class: 'hint', text: '就绪' });
+    /* 结果表实例（只能缓存在 mount 内）：首次挂载后只 update(rows)，
+       筛选条件变化时不再重建表体 —— 不闪、不跳滚动、不丢行 hover */
+    let tableRef = null;
+    let tableColsSig = '';
 
     function collect() {
       const f = {};
@@ -112,12 +121,22 @@
       try {
         const res = await api.screener(market, collect(), state.sort, state.order, state.page, state.size);
         state.total = res.total;
-        clear(tableHost);
-        tableHost.appendChild(ui.tbl({
-          cols: cols(), rows: res.rows, maxHeight: 'calc(100vh - 430px)',
-          onRow: (r) => ctx.openSymbol(r.market, r.code, r.name),
-          emptyText: '没有符合条件的标的，试试放宽条件',
-        }));
+        /* 原位刷新：表实例已存在就只换行（列定义变化时才 setCols），绝不重建整表 */
+        const nextCols = cols();
+        const sig = colsSig(nextCols);
+        if (!tableRef) {
+          tableRef = ui.tbl({
+            cols: nextCols, rows: res.rows, maxHeight: 'calc(100vh - 430px)',
+            onRow: (r) => ctx.openSymbol(r.market, r.code, r.name),
+            emptyText: '没有符合条件的标的，试试放宽条件',
+          });
+          tableColsSig = sig;
+          paint(tableHost, []);               /* 清掉失败提示（只删节点，不重建表格） */
+          tableHost.appendChild(tableRef);    /* 首次挂载；之后只 update，绝不重复挂载 */
+        } else {
+          if (sig !== tableColsSig) { tableRef.setCols(nextCols); tableColsSig = sig; }
+          tableRef.update(res.rows);
+        }
         const pages = Math.max(1, Math.ceil(res.total / state.size));
         statHost.textContent = '命中 ' + res.total + ' 只 · 第 ' + state.page + '/' + pages + ' 页 · 口径：' + res.sampleScope +
           ' · 快照源 ' + (res.source || '—') + (res.stale ? '（本地缓存，可能延迟）' : '');
@@ -130,8 +149,10 @@
         pageLabel.textContent = state.page + ' / ' + pages;
       } catch (e) {
         statHost.textContent = '';
-        clear(tableHost);
-        tableHost.appendChild(ui.empty('筛选失败：' + e.message));
+        /* 失败提示也走原位改写；表实例随之作废，下次成功时重建一次 */
+        paint(tableHost, [ui.empty('筛选失败：' + e.message)]);
+        tableRef = null;
+        tableColsSig = '';
       }
     }
 

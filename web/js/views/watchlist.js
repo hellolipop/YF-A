@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  const { h, clear, pct } = window.AD.dom;
+  const { h, paint, pct } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -25,12 +25,32 @@
   ];
 
   function mount(root, ctx) {
-    let table = null;
+    let table = null;                    /* 表格实例：mount 作用域内缓存，首次创建后不再重建 */
     let timer = null;
     const state = { rows: [], filter: '' };
 
     const tableHost = h('div');
     const statHost = h('span', { class: 'hint' });
+
+    /**
+     * 原位挂载：同一状态内只做增量改写（morph），只有与「缓存实例」互切时才真正替换节点。
+     * 实现见 ui.js（带 __adKeep 标记的表格实例不会被 morph 合并）。
+     */
+    const mountInto = ui.mountInto;
+
+    /* 空态块：结构与原来完全一致，轮询时靠 paint 原位改写（示例按钮与其监听都保留） */
+    function emptyBlock() {
+      const presets = h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center', marginTop: '10px' } });
+      presets.appendChild(h('button', {
+        class: 'btn sm', text: '导入 A股示例（茅台 / 宁德时代 / 中国平安 …）',
+        on: { click: async () => { PRESETS_CN.concat(PRESETS_US).forEach((p) => ctx.addWatch(p.market, p.code, p.name)); await refresh(); } },
+      }));
+      return h('div', { class: 'empty' }, [
+        h('div', { text: '自选列表为空' }),
+        h('div', { style: { marginTop: '6px' }, text: '在上方输入代码加入，或一键导入示例组合' }),
+        presets,
+      ]);
+    }
 
     const input = h('input', { class: 'inp', placeholder: '代码 / 名称，如 600519 / AAPL', style: { width: '210px' } });
 
@@ -87,19 +107,9 @@
 
     async function refresh() {
       const list = ctx.getWatch();
-      clear(statHost);
       if (!list.length) {
-        clear(tableHost);
-        const presets = h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center', marginTop: '10px' } });
-        presets.appendChild(h('button', {
-          class: 'btn sm', text: '导入 A股示例（茅台 / 宁德时代 / 中国平安 …）',
-          on: { click: async () => { PRESETS_CN.concat(PRESETS_US).forEach((p) => ctx.addWatch(p.market, p.code, p.name)); await refresh(); } },
-        }));
-        tableHost.appendChild(h('div', { class: 'empty' }, [
-          h('div', { text: '自选列表为空' }),
-          h('div', { style: { marginTop: '6px' }, text: '在上方输入代码加入，或一键导入示例组合' }),
-          presets,
-        ]));
+        paint(statHost, ['']);                       /* 空态：只清统计说明，容器交给原位挂载 */
+        mountInto(tableHost, emptyBlock());
         return;
       }
       const byMarket = { cn: [], us: [] };
@@ -120,21 +130,15 @@
           };
         }).filter((r) => !state.filter || (r.name || '').indexOf(state.filter) >= 0 || r.code.indexOf(state.filter) >= 0);
 
-        statHost.textContent = '共 ' + state.rows.length + ' 只 · A股 ' + byMarket.cn.length +
-          ' 只 · 美股 ' + byMarket.us.length + ' 只 · 更新 ' + F.clock(Date.now());
         const up = state.rows.filter((r) => (r.changePct || 0) > 0).length;
         const down = state.rows.filter((r) => (r.changePct || 0) < 0).length;
-        statHost.textContent += ' · 上涨 ' + up + ' / 下跌 ' + down;
-
-        if (state.filter) {
-          statHost.textContent += ' · 筛选「' + state.filter + '」命中 ' + state.rows.length + ' 只';
-        }
-        clear(tableHost);
-        tableHost.appendChild(ui.tbl({
-          cols: cols(), rows: state.rows, maxHeight: 'calc(100vh - 300px)',
-          onRow: (r) => ctx.openSymbol(r.market, r.code, r.name),
-          emptyText: '没有匹配的自选股',
-        }));
+        let hint = '共 ' + state.rows.length + ' 只 · A股 ' + byMarket.cn.length +
+          ' 只 · 美股 ' + byMarket.us.length + ' 只 · 更新 ' + F.clock(Date.now());
+        hint += ' · 上涨 ' + up + ' / 下跌 ' + down;
+        if (state.filter) hint += ' · 筛选「' + state.filter + '」命中 ' + state.rows.length + ' 只';
+        paint(statHost, [hint]);                     /* 统计说明原位改写，不会先清空再填 */
+        mountInto(tableHost, table);
+        table.update(state.rows);                    /* 增量更新表体：滚动位置与 hover 都保留 */
       } catch (e) {
         ctx.toast('自选行情刷新失败：' + e.message, 'err');
       }
@@ -160,7 +164,13 @@
       tableHost,
     ]));
 
-    table = ui.tbl({ cols: cols(), rows: [], onRow: (r) => ctx.openSymbol(r.market, r.code, r.name), maxHeight: 'calc(100vh - 300px)' });
+    /* 首次创建并挂载；之后 refresh 只调用 table.update(rows) 做原位更新 */
+    table = ui.tbl({
+      cols: cols(), rows: [], maxHeight: 'calc(100vh - 300px)',
+      onRow: (r) => ctx.openSymbol(r.market, r.code, r.name),
+      emptyText: '没有匹配的自选股',
+    });
+    table.__adKeep = true;                       /* 缓存实例标记：不与普通块做 morph 合并 */
     tableHost.appendChild(table);
 
     const filterInput = h('input', {

@@ -363,6 +363,18 @@ input.inp::placeholder { color: var(--text-3); }
   color: var(--text-2); box-shadow: 0 8px 24px rgba(0,0,0,.5); white-space: nowrap;
 }
 .chart-tip b { color: var(--text); font-weight: 600; }
+
+/* 无感刷新：刷新中 / 刷新失败只在容器右上角浮出一个小标签，绝不替换既有内容 */
+.is-busy { position: relative; }
+.is-busy::after {
+  content: attr(data-busy);
+  position: absolute; top: 8px; right: 10px; z-index: 6; pointer-events: none;
+  padding: 0 8px; border-radius: 999px; font-size: 10.5px; line-height: 1.75;
+  color: var(--text-3); background: rgba(10, 12, 17, .78); border: 1px solid var(--line);
+}
+.is-busy.is-warn::after {
+  color: var(--warn); border-color: rgba(245, 165, 36, .35); background: rgba(245, 165, 36, .10);
+}
 .chart-empty { padding: 40px; text-align: center; color: var(--text-3); font-size: 12px; }
 
 /* ------------------------------------------------------------ 信号/指标 */

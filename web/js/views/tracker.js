@@ -5,7 +5,7 @@
 (function () {
   'use strict';
 
-  const { h, clear, pct } = window.AD.dom;
+  const { h, clear, pct, paint } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -59,10 +59,72 @@
     const detailHost = h('div');
     const hintHost = h('span', { class: 'hint' });
 
+    /* ------------------------------------------------ 无感刷新（增量更新）
+
+       15 秒自动刷新（refreshAll → renderTotals / renderEngine / renderList /
+       loadDetail → renderDetail）一律不做 clear + 重建：
+         · 表格：实例缓存在 mount 作用域内（放模块级会跨页面串数据），
+           首次挂到槽位上，之后只调 ref.update(rows)；列定义随任务变化时才 setCols；
+         · 其余区块：paint(槽位, [子节点…]) 原位改写；空态也只改自己那一块。
+       「表格 / 空态」是二选一：两个常驻槽位 + display 切换，表格实例从不卸载
+       （卸载会丢滚动位置与 hover）。传给 paint 的子节点必须是新构造的（h() 产物），
+       已挂载的节点交给 paint 会被摘下来再插回去 —— 那就等于重建了，表格只走 update。 */
+
+    /* 一对槽位：tbl 只挂一次表格实例；empty 只由 paint 改写空态 */
+    function slotPair(host) {
+      const tbl = h('div');
+      const empty = h('div');
+      host.appendChild(tbl);
+      host.appendChild(empty);
+      return { tbl, empty };
+    }
+
+    /* 显示 / 隐藏（只改 display，节点不卸载） */
+    function vis(el, on) { el.style.display = on ? '' : 'none'; }
+
+    let listTbl = null;        /* 跟踪任务表实例 */
+    let listCfg = null;        /* 它的配置对象：activeKey 决定高亮行，ui.tbl 每次渲染都会读 */
+    let monthlyTbl = null;     /* 详情 · 月度盈亏表实例 */
+    let tradesTbl = null;      /* 详情 · 逐笔交易表实例 */
+    let tblRunId = null;       /* 详情两张表当前对应的任务 id（换任务时才 setCols） */
+    let eqChartRunId = null;   /* 权益曲线当前对应的任务 id（同一任务只 setData，不重建画布） */
+
+    const listSlot = slotPair(listHost);
+
+    /* 任务详情骨架：只建一次（各区块的容器常驻），刷新时只往容器里 paint / update */
+    const dtHead = h('div', { class: 'run-detail-head' });
+    const dtStats = h('div', { class: 'bt-stats' });
+    const dtPos = h('div');
+    const dtProgress = h('div');
+    const eqHost = h('div', { style: { height: '240px' } });
+    const monthlyTblSlot = h('div');
+    const monthlyEmptySlot = h('div');
+    const tradesTblSlot = h('div');
+    const tradesEmptySlot = h('div');
+    const signalsHost = h('div', { class: 'news-list' });
+    const detailEmpty = h('div');
+    const detailSkeleton = h('div', {}, [
+      dtHead,
+      dtStats,
+      h('div', { style: { height: '16px' } }),
+      ui.section('权益曲线', '策略权益 vs 买入持有基准（初始资金等比）', [], eqHost),
+      h('div', { class: 'grid g-2' }, [
+        ui.section('当前持仓', '', [], dtPos),
+        ui.section('观察期进度', '', [], dtProgress),
+      ]),
+      ui.section('调整任务', '手续费 / 滑点 / 止损止盈 / 观察目标即时生效；策略类字段需重置并重新回溯', [], adjustHost),
+      ui.section('月度盈亏', '按自然月拆解：月末权益变动 + 已实现盈亏', [], h('div', {}, [monthlyTblSlot, monthlyEmptySlot])),
+      ui.section('逐笔交易', '信号次日开盘成交，含手续费与滑点', [], h('div', {}, [tradesTblSlot, tradesEmptySlot])),
+      ui.section('最近信号', '引擎识别到的买卖信号（含因资金不足被跳过的信号）', [], signalsHost),
+      ui.section('变更记录', '该任务的配置调整历史（最近 30 次）', [], revHost),
+    ]);
+    vis(detailSkeleton, false);          /* 有详情时才展开（避免空骨架先闪一下） */
+    detailHost.appendChild(detailEmpty);
+    detailHost.appendChild(detailSkeleton);
+
     /* ----------------------------------------------------- 组合总览 */
 
     function renderTotals() {
-      clear(totalsHost);
       const t = (st.overview && st.overview.totals) || {};
       const cells = [
         ['跟踪任务', (t.runs || 0) + ' 个（运行中 ' + (t.running || 0) + '）'],
@@ -74,28 +136,28 @@
         ['整体胜率', F.num(t.winRate || 0, 1) + '%', (t.winRate || 0) >= 50 ? 'up' : ''],
         ['口径说明', '跨市场按本币简单加总（不做汇率换算）'],
       ];
-      cells.forEach((c) => {
-        totalsHost.appendChild(h('div', { class: 'metric' }, [
-          h('div', { class: 'k', text: c[0] }),
-          h('div', { class: 'v ' + (c[2] || ''), text: c[1] }),
-        ]));
-      });
+      /* 卡片数量与顺序固定 → paint 只改文本，不重建节点 */
+      paint(totalsHost, cells.map((c) => h('div', { class: 'metric' }, [
+        h('div', { class: 'k', text: c[0] }),
+        h('div', { class: 'v ' + (c[2] || ''), text: c[1] }),
+      ])));
     }
 
     function renderEngine() {
       const e = st.engine || {};
-      clear(engineChip);
       engineChip.className = 'engine-chip' + (e.running ? '' : ' off');
-      engineChip.appendChild(h('i', { class: 'dot' }));
-      engineChip.appendChild(h('span', {
-        text: e.running ? '引擎运行中' : '引擎未运行（启动 server.py 即自动开启）',
-      }));
-      engineChip.appendChild(h('span', {
-        class: 'meta',
-        text: '每 ' + (e.interval || 60) + ' 秒推进' +
-          (e.lastTick ? ' · 上次 ' + F.clock(e.lastTick) : ' · 等待首次推进') +
-          ' · 已完成 ' + (e.ticks || 0) + ' 轮',
-      }));
+      paint(engineChip, [
+        h('i', { class: 'dot' }),
+        h('span', {
+          text: e.running ? '引擎运行中' : '引擎未运行（启动 server.py 即自动开启）',
+        }),
+        h('span', {
+          class: 'meta',
+          text: '每 ' + (e.interval || 60) + ' 秒推进' +
+            (e.lastTick ? ' · 上次 ' + F.clock(e.lastTick) : ' · 等待首次推进') +
+            ' · 已完成 ' + (e.ticks || 0) + ' 轮',
+        }),
+      ]);
     }
 
     /* ------------------------------------------------- 新建任务表单 */
@@ -251,8 +313,7 @@
           F.amt(Math.ceil(f.minCapital / 10000) * 10000, f.market) + ' 以上');
       }
       bits.push('创建后立即回溯所选窗口的历史表现，并持续向前推进');
-      clear(hintHost);
-      hintHost.appendChild(h('span', { text: bits.join(' · ') }));
+      paint(hintHost, [h('span', { text: bits.join(' · ') })]);
     }
 
     /** 提交前从输入框读回表单状态：以 DOM 为唯一真源。
@@ -333,13 +394,20 @@
     /* ----------------------------------------------------- 任务列表 */
 
     function renderList() {
-      clear(listHost);
       const rows = (st.overview && st.overview.rows) || [];
       if (!rows.length) {
-        listHost.appendChild(ui.empty('还没有跟踪任务：在上方选择标的与策略创建，系统会回溯历史并持续跟踪'));
+        /* 空态：只切显示并原位改写文案；表格实例留在槽位里（下次有任务直接复用） */
+        vis(listSlot.tbl, false);
+        vis(listSlot.empty, true);
+        paint(listSlot.empty, [ui.empty('还没有跟踪任务：在上方选择标的与策略创建，系统会回溯历史并持续跟踪')]);
         return;
       }
-      listHost.appendChild(ui.tbl({
+      vis(listSlot.empty, false);
+      vis(listSlot.tbl, true);
+      /* 高亮行由 cfg.activeKey 决定，ui.tbl 每次渲染都会读它 ——
+         这里与 wrap.update 改写 cfg.rows 同一路子，先同步再 update，避免选中态停在旧行 */
+      if (listTbl) { listCfg.activeKey = st.selected; listTbl.update(rows); return; }
+      listCfg = {
         cols: [
           {
             key: 'status', label: '状态', noSort: true, width: '92px',
@@ -454,7 +522,9 @@
         onRow: (r) => { st.selected = r.id; loadDetail(); },
         maxHeight: '460px',
         emptyText: '暂无任务',
-      }));
+      };
+      listTbl = ui.tbl(listCfg);
+      listSlot.tbl.appendChild(listTbl);
     }
 
     async function act(id, action) {
@@ -530,31 +600,33 @@
       updateDiff();
     });
 
+    /* 变更摘要：15 秒自动刷新也会走到这里（buildAdjust → updateDiff），
+       所以同样原位更新 —— 子节点数是「1 + 变更项数 + 0/1」，paint 按位置合并即可 */
     function updateDiff() {
       const run = st.detail && st.detail.run;
-      clear(diffHost);
-      if (!run) return;
+      if (!run) { paint(diffHost, []); return; }
       const { patch, logicKeys } = currentPatch(run);
       const keys = Object.keys(patch);
       if (!keys.length) {
-        diffHost.appendChild(h('span', { class: 'dim3', text: '尚未修改任何字段' }));
         saveBtn.disabled = true;
+        paint(diffHost, [h('span', { class: 'dim3', text: '尚未修改任何字段' })]);
         return;
       }
       const logic = keys.filter((k) => logicKeys.indexOf(k) >= 0);
-      diffHost.appendChild(h('span', { class: 'dim3', text: '待提交 ' + keys.length + ' 项：' }));
+      const kids = [h('span', { class: 'dim3', text: '待提交 ' + keys.length + ' 项：' })];
       keys.forEach((k) => {
         const from = run[k];
-        diffHost.appendChild(h('span', { class: 'chip' + (logicKeys.indexOf(k) >= 0 ? ' warn' : ' accent') }, [
+        kids.push(h('span', { class: 'chip' + (logicKeys.indexOf(k) >= 0 ? ' warn' : ' accent') }, [
           h('span', { text: fieldLabel(k) + ' ' + fmtVal(from) + ' → ' + fmtVal(patch[k]) }),
         ]));
       });
       if (logic.length && !adjustState.reset) {
         saveBtn.disabled = true;
-        diffHost.appendChild(h('span', { class: 'chip warn', text: '需勾选「重置并重新回溯」后才能提交' }));
+        kids.push(h('span', { class: 'chip warn', text: '需勾选「重置并重新回溯」后才能提交' }));
       } else {
         saveBtn.disabled = false;
       }
+      paint(diffHost, kids);
     }
 
     async function saveAdjust() {
@@ -791,19 +863,19 @@
     }
 
     function renderRevisions(run) {
-      clear(revHost);
       const revs = (run.revisions || []);
       if (!revs.length) {
-        revHost.appendChild(h('div', { class: 'legend-inline' }, ['该任务创建后尚未调整过配置']));
+        paint(revHost, [h('div', { class: 'legend-inline' }, ['该任务创建后尚未调整过配置'])]);
         return;
       }
-      revs.forEach((rev) => {
+      /* 列表按位置原位改写：新记录一次性插到最前时，也只重写各行文本，不重建节点 */
+      paint(revHost, revs.map((rev) => {
         const rows = Object.keys(rev.fields || {}).map((k) => h('div', { class: 'legend-inline monospaced' }, [
           h('span', { class: 'chip', text: fieldLabel(k) }),
           h('span', { class: 'dim3', text: fmtVal(rev.fields[k].from) + ' → ' }),
           h('span', { text: fmtVal(rev.fields[k].to) }),
         ]));
-        revHost.appendChild(h('div', { class: 'news-item' }, [
+        return h('div', { class: 'news-item' }, [
           h('div', { class: 'time', text: F.clock(rev.ts) }),
           h('div', { class: 'body' }, [
             h('div', { class: 'txt' }, [
@@ -813,24 +885,31 @@
             ]),
             h('div', { style: { marginTop: '6px', display: 'grid', gap: '3px' } }, rows),
           ]),
-        ]));
-      });
+        ]);
+      }));
     }
 
     /* ----------------------------------------------------- 任务详情 */
 
     function renderDetail() {
-      clear(detailHost);
-      if (eqChart) { eqChart.destroy(); eqChart = null; }
       const d = st.detail;
       if (!d) {
-        detailHost.appendChild(ui.empty('点击任务行的「详情」查看权益曲线、月度收益与逐笔交易'));
+        /* 详情为空：收起骨架 + 释放旧图，展示空态（骨架下次直接复用，不重建） */
+        if (eqChart) { eqChart.destroy(); eqChart = null; eqChartRunId = null; }
+        vis(detailSkeleton, false);
+        vis(detailEmpty, true);
+        paint(detailEmpty, [ui.empty('点击任务行的「详情」查看权益曲线、月度收益与逐笔交易')]);
         return;
       }
+      vis(detailEmpty, false);
+      vis(detailSkeleton, true);
       const run = d.run;
       const s = d.stats;
 
-      const head = h('div', { class: 'run-detail-head' }, [
+      /* 换任务时才销毁旧图；同一任务的 15 秒刷新只 setData —— 重建画布会闪 */
+      if (eqChart && eqChartRunId !== run.id) { eqChart.destroy(); eqChart = null; eqChartRunId = null; }
+
+      paint(dtHead, [
         h('h3', { text: (run.name || run.code) + ' · ' + run.strategyName }),
         h('span', { class: 'mono-sm', text: (run.market === 'us' ? 'US:' : '') + run.code }),
         h('span', { class: 'chip', text: '周期 ' + run.period }),
@@ -840,7 +919,8 @@
         h('span', { class: 'mono-sm', text: '观察期 ' + (s.startedFrom || run.startDate) + ' → 至今（' + s.daysObserved + ' 个交易日）' }),
       ]);
 
-      const stats = h('div', { class: 'bt-stats' }, [
+      /* 指标卡数量与顺序固定 → paint 只改数值与配色 */
+      paint(dtStats, [
         statCard('累计收益率', F.pct(s.returnPct), F.dir(s.returnPct)),
         statCard('年化收益', F.pct(s.annualizedPct), F.dir(s.annualizedPct)),
         statCard('盈亏金额', F.amt(s.totalPnl, run.market), F.dir(s.totalPnl)),
@@ -865,10 +945,11 @@
         statCard('跳过买入信号', (s.skippedBuys || 0) + ' 次', s.skippedBuys ? 'down' : ''),
       ]);
 
-      const posCard = h('div', {});
+      /* 当前持仓：有仓 / 空仓两种形态按位置合并（结构不同时 morph 会换掉具体单元格） */
+      const posKids = [];
       if (d.position) {
         const p = d.position;
-        posCard.appendChild(h('div', { class: 'pos-card' }, [
+        posKids.push(h('div', { class: 'pos-card' }, [
           ['持仓数量', p.qty + ' 股', ''],
           ['建仓价', F.price(p.entryPrice, run.market), ''],
           ['建仓日', p.entryDate || '—', ''],
@@ -883,50 +964,33 @@
           h('div', { class: 'v ' + cls, text: v }),
         ]))));
         if (p.entryPhase === 'live') {
-          posCard.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '8px' } }, [
+          posKids.push(h('div', { class: 'legend-inline', style: { marginTop: '8px' } }, [
             h('span', { class: 'phase-tag live', text: '实时' }),
             '该持仓由引擎在观察期内按真实行情成交（非历史回溯），是策略前向验证的有效样本',
           ]));
         }
       } else {
-        posCard.appendChild(h('div', { class: 'legend-inline' }, ['当前空仓' + (run.pending ? '，已有待执行信号：' + (run.pending === 'buy' ? '买入' : '卖出') + '（下一根K线开盘成交）' : '')]));
+        posKids.push(h('div', { class: 'legend-inline' }, ['当前空仓' + (run.pending ? '，已有待执行信号：' + (run.pending === 'buy' ? '买入' : '卖出') + '（下一根K线开盘成交）' : '')]));
       }
+      paint(dtPos, posKids);
 
-      const eqHost = h('div', { style: { height: '240px' } });
-      const monthlyHost = h('div');
-      const tradesHost = h('div');
-      const signalsHost = h('div', { class: 'news-list' });
-
-      detailHost.appendChild(h('div', {}, [
-        head,
-        stats,
-        h('div', { style: { height: '16px' } }),
-        ui.section('权益曲线', '策略权益 vs 买入持有基准（初始资金等比）', [], eqHost),
-        h('div', { class: 'grid g-2' }, [
-          ui.section('当前持仓', '', [], posCard),
-          ui.section('观察期进度', '', [], h('div', {}, [
-            progressCell(s),
-            h('div', { class: 'legend-inline', style: { marginTop: '10px' } }, [
-              '目标 ' + s.targetDays + ' 个交易日 · 已观测 ' + s.daysObserved + ' 个交易日（' +
-              F.num(s.progressPct, 1) + '%）',
-              '最近K线 ' + (s.lastBarTime || '—'),
-              '引擎推进 ' + (s.tickCount || 0) + ' 次',
-            ]),
-            h('div', { class: 'legend-inline', style: { marginTop: '6px', color: 'var(--text-3)' } }, [
-              '回溯记录（backfill）为历史模拟，实时记录（live）为引擎在盘中/收盘后写入',
-            ]),
-          ])),
+      paint(dtProgress, [
+        progressCell(s),
+        h('div', { class: 'legend-inline', style: { marginTop: '10px' } }, [
+          '目标 ' + s.targetDays + ' 个交易日 · 已观测 ' + s.daysObserved + ' 个交易日（' +
+          F.num(s.progressPct, 1) + '%）',
+          '最近K线 ' + (s.lastBarTime || '—'),
+          '引擎推进 ' + (s.tickCount || 0) + ' 次',
         ]),
-        ui.section('调整任务', '手续费 / 滑点 / 止损止盈 / 观察目标即时生效；策略类字段需重置并重新回溯', [], adjustHost),
-        ui.section('月度盈亏', '按自然月拆解：月末权益变动 + 已实现盈亏', [], monthlyHost),
-        ui.section('逐笔交易', '信号次日开盘成交，含手续费与滑点', [], tradesHost),
-        ui.section('最近信号', '引擎识别到的买卖信号（含因资金不足被跳过的信号）', [], signalsHost),
-        ui.section('变更记录', '该任务的配置调整历史（最近 30 次）', [], revHost),
-      ]));
+        h('div', { class: 'legend-inline', style: { marginTop: '6px', color: 'var(--text-3)' } }, [
+          '回溯记录（backfill）为历史模拟，实时记录（live）为引擎在盘中/收盘后写入',
+        ]),
+      ]);
+
       buildAdjust(run);
       renderRevisions(run);
 
-      /* 权益曲线 */
+      /* 权益曲线：同一任务只换数据（setData），换任务 / 数据不足时才销毁重建 */
       const eq = d.equity || [];
       if (eq.length > 1) {
         const base = run.initial;
@@ -943,79 +1007,62 @@
             color: '#8b95a5', width: 1.2, fmt: (v) => F.amt(v, run.market),
           });
         }
-        eqChart = window.AD.chart.line(eqHost, {
-          height: 240, fmt: (v) => F.amt(v, run.market), series,
-        });
+        if (!eqChart) {
+          clear(eqHost);                       /* 首次 / 换任务：清掉可能残留的空态或旧画布 */
+          eqChart = window.AD.chart.line(eqHost, {
+            height: 240, fmt: (v) => F.amt(v, run.market), series,
+          });
+          eqChartRunId = run.id;
+        }
+        eqChart.setData(series);
       } else {
-        eqHost.appendChild(ui.empty('权益数据不足'));
+        if (eqChart) { eqChart.destroy(); eqChart = null; eqChartRunId = null; }
+        paint(eqHost, [ui.empty('权益数据不足')]);
       }
 
-      /* 月度 */
-      clear(monthlyHost);
-      if (!d.monthly || !d.monthly.length) monthlyHost.appendChild(ui.empty('暂无月度数据'));
-      else {
-        monthlyHost.appendChild(ui.tbl({
-          cols: [
-            { key: 'month', label: '月份', noSort: true },
-            { key: 'days', label: '交易日', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num', text: String(m.days) }) },
-            { key: 'equityEnd', label: '月末权益', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num', text: F.amt(m.equityEnd, run.market) }) },
-            { key: 'monthlyReturnPct', label: '当月收益', cls: 'n', noSort: true, render: (m) => pct(m.monthlyReturnPct) },
-            { key: 'realized', label: '已实现盈亏', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num ' + F.dir(m.realized), text: F.amt(m.realized, run.market) }) },
-            { key: 'trades', label: '交易', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num', text: String(m.trades) }) },
-            { key: 'winRate', label: '当月胜率', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num ' + (m.winRate >= 50 ? 'up' : (m.trades ? 'down' : 'flat')), text: m.trades ? F.num(m.winRate, 0) + '%' : '—' }) },
-          ],
-          rows: d.monthly, compact: true,
-        }));
+      /* 月度 / 逐笔：列定义只在换任务时重建（币种跟着任务走），同一任务只 update */
+      if (tblRunId !== run.id) {
+        if (monthlyTbl) monthlyTbl.setCols(monthlyCols(run));
+        if (tradesTbl) tradesTbl.setCols(tradesCols(run));
+        tblRunId = run.id;
       }
 
-      /* 交易明细 */
-      clear(tradesHost);
-      if (!d.trades || !d.trades.length) tradesHost.appendChild(ui.empty('观察期内尚未产生完整交易（可能一直持有或尚未触发卖出信号）'));
-      else {
-        tradesHost.appendChild(ui.tbl({
-          cols: [
-            { key: 'inDate', label: '买入日', noSort: true, render: (t) => h('span', { class: 'num', text: t.inDate }) },
-            { key: 'inPrice', label: '买入价', cls: 'n', noSort: true, render: (t) => h('span', { class: 'num', text: F.price(t.inPrice, run.market) }) },
-            { key: 'outDate', label: '卖出日', noSort: true, render: (t) => h('span', { class: 'num', text: t.outDate }) },
-            { key: 'outPrice', label: '卖出价', cls: 'n', noSort: true, render: (t) => h('span', { class: 'num', text: F.price(t.outPrice, run.market) }) },
-            { key: 'qty', label: '数量', cls: 'n', noSort: true, render: (t) => h('span', { class: 'num', text: String(t.qty) }) },
-            { key: 'pnlPct', label: '收益率', cls: 'n', value: (t) => t.pnlPct, render: (t) => pct(t.pnlPct) },
-            { key: 'pnl', label: '盈亏', cls: 'n', value: (t) => t.pnl, render: (t) => h('span', { class: 'num ' + F.dir(t.pnl), text: F.amt(t.pnl, run.market) }) },
-            { key: 'bars', label: '持仓', cls: 'n', value: (t) => t.bars, render: (t) => h('span', { class: 'num', text: t.bars + ' 根' }) },
-            {
-              key: 'cost', label: '成本', cls: 'n', noSort: true,
-              render: (t) => {
-                const cost = (t.fee || 0) + (t.slippage || 0);
-                const est = t.costEstimated ? h('span', { class: 'dim3', text: t.costEstimated ? '（估算）' : '' }) : null;
-                return h('span', { class: 'num', title: '手续费 ' + F.num(t.fee || 0, 2) + ' + 滑点 ' + F.num(t.slippage || 0, 2) }, [
-                  h('span', { text: F.num(cost, 2) }), est,
-                ]);
-              },
-            },
-            {
-              key: 'slipBps', label: '实现滑点', cls: 'n', noSort: true,
-              render: (t) => {
-                if (!t.signalPrice || !t.fillPrice) return h('span', { class: 'num dim3', text: '—' });
-                const bps = (t.fillPrice / t.signalPrice - 1) * 10000;
-                return h('span', { class: 'num', text: F.num(bps, 1) + ' bp' });
-              },
-            },
-            { key: 'reason', label: '平仓原因', noSort: true },
-            {
-              key: 'phase', label: '阶段', noSort: true,
-              render: (t) => h('span', { class: 'phase-tag' + (t.phase === 'live' ? ' live' : ''), text: t.phase === 'live' ? '实时' : '回溯' }),
-            },
-          ],
-          rows: d.trades.slice(0, 100), maxHeight: '340px', compact: true,
-        }));
+      const monthly = d.monthly || [];
+      if (!monthly.length) {
+        vis(monthlyTblSlot, false);
+        vis(monthlyEmptySlot, true);
+        paint(monthlyEmptySlot, [ui.empty('暂无月度数据')]);
+      } else {
+        vis(monthlyEmptySlot, false);
+        vis(monthlyTblSlot, true);
+        if (monthlyTbl) monthlyTbl.update(monthly);
+        else {
+          monthlyTbl = ui.tbl({ cols: monthlyCols(run), rows: monthly, compact: true });
+          monthlyTblSlot.appendChild(monthlyTbl);
+        }
+      }
+
+      const trades = d.trades || [];
+      if (!trades.length) {
+        vis(tradesTblSlot, false);
+        vis(tradesEmptySlot, true);
+        paint(tradesEmptySlot, [ui.empty('观察期内尚未产生完整交易（可能一直持有或尚未触发卖出信号）')]);
+      } else {
+        vis(tradesEmptySlot, false);
+        vis(tradesTblSlot, true);
+        if (tradesTbl) tradesTbl.update(trades.slice(0, 100));
+        else {
+          tradesTbl = ui.tbl({ cols: tradesCols(run), rows: trades.slice(0, 100), maxHeight: '340px', compact: true });
+          tradesTblSlot.appendChild(tradesTbl);
+        }
       }
 
       /* 信号 */
-      clear(signalsHost);
       const sigs = d.signals || [];
-      if (!sigs.length) signalsHost.appendChild(ui.empty('暂无信号记录'));
-      sigs.slice(0, 20).forEach((sg) => {
-        signalsHost.appendChild(h('div', { class: 'news-item' }, [
+      if (!sigs.length) {
+        paint(signalsHost, [ui.empty('暂无信号记录')]);
+      } else {
+        paint(signalsHost, sigs.slice(0, 20).map((sg) => h('div', { class: 'news-item' }, [
           h('div', { class: 'time', text: F.date(sg.t) }),
           h('div', { class: 'body' }, [
             h('div', { class: 'txt' }, [
@@ -1029,8 +1076,57 @@
               sg.skipped ? h('span', { class: 'chip warn', text: '未成交' }) : null,
             ]),
           ]),
-        ]));
-      });
+        ])));
+      }
+    }
+
+    /* 详情两张表的列定义：随任务（币种）变化，因此抽成函数，供 setCols 复用 */
+    function monthlyCols(run) {
+      return [
+        { key: 'month', label: '月份', noSort: true },
+        { key: 'days', label: '交易日', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num', text: String(m.days) }) },
+        { key: 'equityEnd', label: '月末权益', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num', text: F.amt(m.equityEnd, run.market) }) },
+        { key: 'monthlyReturnPct', label: '当月收益', cls: 'n', noSort: true, render: (m) => pct(m.monthlyReturnPct) },
+        { key: 'realized', label: '已实现盈亏', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num ' + F.dir(m.realized), text: F.amt(m.realized, run.market) }) },
+        { key: 'trades', label: '交易', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num', text: String(m.trades) }) },
+        { key: 'winRate', label: '当月胜率', cls: 'n', noSort: true, render: (m) => h('span', { class: 'num ' + (m.winRate >= 50 ? 'up' : (m.trades ? 'down' : 'flat')), text: m.trades ? F.num(m.winRate, 0) + '%' : '—' }) },
+      ];
+    }
+
+    function tradesCols(run) {
+      return [
+        { key: 'inDate', label: '买入日', noSort: true, render: (t) => h('span', { class: 'num', text: t.inDate }) },
+        { key: 'inPrice', label: '买入价', cls: 'n', noSort: true, render: (t) => h('span', { class: 'num', text: F.price(t.inPrice, run.market) }) },
+        { key: 'outDate', label: '卖出日', noSort: true, render: (t) => h('span', { class: 'num', text: t.outDate }) },
+        { key: 'outPrice', label: '卖出价', cls: 'n', noSort: true, render: (t) => h('span', { class: 'num', text: F.price(t.outPrice, run.market) }) },
+        { key: 'qty', label: '数量', cls: 'n', noSort: true, render: (t) => h('span', { class: 'num', text: String(t.qty) }) },
+        { key: 'pnlPct', label: '收益率', cls: 'n', value: (t) => t.pnlPct, render: (t) => pct(t.pnlPct) },
+        { key: 'pnl', label: '盈亏', cls: 'n', value: (t) => t.pnl, render: (t) => h('span', { class: 'num ' + F.dir(t.pnl), text: F.amt(t.pnl, run.market) }) },
+        { key: 'bars', label: '持仓', cls: 'n', value: (t) => t.bars, render: (t) => h('span', { class: 'num', text: t.bars + ' 根' }) },
+        {
+          key: 'cost', label: '成本', cls: 'n', noSort: true,
+          render: (t) => {
+            const cost = (t.fee || 0) + (t.slippage || 0);
+            const est = t.costEstimated ? h('span', { class: 'dim3', text: t.costEstimated ? '（估算）' : '' }) : null;
+            return h('span', { class: 'num', title: '手续费 ' + F.num(t.fee || 0, 2) + ' + 滑点 ' + F.num(t.slippage || 0, 2) }, [
+              h('span', { text: F.num(cost, 2) }), est,
+            ]);
+          },
+        },
+        {
+          key: 'slipBps', label: '实现滑点', cls: 'n', noSort: true,
+          render: (t) => {
+            if (!t.signalPrice || !t.fillPrice) return h('span', { class: 'num dim3', text: '—' });
+            const bps = (t.fillPrice / t.signalPrice - 1) * 10000;
+            return h('span', { class: 'num', text: F.num(bps, 1) + ' bp' });
+          },
+        },
+        { key: 'reason', label: '平仓原因', noSort: true },
+        {
+          key: 'phase', label: '阶段', noSort: true,
+          render: (t) => h('span', { class: 'phase-tag' + (t.phase === 'live' ? ' live' : ''), text: t.phase === 'live' ? '实时' : '回溯' }),
+        },
+      ];
     }
 
     /* --------------------------------------------------------- 刷新 */
@@ -1041,8 +1137,11 @@
         st.detail = await api.strategyRun(st.selected);
         renderDetail();
       } catch (e) {
-        clear(detailHost);
-        detailHost.appendChild(ui.empty('详情获取失败：' + e.message));
+        /* 详情获取失败：只改这一块（骨架留在原位，下一次成功时接着用） */
+        if (eqChart) { eqChart.destroy(); eqChart = null; eqChartRunId = null; }
+        vis(detailSkeleton, false);
+        vis(detailEmpty, true);
+        paint(detailEmpty, [ui.empty('详情获取失败：' + e.message)]);
       }
     }
 

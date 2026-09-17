@@ -64,6 +64,10 @@
    destroy() 约定：置 st.destroyed，关闭推送句柄并清空所有定时器（15 秒兜底轮询 +
      20 秒调度区块刷新）；所有异步回调与推送回调进入时先判 st.destroyed，销毁后绝不再碰 DOM。
 
+   无感刷新约定：15 秒兜底轮询 / 20 秒调度刷新 / stream 推送这几条自动路径上
+     一律不做 clear + 重建 —— 表格实例缓存在 mount 作用域内（首次挂载，之后只 update），
+     其余区块用 AD.dom.paint 原位改写，空态也只改自己那一块（详见「无感刷新」小节）。
+
    可测试钩子（data-* 定位，便于自动化用例与人工排查）：
      [data-host=…] 渲染容器：config/metrics/gates/positions/orders/skipped/plan/fills/export/
                    scheduler（定时调度区块）
@@ -77,7 +81,7 @@
 (function () {
   'use strict';
 
-  const { h, clear } = window.AD.dom;
+  const { h, clear, paint } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -269,6 +273,43 @@
     });
     tokenInp.addEventListener('input', () => { st.tokenEdited = true; });
 
+    /* ------------------------------------------------ 无感刷新（增量更新）
+
+       轮询 / 推送 / 自动刷新路径上不做 clear + 重建：重建会让界面闪动，
+       还会丢掉滚动位置、hover 与正在输入的内容。统一两条规则：
+         · 表格：实例缓存在 mount 作用域内（不能放模块级 —— 会跨页面 / 跨市场串数据），
+           首次挂到槽位上，之后只调 ref.update(rows)；列定义变了才用 ref.setCols(cols)；
+         · 其余区块：paint(槽位, [子节点…]) 原位改写；空态也只改自己那一块，不整块清空。
+       「表格 / 空态」是二选一：给两个常驻槽位，用 display 切换 ——
+       表格实例从不卸载（卸载会丢滚动位置与 hover），切换只发生在状态真的变了的那一帧。
+       注意：传给 paint 的子节点必须是新构造的（h() 产物）；已挂载的节点交给 paint
+       会被摘下来再插回去，那就等于重建了。表格因此只走 appendChild + update。 */
+
+    /* 一对槽位：tbl 只挂一次表格实例；empty 只由 paint 改写空态 */
+    function slotPair(host) {
+      const tbl = h('div');
+      const empty = h('div');
+      host.appendChild(tbl);
+      host.appendChild(empty);
+      return { tbl, empty };
+    }
+
+    /* 显示 / 隐藏（只改 display，节点不卸载） */
+    function vis(el, on) { el.style.display = on ? '' : 'none'; }
+
+    let posTbl = null;          /* 持仓表实例（mount 作用域） */
+    let orderTbl = null;        /* 委托单表实例 */
+    let orderPager = null;      /* 委托单分页条：常驻节点，只 paint 它的子节点 */
+    let planTbl = null;         /* 本次计划表实例 */
+    let orderErr = '';          /* 委托单取数失败提示：只影响这一帧，下次成功即回到表格 */
+    let posMkt = st.market;     /* 持仓单元格的计价市场：随账户刷新，避免缓存表格读到旧市场 */
+
+    const posSlot = slotPair(posHost);
+    const orderSlot = slotPair(orderHost);
+    const planHead = h('div');                 /* 本次计划的摘要行 */
+    planHost.appendChild(planHead);
+    const planSlot = slotPair(planHost);       /* 顺序：摘要行 → 表格槽 → 空态槽 */
+
     /* --------------------------------------------------- 接口（带兜底） */
 
     function apiConfig() {
@@ -364,36 +405,39 @@
     /* ------------------------------------------------ 顶部说明 + 状态 */
 
     function paintTradeState() {
-      clear(tradeChipHost);
       const cfg = st.config;
       if (!cfg) {
         /* 配置读不到时不能假装知道开关状态：只声明「默认按关闭处理」 */
-        tradeChipHost.appendChild(h('span', {
-          class: 'chip', text: '自动交易：配置未知（默认按关闭处理）',
-          title: 'GET /api/trade/config 未返回，无法确认服务端开关状态；在读到配置前不要假定它是开启的',
-        }));
-        tradeChipHost.appendChild(h('span', { class: 'chip', text: '模式：—' }));
-        tradeChipHost.appendChild(h('span', { class: 'chip', text: '市场：' + marketText(st.market) }));
-        tradeChipHost.appendChild(h('span', { class: 'chip', text: '配置更新：—' }));
+        paint(tradeChipHost, [
+          h('span', {
+            class: 'chip', text: '自动交易：配置未知（默认按关闭处理）',
+            title: 'GET /api/trade/config 未返回，无法确认服务端开关状态；在读到配置前不要假定它是开启的',
+          }),
+          h('span', { class: 'chip', text: '模式：—' }),
+          h('span', { class: 'chip', text: '市场：' + marketText(st.market) }),
+          h('span', { class: 'chip', text: '配置更新：—' }),
+        ]);
         return;
       }
       const on = cfg.enabled === true;
-      tradeChipHost.appendChild(h('span', {
-        class: 'chip' + (on ? ' warn' : ''),
-        text: on ? '自动交易：已开启' : '自动交易：已关闭（默认关闭）',
-        title: on
-          ? '已开启自动交易：仍受风控上限与 confirmToken 口令约束，且仅在 dryrun / paper 模拟通道内成交'
-          : '总开关默认关闭；关闭时「立即扫描」仍可出计划，但不会产生任何成交',
-      }));
-      tradeChipHost.appendChild(h('span', {
-        class: 'chip' + (String(cfg.mode) === 'paper' ? ' accent' : ''),
-        text: '模式：' + (MODE_SHORT[cfg.mode] || text(cfg.mode)),
-      }));
-      tradeChipHost.appendChild(h('span', { class: 'chip', text: '市场：' + marketText(st.market) }));
-      tradeChipHost.appendChild(h('span', {
-        class: 'chip',
-        text: '配置更新：' + (cfg.updatedAt ? timeText(cfg.updatedAt) : '—'),
-      }));
+      paint(tradeChipHost, [
+        h('span', {
+          class: 'chip' + (on ? ' warn' : ''),
+          text: on ? '自动交易：已开启' : '自动交易：已关闭（默认关闭）',
+          title: on
+            ? '已开启自动交易：仍受风控上限与 confirmToken 口令约束，且仅在 dryrun / paper 模拟通道内成交'
+            : '总开关默认关闭；关闭时「立即扫描」仍可出计划，但不会产生任何成交',
+        }),
+        h('span', {
+          class: 'chip' + (String(cfg.mode) === 'paper' ? ' accent' : ''),
+          text: '模式：' + (MODE_SHORT[cfg.mode] || text(cfg.mode)),
+        }),
+        h('span', { class: 'chip', text: '市场：' + marketText(st.market) }),
+        h('span', {
+          class: 'chip',
+          text: '配置更新：' + (cfg.updatedAt ? timeText(cfg.updatedAt) : '—'),
+        }),
+      ]);
     }
 
     function chipTitle() {
@@ -404,13 +448,11 @@
     /* 推送状态 chip：文案与配色由 AD.stream.chip 统一提供 */
     function paintChip(state, title) {
       const s = window.AD.stream;
-      clear(connChipHost);
       const next = state || st.push.state || 'connecting';
-      if (s && typeof s.chip === 'function') {
-        connChipHost.appendChild(s.chip(next, title || chipTitle()));
-      } else {
-        connChipHost.appendChild(h('span', { class: 'chip', text: '推送状态：' + next }));
-      }
+      const node = (s && typeof s.chip === 'function')
+        ? s.chip(next, title || chipTitle())
+        : h('span', { class: 'chip', text: '推送状态：' + next });
+      paint(connChipHost, [node]);
       st.push.state = next;
     }
 
@@ -807,11 +849,14 @@
 
     function renderScheduler() {
       if (st.destroyed) return;
-      clear(schedHost);
 
-      /* 接口失败：区域内如实提示，并说明下面展示的是「上一次成功读取的值」 */
-      if (st.schedErr) {
-        schedHost.appendChild(h('div', {
+      /* 这一块的位置固定成 8 段（缺的那段用空 div 占位）：
+           0 读取出错 · 1 运行状态 · 2 三层开关 · 3 指标 · 4 为什么没动作
+           5 启停 / 试跑 · 6 试跑结果 · 7 服务端口径说明
+         位置固定后每次刷新都是同构合并，只改文本与 class，不再整块重建
+         （20 秒定时刷新与 SSE 成串事件都会打到这个函数）。 */
+      const errRow = st.schedErr
+        ? h('div', {
           class: 'legend-inline', style: { marginBottom: '8px', alignItems: 'center', gap: '8px' },
           dataset: { sched: 'error' },
         }, [
@@ -820,13 +865,17 @@
           st.sched
             ? h('span', { class: 'dim3', text: '（下方为上一次成功读取的状态，可能已过期）' })
             : null,
-        ]));
-      }
+        ])
+        : h('div');
 
       const s = st.sched;
       if (!s) {
-        schedHost.appendChild(ui.empty('调度状态未就绪：GET /api/trade/status 无有效返回时展示此空态；' +
-          '本页不会臆造「运行中 / 已停止」，也不会臆造任何调度计数。'));
+        paint(schedHost, [
+          errRow,
+          ui.empty('调度状态未就绪：GET /api/trade/status 无有效返回时展示此空态；' +
+            '本页不会臆造「运行中 / 已停止」，也不会臆造任何调度计数。'),
+          h('div'), h('div'), h('div'), h('div'), h('div'), h('div'),
+        ]);
         return;
       }
 
@@ -836,7 +885,7 @@
       const mode = String(s.mode || '');
 
       /* ① 运行状态 + 交易时段 */
-      schedHost.appendChild(h('div', {
+      const stateRow = h('div', {
         class: 'legend-inline', style: { alignItems: 'center', gap: '8px' },
         dataset: { sched: 'state' },
       }, [
@@ -869,10 +918,10 @@
           class: 'dim3',
           text: '状态读取：' + (st.schedAt ? F.clock(st.schedAt) : '—') + '（每 ' + (SCHED_MS / 1000) + ' 秒自动刷新）',
         }),
-      ]));
+      ]);
 
       /* ② 三层开关：一行里必须能看出是哪一层没开 */
-      schedHost.appendChild(h('div', {
+      const layerRow = h('div', {
         class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center', gap: '8px' },
         dataset: { sched: 'layers' },
       }, [
@@ -890,7 +939,7 @@
             ? 'paper：按模拟撮合成交（仍只写本地模拟账户，不接任何券商通道）'
             : 'dryrun：只出计划，永不成交（autoExecute 开着也不会成交）',
         }),
-      ]));
+      ]);
 
       /* ③ 指标 */
       const lr = (s.lastResult && typeof s.lastResult === 'object') ? s.lastResult : null;
@@ -924,24 +973,22 @@
             : '服务端尚未产生过成功的扫描结果（lastResult 为 null）'],
         ['下次预计', stampText(hasNextRun ? s.nextRunAt : (hasNextOpen ? s.nextOpen : null)), '', nextTitle],
       ];
-      const metricWrap = h('div', {
+      const metricRow = h('div', {
         class: 'metric-list', style: { marginTop: '8px' }, dataset: { sched: 'metrics' },
-      });
-      cells.forEach((c) => metricWrap.appendChild(metricCell(c[0], c[1], c[2], c[3])));
-      schedHost.appendChild(metricWrap);
+      }, cells.map((c) => metricCell(c[0], c[1], c[2], c[3])));
 
       /* ④ 为什么现在没动作（永远给出一个答案） */
       const r = idleReason(s);
-      schedHost.appendChild(h('div', {
+      const reasonRow = h('div', {
         class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center', gap: '8px' },
         dataset: { sched: 'reason' },
       }, [
         h('span', { class: 'chip ' + r.cls, text: '为什么现在没动作：' + r.tag }),
         h('span', { class: 'dim', text: r.text, title: r.text }),
-      ]));
+      ]);
 
       /* ⑤ 启停 + 立即试跑 */
-      schedHost.appendChild(h('div', {
+      const actRow = h('div', {
         style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' },
       }, [
         h('button', {
@@ -953,7 +1000,9 @@
             ? 'POST /api/trade/scheduler { running:false }：停止调度线程（不会撤销已生成的委托）'
             : 'POST /api/trade/scheduler { running:true }：启动调度线程；' +
               '仍受「自动交易 / 定时调度」开关与交易时段约束',
-          on: { click: () => toggleScheduler(!running) },
+          /* 原位更新后按钮节点会被复用（morph 保留旧监听），所以不能在闭包里读渲染时的 running：
+             点的时候按 st.sched 的真实状态取反，避免状态一变就拿着旧值反向操作 */
+          on: { click: () => toggleScheduler(!((st.sched || {}).running === true)) },
         }),
         h('button', {
           class: 'btn sm', text: st.onceBusy ? '试跑中…' : '立即试跑一次',
@@ -968,41 +1017,44 @@
           class: 'dim3',
           text: '试跑只为确认链路是否通：不绕过总开关，不会在 dryrun 下成交',
         }),
-      ]));
+      ]);
 
-      const onceHost = h('div', {
-        class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center', gap: '8px' },
-        dataset: { sched: 'once' },
-      });
+      const onceKids = [];
       if (st.onceErr) {
-        onceHost.appendChild(h('span', { class: 'chip down', text: '试跑请求失败' }));
-        onceHost.appendChild(h('span', { class: 'dim', text: st.onceErr, title: st.onceErr }));
+        onceKids.push(h('span', { class: 'chip down', text: '试跑请求失败' }));
+        onceKids.push(h('span', { class: 'dim', text: st.onceErr, title: st.onceErr }));
       } else if (st.once) {
         const act = String(st.once.action || '');
         const cls = act === 'error' ? 'down'
           : (act === 'skip' ? 'warn' : (act === 'executed' ? 'up' : 'accent'));
         const label = ONCE_LABEL[act] || text(act);
-        onceHost.appendChild(h('span', {
+        onceKids.push(h('span', {
           class: 'chip ' + cls,
           text: '试跑结果：' + label + '（' + timeText(st.onceAt || st.once.ts) + '）',
         }));
-        onceHost.appendChild(h('span', {
+        onceKids.push(h('span', {
           class: 'dim', text: onceText(st.once), title: onceText(st.once),
         }));
       } else {
-        onceHost.appendChild(h('span', {
+        onceKids.push(h('span', {
           class: 'dim3', text: '尚未试跑：点「立即试跑一次」可跳过开关 / 间隔 / 时段限制跑一轮（仍要求总开关开启）',
         }));
       }
-      schedHost.appendChild(onceHost);
+      const onceRow = h('div', {
+        class: 'legend-inline', style: { marginTop: '8px', alignItems: 'center', gap: '8px' },
+        dataset: { sched: 'once' },
+      }, onceKids);
 
       /* ⑥ 服务端调度口径说明（原文截断展示，全文挂 title） */
-      if (s.note) {
-        schedHost.appendChild(h('div', {
+      const noteRow = s.note
+        ? h('div', {
           class: 'hint dim3', style: { marginTop: '8px' }, dataset: { sched: 'note' },
           title: String(s.note), text: clip(s.note, 150),
-        }));
-      }
+        })
+        : h('div');
+
+      /* 一次性原位合并：位置固定 → 只改文本 / class，不重建（也不丢 hover 与滚动位置） */
+      paint(schedHost, [errRow, stateRow, layerRow, metricRow, reasonRow, actRow, onceRow, noteRow]);
     }
 
     /* /api/trade/status 里的 scheduler 段带三层开关的生效值。若与本页 st.config 不一致
@@ -1139,12 +1191,11 @@
     }
 
     function renderMetrics() {
-      clear(metricHost);
       const acc = st.account;
       if (!acc) {
-        metricHost.appendChild(ui.empty('账户数据未就绪：GET /api/trade/account?market=' + st.market +
+        paint(metricHost, [ui.empty('账户数据未就绪：GET /api/trade/account?market=' + st.market +
           ' 无有效返回时展示此空态。模拟账户由服务端在首次读取时创建（即「初始化账户」），' +
-          '本页不会自己造一个账户，也不会臆造任何数字。'));
+          '本页不会自己造一个账户，也不会臆造任何数字。')]);
         return;
       }
       const mkt = acc.market || st.market;
@@ -1165,7 +1216,7 @@
         ['持仓只数', isNum(acc.positionCount) ? acc.positionCount + ' 只' : '—'],
         ['当日委托', sameDay + ' / ' + limitText(dayCap), 'dim', '当日已用 / 上限'],
       ];
-      cells.forEach((c) => metricHost.appendChild(metricCell(c[0], c[1], c[2], c[3])));
+      paint(metricHost, cells.map((c) => metricCell(c[0], c[1], c[2], c[3])));
     }
 
     /* ----------------------------------------------------- 风控快照 */
@@ -1182,7 +1233,6 @@
     }
 
     function renderGates() {
-      clear(gateHost);
       const cfg = st.config || {};
       const acc = st.account || {};
       const hasGates = !!(st.gates && Object.keys(st.gates).length);
@@ -1204,7 +1254,7 @@
         ['生效上限来源', hasGates ? '服务端 gates（当前生效值）' : '配置值兜底（gates 缺失，非服务端生效值）',
           hasGates ? '' : 'dim'],
       ];
-      cells.forEach((c) => gateHost.appendChild(metricCell(c[0], c[1], c[2], c[3])));
+      paint(gateHost, cells.map((c) => metricCell(c[0], c[1], c[2], c[3])));
     }
 
     /* --------------------------------------------------------- 持仓 */
@@ -1220,16 +1270,22 @@
     }
 
     function renderPositions() {
-      clear(posHost);
       const acc = st.account;
       const rows = (acc && Array.isArray(acc.positions)) ? acc.positions : [];
-      if (!acc) { posHost.appendChild(ui.empty('账户未就绪，暂无持仓')); return; }
-      if (!rows.length) {
-        posHost.appendChild(ui.empty('当前无持仓：模拟账户尚未买入，或已全部平仓。可先「立即扫描」生成计划。'));
+      if (!acc || !rows.length) {
+        /* 空态：只切显示并原位改写文案；表格实例留在槽位里不卸载（下次有持仓直接复用） */
+        vis(posSlot.tbl, false);
+        vis(posSlot.empty, true);
+        paint(posSlot.empty, [ui.empty(!acc
+          ? '账户未就绪，暂无持仓'
+          : '当前无持仓：模拟账户尚未买入，或已全部平仓。可先「立即扫描」生成计划。')]);
         return;
       }
-      const mkt = acc.market || st.market;
-      posHost.appendChild(ui.tbl({
+      posMkt = acc.market || st.market;
+      vis(posSlot.empty, false);
+      vis(posSlot.tbl, true);
+      if (posTbl) { posTbl.update(rows); return; }
+      posTbl = ui.tbl({
         cols: [
           {
             key: 'code', label: '标的', noSort: true,
@@ -1237,16 +1293,16 @@
               h('span', { class: 'name', text: text(p.name, p.code) }),
               h('span', { class: 'code', text: (p.market === 'us' ? 'US:' : '') + text(p.code) }),
             ]),
-            onCell: (p) => { if (ctx && typeof ctx.openSymbol === 'function') ctx.openSymbol(p.market || mkt, p.code, p.name); },
+            onCell: (p) => { if (ctx && typeof ctx.openSymbol === 'function') ctx.openSymbol(p.market || posMkt, p.code, p.name); },
           },
           { key: 'qty', label: '数量', cls: 'n', noSort: true, render: (p) => h('span', { class: 'num', text: text(p.qty) }) },
-          { key: 'avgPrice', label: '成本', cls: 'n', noSort: true, render: (p) => h('span', { class: 'num', text: F.price(p.avgPrice, p.market || mkt) }) },
+          { key: 'avgPrice', label: '成本', cls: 'n', noSort: true, render: (p) => h('span', { class: 'num', text: F.price(p.avgPrice, p.market || posMkt) }) },
           { key: 'lastPrice', label: '最新价', cls: 'n', noSort: true, render: (p) => posPriceCell(p) },
-          { key: 'marketValue', label: '市值', cls: 'n', noSort: true, render: (p) => h('span', { class: 'num', text: F.amt(p.marketValue, mkt) }) },
+          { key: 'marketValue', label: '市值', cls: 'n', noSort: true, render: (p) => h('span', { class: 'num', text: F.amt(p.marketValue, posMkt) }) },
           {
             key: 'pnl', label: '盈亏', cls: 'n', noSort: true,
             render: (p) => h('span', { class: 'num ' + F.dir(p.pnl) }, [
-              h('span', { text: F.amt(p.pnl, mkt) }),
+              h('span', { text: F.amt(p.pnl, posMkt) }),
               h('small', { class: 'dim3', text: ' ' + F.pct(p.pnlPct) }),
             ]),
           },
@@ -1275,7 +1331,8 @@
         rowKey: (p) => p.code,
         maxHeight: '420px',
         emptyText: '暂无持仓',
-      }));
+      });
+      posSlot.tbl.appendChild(posTbl);
     }
 
     async function closePosition(p) {
@@ -1344,9 +1401,22 @@
     }
 
     function renderOrders() {
-      clear(orderHost);
+      /* 取数失败只影响这一帧（orderErr 用完即清）：下一次成功取数或推送就会回到表格实例 */
+      const err = orderErr;
+      orderErr = '';
+      if (err) {
+        vis(orderSlot.tbl, false);
+        vis(orderSlot.empty, true);
+        paint(orderSlot.empty, [ui.empty(err)]);
+        return;
+      }
       const rows = sortOrders(visibleOrders());
-      const pager = h('div', { class: 'pager' }, [
+      vis(orderSlot.empty, false);
+      vis(orderSlot.tbl, true);
+
+      /* 分页条：常驻节点（按钮监听只绑一次），刷新时只 paint 它的子节点 */
+      if (!orderPager) orderPager = h('div', { class: 'pager' });
+      paint(orderPager, [
         h('span', {
           text: '共 ' + text(st.ordersTotal) + ' 条 · 已载入 ' + st.orders.length + ' 条' +
             (rows.length !== st.orders.length ? ' · 当前筛选命中 ' + rows.length + ' 条' : ''),
@@ -1364,7 +1434,8 @@
         }),
       ]);
 
-      orderHost.appendChild(ui.tbl({
+      if (orderTbl) { orderTbl.update(rows); return; }
+      orderTbl = ui.tbl({
         cols: [
           { key: 'createdAt', label: '时间', noSort: true, render: (o) => h('span', { class: 'num dim', text: timeText(o.createdAt) }) },
           {
@@ -1418,11 +1489,12 @@
           },
         ],
         rows,
-        pager,
+        pager: orderPager,
         maxHeight: '420px',
         compact: true,
         emptyText: '暂无委托单：点上方「立即扫描」生成计划，或调整筛选条件',
-      }));
+      });
+      orderSlot.tbl.appendChild(orderTbl);
     }
 
     async function cancelOrder(o) {
@@ -1458,16 +1530,19 @@
     /* --------------------------------------------- 本次计划 / 被拦截 */
 
     function renderPlan() {
-      clear(planHost);
       const p = st.plan;
       if (!p) {
-        planHost.appendChild(ui.empty('尚未扫描：点「立即扫描（只出计划）」生成计划（execute=false，不会成交）'));
+        vis(planHead, false);
+        vis(planSlot.tbl, false);
+        vis(planSlot.empty, true);
+        paint(planSlot.empty, [ui.empty('尚未扫描：点「立即扫描（只出计划）」生成计划（execute=false，不会成交）')]);
         return;
       }
       const summary = p.adviceSummary || {};
       const acts = summary.actions || {};
       const actBits = Object.keys(acts).map((k) => (ACTION_LABEL[k] || k) + ' ' + acts[k]).join(' · ');
-      planHost.appendChild(h('div', { class: 'legend-inline', style: { marginBottom: '8px', alignItems: 'center', gap: '10px' } }, [
+      vis(planHead, true);
+      paint(planHead, [h('div', { class: 'legend-inline', style: { marginBottom: '8px', alignItems: 'center', gap: '10px' } }, [
         chipEl('本次计划', 'accent'),
         h('span', { text: '扫描时间 ' + (st.planAt ? F.clock(st.planAt) : '—') }),
         h('span', { text: '市场 ' + marketText(p.market || st.market) }),
@@ -1475,13 +1550,18 @@
         h('span', { text: '研判 ' + text(summary.analyzed) + ' 个' }),
         actBits ? h('span', { text: actBits }) : null,
         h('span', { text: '生成委托 ' + ((p.orders || []).length) + ' 笔 · 成交 ' + text(p.filled) }),
-      ]));
+      ])]);
       const rows = Array.isArray(p.orders) ? p.orders : [];
       if (!rows.length) {
-        planHost.appendChild(ui.empty('本次没有生成任何委托（可能是全部被风控拦截，或当前没有可执行信号）'));
+        vis(planSlot.tbl, false);
+        vis(planSlot.empty, true);
+        paint(planSlot.empty, [ui.empty('本次没有生成任何委托（可能是全部被风控拦截，或当前没有可执行信号）')]);
         return;
       }
-      planHost.appendChild(ui.tbl({
+      vis(planSlot.empty, false);
+      vis(planSlot.tbl, true);
+      if (planTbl) { planTbl.update(rows); return; }
+      planTbl = ui.tbl({
         cols: [
           {
             key: 'code', label: '标的', noSort: true,
@@ -1503,21 +1583,22 @@
           },
         ],
         rows,
+        rowKey: (o, i) => (o && o.id !== undefined && o.id !== null && o.id !== '' ? String(o.id) : 'idx:' + i),
         maxHeight: '340px',
         compact: true,
         emptyText: '本次没有生成委托',
-      }));
+      });
+      planSlot.tbl.appendChild(planTbl);
     }
 
     /* 被风控拦截：每条必须写明「代码 + 档位 + 原因」 */
     function renderSkipped() {
-      clear(skipHost);
-      if (!st.plan) return;
-      skipHost.appendChild(h('div', { class: 'legend-inline', style: { margin: '12px 0 6px', alignItems: 'center', gap: '10px' } }, [
+      if (!st.plan) { paint(skipHost, []); return; }      /* 没有计划：整块收起来（与原先 clear 后直接 return 一致） */
+      const head = h('div', { class: 'legend-inline', style: { margin: '12px 0 6px', alignItems: 'center', gap: '10px' } }, [
         chipEl('被风控拦截', st.skipped.length ? 'warn' : ''),
         h('span', { text: st.skipped.length ? st.skipped.length + ' 条' : '本次没有被拦截的标的' }),
-      ]));
-      if (!st.skipped.length) return;
+      ]);
+      if (!st.skipped.length) { paint(skipHost, [head]); return; }
       const list = h('div', { class: 'news-list' });
       st.skipped.forEach((s) => {
         const code = text(s.code);
@@ -1535,20 +1616,20 @@
           ]),
         ]));
       });
-      skipHost.appendChild(list);
+      paint(skipHost, [head, list]);
     }
 
     /* ----------------------------------------------------- 成交回报 */
 
     function renderFills() {
-      clear(fillHost);
       if (!st.fills.length) {
-        fillHost.appendChild(ui.empty('暂无成交回报：推送 onFill 或撮合成交后这里会追加流水'));
+        /* 空态同样走 paint：只改这一块，不清空整个容器 */
+        paint(fillHost, [ui.empty('暂无成交回报：推送 onFill 或撮合成交后这里会追加流水')]);
         return;
       }
-      st.fills.slice(0, FILL_MAX).forEach((f) => {
+      const items = st.fills.slice(0, FILL_MAX).map((f) => {
         const mkt = f.market || st.market;
-        fillHost.appendChild(h('div', { class: 'news-item' }, [
+        return h('div', { class: 'news-item' }, [
           h('div', { class: 'time', text: timeText(f.at) }),
           h('div', { class: 'body' }, [
             h('div', { class: 'txt' }, [
@@ -1563,19 +1644,18 @@
               h('span', { class: 'mono-sm', text: f.id ? '单号 ' + f.id : '单号 —' }),
             ]),
           ]),
-        ]));
+        ]);
       });
+      /* 推送按时间倒序前插，这里按位置原位改写（新流水进来只重写文本，不重建节点） */
+      paint(fillHost, items);
     }
 
     /* --------------------------------------------------------- 导出 */
 
+    /* 导出结果直接改 textContent（<pre> 常驻节点）：不 clear、不重建 */
     function renderExport() {
-      clear(exportHost);
-      if (!st.exportText) {
-        exportHost.textContent = '尚未导出：点上方「导出待执行意图」拉取 GET /api/trade/export';
-        return;
-      }
-      exportHost.textContent = st.exportText;
+      exportHost.textContent = st.exportText ||
+        '尚未导出：点上方「导出待执行意图」拉取 GET /api/trade/export';
     }
 
     /* ------------------------------------------------------- 操作区 */
@@ -1821,8 +1901,8 @@
       } catch (e) {
         if (st.destroyed) return;
         st.config = null;
-        clear(cfgHost);
-        cfgHost.appendChild(ui.empty('配置获取失败：' + e.message + '（接口 /api/trade/config）'));
+        /* 空态走 paint 原位改写（不 clear 容器）：配置就绪后由 renderConfig 重建表单 */
+        paint(cfgHost, [ui.empty('配置获取失败：' + e.message + '（接口 /api/trade/config）')]);
         paintTradeState();
         if (!silent) toast('配置获取失败：' + e.message, 'err');
       }
@@ -1886,9 +1966,11 @@
       } catch (e) {
         if (st.destroyed) return;
         st.ordersLoading = false;
+        /* 失败提示只在「非轮询」路径上占位：轮询（silent）失败保持上一帧表格，与原先一致。
+           表格实例留在槽位里，下一次取数成功直接接着用（不重建）。 */
         if (!silent) {
-          clear(orderHost);
-          orderHost.appendChild(ui.empty('委托单获取失败：' + e.message + '（接口 /api/trade/orders）'));
+          orderErr = '委托单获取失败：' + e.message + '（接口 /api/trade/orders）';
+          renderOrders();
           toast('委托单获取失败：' + e.message, 'err');
         }
       }

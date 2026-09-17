@@ -5,7 +5,7 @@
 (function () {
   'use strict';
 
-  const { h, clear, pct } = window.AD.dom;
+  const { h, clear, pct, paint, reconcile } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -258,6 +258,22 @@
     const logsHost = h('div');
     const statusHost = h('span', { class: 'hint' });
 
+    /* 常驻实例（放在 mount 内，避免跨页面串数据）：
+       规则表首次 appendChild，之后只 update(rows)；
+       触发记录表体常驻，行按 key 复用 —— 后台按 quoteMs 轮询触发时不再重建 DOM */
+    let rulesTbl = null;
+    const logsWrap = h('div', { class: 'tbl-wrap' });
+    const logsScroll = h('div', { class: 'tbl-scroll', style: { maxHeight: '360px' } });
+    const logsTable = h('table', { class: 'tbl compact' });
+    const logsBody = h('tbody');
+    logsTable.appendChild(h('thead', {}, [h('tr', {}, [
+      h('th', { text: '时间' }), h('th', { text: '标的' }), h('th', { class: 'n', text: '现价' }),
+      h('th', { class: 'n', text: '涨跌幅' }), h('th', { text: '触发说明' }),
+    ])]));
+    logsTable.appendChild(logsBody);
+    logsScroll.appendChild(logsTable);
+    logsWrap.appendChild(logsScroll);
+
     if (ctx.state.symbol && ctx.state.symbol.code) {
       codeInput.value = ctx.state.symbol.code;
     }
@@ -291,78 +307,100 @@
     function render() {
       engine.load();
       const rules = engine.rules;
-      clear(rulesHost);
       statusHost.textContent = '规则 ' + rules.length + ' 条 · 启用 ' + rules.filter((r) => r.enabled).length +
         ' 条 · 触发记录 ' + engine.logs.length + ' 条';
 
       if (!rules.length) {
-        rulesHost.appendChild(ui.empty('还没有预警规则，先在上方创建一个'));
+        rulesTbl = null;                       /* 空态替换掉了表体，实例随之失效 */
+        paint(rulesHost, [ui.empty('还没有预警规则，先在上方创建一个')]);
       } else {
-        rulesHost.appendChild(ui.tbl({
-          cols: [
-            {
-              key: 'name', label: '标的', noSort: true,
-              render: (r) => h('span', {}, [
-                h('span', { class: 'name', text: r.name || r.code }),
-                h('span', { class: 'code', text: (r.market === 'us' ? 'US:' : '') + r.code }),
-              ]),
-            },
-            { key: 'type', label: '触发条件', noSort: true, render: (r) => h('span', { text: typeDesc(r) }) },
-            { key: 'note', label: '备注', noSort: true, render: (r) => h('span', { class: 'dim', text: r.note || '—' }) },
-            {
-              key: 'lastTrigger', label: '最近触发', noSort: true,
-              render: (r) => h('span', { class: 'num dim', text: r.lastTrigger ? F.clock(r.lastTrigger) : '—' }),
-            },
-            {
-              key: 'enabled', label: '状态', noSort: true,
-              render: (r) => h('span', { class: 'chip ' + (r.enabled ? 'accent' : ''), text: r.enabled ? '监控中' : '已暂停' }),
-            },
-            {
-              key: 'act', label: '操作', noSort: true, width: '150px',
-              render: (r) => h('div', { style: { display: 'flex', gap: '5px' } }, [
-                h('button', {
-                  class: 'btn ghost sm', text: r.enabled ? '暂停' : '启用',
-                  on: { click: (e) => { e.stopPropagation(); engine.toggle(r.id, !r.enabled); render(); } },
-                }),
-                h('button', {
-                  class: 'btn ghost sm', text: '打开',
-                  on: { click: (e) => { e.stopPropagation(); ctx.openSymbol(r.market, r.code, r.name); } },
-                }),
-                h('button', {
-                  class: 'btn ghost sm', text: '删除',
-                  on: { click: (e) => { e.stopPropagation(); engine.remove(r.id); render(); } },
-                }),
-              ]),
-            },
-          ],
-          rows: rules, compact: true,
-        }));
+        const cols = [
+          {
+            key: 'name', label: '标的', noSort: true,
+            render: (r) => h('span', {}, [
+              h('span', { class: 'name', text: r.name || r.code }),
+              h('span', { class: 'code', text: (r.market === 'us' ? 'US:' : '') + r.code }),
+            ]),
+          },
+          { key: 'type', label: '触发条件', noSort: true, render: (r) => h('span', { text: typeDesc(r) }) },
+          { key: 'note', label: '备注', noSort: true, render: (r) => h('span', { class: 'dim', text: r.note || '—' }) },
+          {
+            key: 'lastTrigger', label: '最近触发', noSort: true,
+            render: (r) => h('span', { class: 'num dim', text: r.lastTrigger ? F.clock(r.lastTrigger) : '—' }),
+          },
+          {
+            key: 'enabled', label: '状态', noSort: true,
+            render: (r) => h('span', { class: 'chip ' + (r.enabled ? 'accent' : ''), text: r.enabled ? '监控中' : '已暂停' }),
+          },
+          {
+            key: 'act', label: '操作', noSort: true, width: '150px',
+            render: (r) => h('div', { style: { display: 'flex', gap: '5px' } }, [
+              h('button', {
+                class: 'btn ghost sm', text: r.enabled ? '暂停' : '启用',
+                on: { click: (e) => { e.stopPropagation(); engine.toggle(r.id, !r.enabled); render(); } },
+              }),
+              h('button', {
+                class: 'btn ghost sm', text: '打开',
+                on: { click: (e) => { e.stopPropagation(); ctx.openSymbol(r.market, r.code, r.name); } },
+              }),
+              h('button', {
+                class: 'btn ghost sm', text: '删除',
+                on: { click: (e) => { e.stopPropagation(); engine.remove(r.id); render(); } },
+              }),
+            ]),
+          },
+        ];
+        if (!rulesTbl) {
+          rulesTbl = ui.tbl({ cols, rows: rules, compact: true });
+          clear(rulesHost);
+          rulesHost.appendChild(rulesTbl);
+        } else {
+          if (rulesTbl.parentNode !== rulesHost) {   /* 曾被空态替换过：重新挂载 */
+            clear(rulesHost);
+            rulesHost.appendChild(rulesTbl);
+          }
+          rulesTbl.update(rules);                    /* 列固定：只更新行，不重建表体 */
+        }
       }
 
-      clear(logsHost);
-      const logs = engine.logs;
-      if (!logs.length) { logsHost.appendChild(ui.empty('暂无触发记录')); return; }
-      const list = h('div', { class: 'tbl-wrap' });
-      const scroll = h('div', { class: 'tbl-scroll', style: { maxHeight: '360px' } });
-      const table = h('table', { class: 'tbl compact' });
-      table.appendChild(h('thead', {}, [h('tr', {}, [
-        h('th', { text: '时间' }), h('th', { text: '标的' }), h('th', { class: 'n', text: '现价' }),
-        h('th', { class: 'n', text: '涨跌幅' }), h('th', { text: '触发说明' }),
-      ])]));
-      const tb = h('tbody');
-      logs.forEach((l) => {
-        tb.appendChild(h('tr', { on: { click: () => ctx.openSymbol(l.market, l.code, l.name) } }, [
-          h('td', { class: 'num dim', text: F.clock(l.ts) }),
-          h('td', { class: 'name', text: l.name + ' ' + (l.market === 'us' ? 'US:' : '') + l.code }),
-          h('td', { class: 'n' }, [h('span', { class: 'num', text: F.price(l.price, l.market) })]),
-          h('td', { class: 'n' }, [pct(l.changePct)]),
-          h('td', { class: 'dim', text: l.message }),
-        ]));
+      renderLogs();
+    }
+
+    /* 触发记录：一条记录 = 一行，key 由 ts + 规则 + 类型 + 代码组成（同一个规则同一毫秒只会记一条） */
+    function logKey(l) {
+      return String(l.ts) + '|' + String(l.ruleId || '') + '|' + String(l.type || '') + '|' + String(l.code || '');
+    }
+
+    function logRow(l) {
+      const tr = h('tr', {}, [
+        h('td', { class: 'num dim', text: F.clock(l.ts) }),
+        h('td', { class: 'name', text: l.name + ' ' + (l.market === 'us' ? 'US:' : '') + l.code }),
+        h('td', { class: 'n' }, [h('span', { class: 'num', text: F.price(l.price, l.market) })]),
+        h('td', { class: 'n' }, [pct(l.changePct)]),
+        h('td', { class: 'dim', text: l.message }),
+      ]);
+      /* reconcile 每次刷新会把最新记录写到节点上：点击时读 __row，不读闭包里的旧值 */
+      tr.addEventListener('click', () => {
+        const row = tr.__row || l;
+        ctx.openSymbol(row.market, row.code, row.name);
       });
-      table.appendChild(tb);
-      scroll.appendChild(table);
-      list.appendChild(scroll);
-      logsHost.appendChild(list);
+      return tr;
+    }
+
+    function renderLogs() {
+      const logs = engine.logs;
+      if (!logs.length) {
+        /* 空态与表体是两种结构：先把常驻表体摘下来，再原位换成空态 */
+        if (logsWrap.parentNode === logsHost) logsHost.removeChild(logsWrap);
+        paint(logsHost, [ui.empty('暂无触发记录')]);
+        return;
+      }
+      if (logsWrap.parentNode !== logsHost) {
+        clear(logsHost);
+        logsHost.appendChild(logsWrap);
+      }
+      /* 行按 key 复用：新触发只插到最前面，滚动位置与 hover 都不会丢 */
+      reconcile(logsBody, logs, { key: logKey, render: logRow });
     }
 
     const soundToggle = h('button', {

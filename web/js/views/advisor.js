@@ -60,7 +60,7 @@
 (function () {
   'use strict';
 
-  const { h, clear } = window.AD.dom;
+  const { h, clear, paint } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -226,6 +226,11 @@
   /* ui.seg 不会自行切换高亮态，这里按顺序手动同步（只用已有 CSS 类） */
   function markSeg(seg, active, values) {
     Array.prototype.forEach.call(seg.children, (b, i) => b.classList.toggle('active', values[i] === active));
+  }
+
+  /* 列定义指纹：列没变就只更新行，避免动表头（setCols 会重建表头，打断 hover） */
+  function colsSig(cols) {
+    return (cols || []).map((c) => c.key + '\u0001' + (c.label || '') + '\u0001' + (c.width || '')).join('\u0002');
   }
 
   /* 降级路径的极简形态判断：**只在识别接口不可用时使用**。
@@ -483,11 +488,11 @@
     }
 
     function renderDisclaimer() {
-      clear(disclaimerHost);
-      disclaimerHost.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '8px', lineHeight: '1.8' } }, [
+      /* 免责声明只有一句文案会变：原位改写文本，不重建节点 */
+      paint(disclaimerHost, [h('div', { class: 'legend-inline', style: { marginTop: '8px', lineHeight: '1.8' } }, [
         h('span', { class: 'chip warn', text: '免责声明' }),
         h('span', { class: 'dim3', text: text(st.disclaimer, DISCLAIMER_DEFAULT) }),
-      ]));
+      ])]);
     }
 
     /* ------------------------------------------------------- 主表 */
@@ -734,34 +739,133 @@
       ];
     }
 
+    /* 主表实例 / 列指纹（必须缓存在 mount 内，跨刷新复用）：
+       首次挂载后只调 update(rows)，60 秒轮询与推送不再重建表体。 */
+    let tableRef = null;
+    let tableColsSig = '';
+
     function renderTable() {
-      clear(tableHost);
       if (!st.rows.length) {
-        tableHost.appendChild(ui.empty(st.history
+        /* 空态：原位改写提示；旧表实例随提示一起被替换，下次有数据时重建一次 */
+        paint(tableHost, [ui.empty(st.history
           ? '该历史记录没有逐只研判明细（记录 #' + text(st.history.id) + '）'
           : (st.submitted
             ? '服务端未返回任何标的的研判结果，请检查代码是否正确或稍后重试'
-            : '在上方填写标的（代码或中文名）后点击「开始 AI 分析」')));
+            : '在上方填写标的（代码或中文名）后点击「开始 AI 分析」'))]);
+        tableRef = null;
+        tableColsSig = '';
         return;
       }
-      tableHost.appendChild(ui.tbl({
-        cols: buildCols(),
-        rows: st.rows,
-        sortKey: 'score',
-        sortDir: 'desc',
-        maxHeight: 'calc(100vh - 460px)',
-        rowKey: (r) => rowMarket(r) + ':' + text(r.code),
-        onRow: (r) => ctx.openSymbol(rowMarket(r), r.code, rowName(r)),
-        emptyText: '暂无标的',
-      }));
+      const cols = buildCols();
+      const sig = colsSig(cols);
+      if (!tableRef) {
+        tableRef = ui.tbl({
+          cols,
+          rows: st.rows,
+          sortKey: 'score',
+          sortDir: 'desc',
+          maxHeight: 'calc(100vh - 460px)',
+          rowKey: (r) => rowMarket(r) + ':' + text(r.code),
+          onRow: (r) => ctx.openSymbol(rowMarket(r), r.code, rowName(r)),
+          emptyText: '暂无标的',
+        });
+        tableColsSig = sig;
+        paint(tableHost, []);                  /* 清掉空态 / 加载占位（只删节点，不重建表格） */
+        tableHost.appendChild(tableRef);       /* 首次挂载；之后只 update，绝不重复挂载 */
+        return;
+      }
+      if (sig !== tableColsSig) {              /* 列定义变化：换列不换整表 */
+        tableRef.setCols(cols);
+        tableColsSig = sig;
+      }
+      tableRef.update(st.rows);
     }
 
     /* --------------------------------------------------- 组合分配 */
 
+    /* 组合分配区的稳定挂载点（mount 内一次性建好，刷新时各自原位更新）：
+       统计卡只改数值文本、权重条只改 flex、明细表只换行 —— 不重建节点，
+       所以滚动位置、hover 与用户的阅读位置都不会被打断。 */
+    const pfAltHost = h('div');                                       /* 空态 / 未提交提示 */
+    const pfMetricHost = h('div');                                    /* 汇总指标卡 */
+    const pfBarHost = h('div');                                       /* 权重条 */
+    const pfLegendHost = h('div');                                    /* 权重图例 */
+    const pfTableHost = h('div', { style: { marginTop: '12px' } });    /* 分配明细表 */
+    const pfNoteHost = h('div');                                      /* 备注行 */
+    portfolioHost.appendChild(pfAltHost);
+    portfolioHost.appendChild(pfMetricHost);
+    portfolioHost.appendChild(pfBarHost);
+    portfolioHost.appendChild(pfLegendHost);
+    portfolioHost.appendChild(pfTableHost);
+    portfolioHost.appendChild(pfNoteHost);
+
+    let pfRef = null;                  /* 明细表实例（mount 内缓存，绝不放模块级） */
+    let pfColsSig = '';
+    let pfMaxW = 1;                    /* 占比条基准：列定义只建一次，渲染时读这里的值 */
+    let pfMarket = ctx.state.market;   /* 金额口径市场：同上 */
+
+    /* 行市场：优先服务端字段，其次提交时的输入映射，最后当前市场（与整表渲染同一口径） */
+    function pfMktOfRow(r) {
+      const hit = st.symbolMap[String((r && r.code) || '').toUpperCase()] || {};
+      return (r && r.market) || hit.market || pfMarket;
+    }
+
+    /* 明细表列定义：只依赖 pfMaxW / pfMarket / st.symbolMap，所以可以只建一次 */
+    function buildPfCols() {
+      return [
+        {
+          key: 'name', label: '标的', cls: 'name', noSort: true,
+          render: (r) => {
+            const nm = text(r.name, text(r.code));
+            const same = String(nm) === String(r.code);
+            return h('span', {}, [
+              h('span', { class: 'name', text: nm }),
+              same ? null : h('span', { class: 'code', text: text(r.code) }),
+            ]);
+          },
+        },
+        {
+          key: 'weight', label: '权重', cls: 'n', value: (r) => asPct(r.weight),
+          render: (r) => {
+            const w = asPct(r.weight);
+            return h('span', { class: 'num' + (isNum(w) ? '' : ' dim3'), text: isNum(w) ? F.num(w, 1) + '%' : '—' });
+          },
+        },
+        {
+          key: 'amount', label: '金额', cls: 'n', value: (r) => r.amount,
+          render: (r) => h('span', {
+            class: 'num' + (isNum(r.amount) ? '' : ' dim3'),
+            text: isNum(r.amount) ? F.amt(r.amount, pfMktOfRow(r)) : '—',
+          }),
+        },
+        {
+          key: 'bar', label: '占比', noSort: true, width: '180px',
+          render: (r) => {
+            const w = asPct(r.weight);
+            const p = isNum(w) ? Math.min(100, (w / pfMaxW) * 100) : 0;
+            return h('div', { class: 'prog' }, [
+              h('div', { class: 'prog-bar' }, [h('i', { style: { width: p.toFixed(1) + '%' } })]),
+            ]);
+          },
+        },
+      ];
+    }
+
+    /* 空态 / 未提交：提示原位改写，其余区块清空并隐藏（表实例作废，下次有数据时重建一次） */
+    function paintPfEmpty(msg, note) {
+      paint(pfAltHost, [ui.empty(msg), note ? noteLine(note) : null]);
+      pfAltHost.style.display = '';
+      [pfMetricHost, pfBarHost, pfLegendHost, pfTableHost, pfNoteHost].forEach((el) => {
+        el.style.display = 'none';
+        paint(el, []);
+      });
+      pfRef = null;
+      pfColsSig = '';
+    }
+
     function renderPortfolio() {
-      clear(portfolioHost);
       if (!st.submitted) {
-        portfolioHost.appendChild(ui.empty('提交标的后显示组合权重分配'));
+        paintPfEmpty('提交标的后显示组合权重分配');
         return;
       }
       const p = st.portfolio || {};
@@ -773,7 +877,7 @@
       const mw = hp && isNum(hp.maxWeight) ? hp.maxWeight
         : (st.lastBody && isNum(st.lastBody.maxWeight) ? st.lastBody.maxWeight : null);
       const mkt = (hp && hp.market) || ctx.state.market;
-      const mktOfRow = (r) => (r.market || (st.symbolMap[String(r.code || '').toUpperCase()] || {}).market || mkt);
+      pfMarket = mkt;
       const ws = rows.map((r) => asPct(r.weight)).filter(isNum);
       const sumW = isNum(p.totalWeight) ? asPct(p.totalWeight) : (ws.length ? ws.reduce((a, b) => a + b, 0) : null);
       const amts = rows.map((r) => r.amount).filter(isNum);
@@ -781,19 +885,21 @@
       const cash = isNum(p.cash) ? p.cash : (isNum(cap) && sumAmt !== null ? Math.max(0, cap - sumAmt) : null);
 
       if (!rows.length && !isNum(sumW) && !isNum(cash)) {
-        portfolioHost.appendChild(ui.empty('服务端未返回组合分配数据'));
-        if (p.note) portfolioHost.appendChild(noteLine(p.note));
+        paintPfEmpty('服务端未返回组合分配数据', p.note || '');
         return;
       }
 
-      portfolioHost.appendChild(metricList([
+      pfAltHost.style.display = 'none';
+      paint(pfAltHost, []);
+      pfMetricHost.style.display = '';
+      paint(pfMetricHost, [metricList([
         ['纳入标的', rows.length ? rows.length + ' 只' : (st.rows.length + ' 只（无分配明细）')],
         ['总仓位', isNum(sumW) ? F.num(sumW, 1) + '%' : '—'],
         ['现金 / 未分配', isNum(cash) ? F.amt(cash, mkt) : '—'],
         ['资金合计', isNum(sumAmt) ? F.amt(sumAmt, mkt) : '—'],
         ['本金', isNum(cap) ? F.amt(cap, mkt) : '—'],
         ['单只上限', isNum(mw) ? F.num(asPct(mw), 1) + '%' : '—'],
-      ]));
+      ])]);
 
       /* 权重条：按权重成比例分配宽度，剩余为现金 */
       if (ws.length) {
@@ -813,7 +919,8 @@
             title: '现金 / 未分配 ' + F.num(rest, 1) + '%',
           }));
         }
-        portfolioHost.appendChild(bar);
+        pfBarHost.style.display = '';
+        paint(pfBarHost, [bar]);
 
         const legend = h('div', { class: 'breadth-legend' });
         rows.slice(0, 12).forEach((r, i) => {
@@ -842,60 +949,44 @@
             h('b', { text: ' ' + F.num(rest, 1) + '%' }),
           ]));
         }
-        portfolioHost.appendChild(legend);
+        pfLegendHost.style.display = '';
+        paint(pfLegendHost, [legend]);
+      } else {
+        /* 没有权重明细：两块清空并隐藏，不留占位高度 */
+        pfBarHost.style.display = 'none';
+        pfLegendHost.style.display = 'none';
+        paint(pfBarHost, []);
+        paint(pfLegendHost, []);
       }
 
       if (rows.length) {
-        const maxW = Math.max.apply(null, ws.concat([1]));
-        portfolioHost.appendChild(h('div', { style: { marginTop: '12px' } }, [
-          ui.tbl({
-            cols: [
-              {
-                key: 'name', label: '标的', cls: 'name', noSort: true,
-                render: (r) => {
-                  const nm = text(r.name, text(r.code));
-                  const same = String(nm) === String(r.code);
-                  return h('span', {}, [
-                    h('span', { class: 'name', text: nm }),
-                    same ? null : h('span', { class: 'code', text: text(r.code) }),
-                  ]);
-                },
-              },
-              {
-                key: 'weight', label: '权重', cls: 'n', value: (r) => asPct(r.weight),
-                render: (r) => {
-                  const w = asPct(r.weight);
-                  return h('span', { class: 'num' + (isNum(w) ? '' : ' dim3'), text: isNum(w) ? F.num(w, 1) + '%' : '—' });
-                },
-              },
-              {
-                key: 'amount', label: '金额', cls: 'n', value: (r) => r.amount,
-                render: (r) => h('span', {
-                  class: 'num' + (isNum(r.amount) ? '' : ' dim3'),
-                  text: isNum(r.amount) ? F.amt(r.amount, mktOfRow(r)) : '—',
-                }),
-              },
-              {
-                key: 'bar', label: '占比', noSort: true, width: '180px',
-                render: (r) => {
-                  const w = asPct(r.weight);
-                  const p = isNum(w) ? Math.min(100, (w / maxW) * 100) : 0;
-                  return h('div', { class: 'prog' }, [
-                    h('div', { class: 'prog-bar' }, [h('i', { style: { width: p.toFixed(1) + '%' } })]),
-                  ]);
-                },
-              },
-            ],
-            rows,
-            compact: true,
-            emptyText: '无分配明细',
-          }),
-        ]));
+        pfMaxW = Math.max.apply(null, ws.concat([1]));
+        const cols = buildPfCols();
+        const sig = colsSig(cols);
+        if (!pfRef) {
+          pfRef = ui.tbl({ cols, rows, compact: true, emptyText: '无分配明细' });
+          pfColsSig = sig;
+          pfTableHost.style.display = '';
+          paint(pfTableHost, []);             /* 只删节点，不重建表格 */
+          pfTableHost.appendChild(pfRef);     /* 首次挂载；之后只 update，绝不重复挂载 */
+        } else {
+          if (sig !== pfColsSig) { pfRef.setCols(cols); pfColsSig = sig; }
+          pfTableHost.style.display = '';
+          pfRef.update(rows);
+        }
+      } else {
+        pfTableHost.style.display = 'none';
+        paint(pfTableHost, []);
+        pfRef = null;
+        pfColsSig = '';
       }
 
-      if (p.note) portfolioHost.appendChild(noteLine(p.note));
-      portfolioHost.appendChild(noteLine('组合分配由服务端按凯利折扣与单只权重上限折算，权重之和即总仓位；' +
-        '本金与现金按当前市场本币口径，不做跨市场汇率换算。'));
+      pfNoteHost.style.display = '';
+      paint(pfNoteHost, [
+        p.note ? noteLine(p.note) : null,
+        noteLine('组合分配由服务端按凯利折扣与单只权重上限折算，权重之和即总仓位；' +
+          '本金与现金按当前市场本币口径，不做跨市场汇率换算。'),
+      ]);
     }
 
     /* --------------------------------------------------------- 取数 */
@@ -917,8 +1008,13 @@
       st.loading = true;
       submitBtn.disabled = true;
       statHost.textContent = '模型计算中…';
-      clear(tableHost);
-      tableHost.appendChild(ui.loading('模型计算中…（多标的批量研判可能需要数秒）'));
+      /* 已有结果时保留当前表格（后台轮询不闪、不跳滚动、不丢 hover），
+         只有「还没有任何结果」才用加载占位（与原来首次提交的观感一致） */
+      if (!tableRef || !st.rows.length) {
+        paint(tableHost, [ui.loading('模型计算中…（多标的批量研判可能需要数秒）')]);
+        tableRef = null;
+        tableColsSig = '';
+      }
       try {
         const res = await recommend(req);
         if (st.destroyed) return;
@@ -948,10 +1044,11 @@
         st.rows = [];
         st.portfolio = null;
         statHost.textContent = '分析失败';
-        clear(tableHost);
-        tableHost.appendChild(ui.empty('分析失败：' + e.message + '（接口 /api/advisor/recommend）'));
-        clear(portfolioHost);
-        portfolioHost.appendChild(ui.empty('无组合分配数据'));
+        /* 失败提示原位改写；旧表实例随之作废，下次成功时重建一次 */
+        paint(tableHost, [ui.empty('分析失败：' + e.message + '（接口 /api/advisor/recommend）')]);
+        tableRef = null;
+        tableColsSig = '';
+        paintPfEmpty('无组合分配数据');
         ctx.toast('AI 选股失败：' + e.message, 'err');
       } finally {
         st.loading = false;
@@ -1601,12 +1698,12 @@
       edge: 6, forecast: 7, kelly: 8, plan: 9, signals: 10, risk: 11, act: 12,
     };
 
-    /* 只替换单个单元格：整表重绘会打断用户的选择与滚动位置 */
+    /* 只替换单个单元格：整表重绘会打断用户的选择与滚动位置。
+       结构一致时进一步原位改写（chip 只换文案与配色，不换节点） */
     function replaceCell(tr, idx, node) {
       const td = tr && tr.cells ? tr.cells[idx] : null;
       if (!td || !node) return false;
-      clear(td);
-      td.appendChild(node);
+      paint(td, [node]);
       return true;
     }
 
@@ -2019,8 +2116,7 @@
     /* ---- 历史视图提示条 ---- */
 
     function renderBanner() {
-      clear(bannerHost);
-      if (!st.history) { bannerHost.style.display = 'none'; return; }
+      if (!st.history) { bannerHost.style.display = 'none'; paint(bannerHost, []); return; }
       bannerHost.style.display = '';
       const rec = st.history;
       const mkt = histMarket(rec);
@@ -2029,7 +2125,8 @@
       if (isNum(rec.capital)) args.push('本金 ' + F.amt(rec.capital, mkt));
       if (isNum(rec.kellyFraction)) args.push(kellyText(rec.kellyFraction));
       if (isNum(rec.maxWeight)) args.push('上限 ' + F.num(asPct(rec.maxWeight), 0) + '%');
-      bannerHost.appendChild(h('div', {
+      /* 两条提示行原位改写（按钮节点被复用，不会因为重绘而丢点击态） */
+      paint(bannerHost, [h('div', {
         class: 'legend-inline',
         style: {
           alignItems: 'center', gap: '10px', marginBottom: '8px', padding: '8px 10px',
@@ -2047,15 +2144,14 @@
           title: '回到最近一次实时研判结果（若无则回到空态）',
           on: { click: () => exitHistory() },
         }),
-      ]));
-      bannerHost.appendChild(h('div', { class: 'legend-inline', style: { marginBottom: '8px', lineHeight: '1.8' } }, [
+      ]), h('div', { class: 'legend-inline', style: { marginBottom: '8px', lineHeight: '1.8' } }, [
         h('span', {
           class: 'dim3',
           text: '历史记录按保存时的结果原样回放：字段缺失一律显示「—」，不做推断填充；' +
             '为避免 60 秒自动刷新把历史数据覆盖成实时结果，历史视图下已暂停轮询，点「退出历史视图」即可恢复。',
         }),
         rec.note ? h('span', { class: 'dim3', text: '备注：' + text(rec.note) }) : null,
-      ]));
+      ])]);
     }
 
     /* ---- 历史记录表 ---- */
@@ -2071,7 +2167,6 @@
     }
 
     function renderHistStats() {
-      clear(histStatsHost);
       const s = st.hist.stats || {};
       const total = isNum(s.records) ? s.records : (isNum(st.hist.total) ? st.hist.total : st.hist.rows.length);
       const parts = [
@@ -2083,10 +2178,16 @@
       ];
       const ret = st.hist.retention || {};
       if (isNum(ret.limit)) parts.push('保留上限 ' + ret.limit + ' 条 · 已清理 ' + text(ret.pruned, '0') + ' 条');
-      histStatsHost.appendChild(h('span', { class: 'dim3', text: parts.join(' · ') }));
-      if (st.hist.note) histStatsHost.appendChild(h('span', { class: 'dim3', text: st.hist.note }));
+      /* 统计行只改文本，原位改写即可（历史列表刷新时不闪） */
+      paint(histStatsHost, [
+        h('span', { class: 'dim3', text: parts.join(' · ') }),
+        st.hist.note ? h('span', { class: 'dim3', text: st.hist.note }) : null,
+      ]);
     }
 
+    /* 备注编辑器：行内 input / 按钮交给 morph 原位保留 ——
+       刷新时结构一致，输入框节点不会被换掉，所以正在输入的备注不丢、焦点也不会被抢走
+       （morph 会跳过正处于焦点中的控件，不去改写它的 value）。 */
     function noteCell(r) {
       const cur = r.note === null || r.note === undefined ? '' : String(r.note);
       const inp = h('input', {
@@ -2201,30 +2302,56 @@
       ];
     }
 
+    /* 历史记录表实例 / 列指纹 / 配置对象（mount 内缓存）：
+       loadHistory 每次都先置 loading 再重渲染，重建表体会连带把备注输入框冲掉；
+       这里首次挂载后只 update(rows)，行内 input 由 morph 原位保留（不丢焦点）。 */
+    let histRef = null;
+    let histColsSig = '';
+    let histCfg = null;
+
     function renderHistory() {
-      clear(histTableHost);
-      if (st.hist.loading) { histTableHost.appendChild(ui.loading('历史记录加载中…')); return; }
+      if (st.hist.loading && histRef) return;    /* 已有列表：保留当前内容，等结果回来原位更新 */
+      if (st.hist.loading) { paint(histTableHost, [ui.loading('历史记录加载中…')]); return; }
       if (st.hist.error) {
-        histTableHost.appendChild(ui.empty('历史记录暂不可用：' + st.hist.error + '（接口 /api/advisor/history）'));
+        paint(histTableHost, [ui.empty('历史记录暂不可用：' + st.hist.error + '（接口 /api/advisor/history）')]);
+        histRef = null;
+        histColsSig = '';
+        histCfg = null;
         return;
       }
       if (!st.hist.rows.length) {
         const f = st.hist.filter;
         const filtered = !!(f.market || f.action || f.q || f.pinned);
-        histTableHost.appendChild(ui.empty(filtered
+        paint(histTableHost, [ui.empty(filtered
           ? '没有符合筛选条件的历史记录：可放宽筛选或点「刷新」重试'
-          : '暂无历史记录：保持「自动保存到历史记录」开启，提交一次「开始 AI 分析」后即会出现在这里'));
+          : '暂无历史记录：保持「自动保存到历史记录」开启，提交一次「开始 AI 分析」后即会出现在这里')]);
+        histRef = null;
+        histColsSig = '';
+        histCfg = null;
         return;
       }
-      histTableHost.appendChild(ui.tbl({
-        cols: buildHistCols(),
-        rows: st.hist.rows,
-        compact: true,
-        maxHeight: '340px',
-        rowKey: (r) => r.id,
-        activeKey: st.history ? st.history.id : null,
-        emptyText: '没有符合条件的历史记录',
-      }));
+      const cols = buildHistCols();
+      const sig = colsSig(cols);
+      if (!histRef) {
+        histCfg = {
+          cols,
+          rows: st.hist.rows,
+          compact: true,
+          maxHeight: '340px',
+          rowKey: (r) => r.id,
+          activeKey: st.history ? st.history.id : null,
+          emptyText: '没有符合条件的历史记录',
+        };
+        histRef = ui.tbl(histCfg);
+        histColsSig = sig;
+        paint(histTableHost, []);                /* 只删节点，不重建表格 */
+        histTableHost.appendChild(histRef);      /* 首次挂载；之后只 update，绝不重复挂载 */
+        return;
+      }
+      /* 当前记录高亮：行类名在 update 时按最新的 activeKey 重算 */
+      histCfg.activeKey = st.history ? st.history.id : null;
+      if (sig !== histColsSig) { histRef.setCols(cols); histColsSig = sig; }
+      histRef.update(st.hist.rows);
     }
 
     /* 历史列表请求序号：筛选条件变化时允许并发，只采用最后一次请求的结果 */
@@ -2267,9 +2394,8 @@
 
     async function loadRecord(id) {
       if (!id) return;
-      clear(bannerHost);
       bannerHost.style.display = '';
-      bannerHost.appendChild(ui.loading('历史记录载入中…（#' + id + '）'));
+      paint(bannerHost, [ui.loading('历史记录载入中…（#' + id + '）')]);
       try {
         const res = await recordApi(id);
         if (st.destroyed) return;
@@ -2316,8 +2442,11 @@
         if (st.history) renderBanner();
         else {
           bannerHost.style.display = 'none';
-          clear(tableHost);
-          tableHost.appendChild(ui.empty('历史记录载入失败：' + e.message + '（接口 /api/advisor/record）'));
+          paint(bannerHost, []);
+          /* 失败提示原位改写；旧表实例随之作废，下次渲染时重建一次 */
+          paint(tableHost, [ui.empty('历史记录载入失败：' + e.message + '（接口 /api/advisor/record）')]);
+          tableRef = null;
+          tableColsSig = '';
         }
       }
     }

@@ -385,6 +385,13 @@
 
   /* ------------------------------------------------- 顶栏时钟 / 时段 */
 
+  /* 时段徽标每秒刷新一次：节点只建一次，之后只改文本（重建会让整条徽标每秒闪一次） */
+  const sessionDot = sessionBadge.querySelector('i.dot') || h('i', { class: 'dot' });
+  const sessionText = sessionBadge.querySelector('span') || h('span');
+  clear(sessionBadge);
+  sessionBadge.appendChild(sessionDot);
+  sessionBadge.appendChild(sessionText);
+
   function tickClock() {
     const now = new Date();
     clockEl.textContent = F.clock(now.getTime());
@@ -393,9 +400,8 @@
     sessionBadge.className = 'session ' + s.cls;
     const other = state.market === 'us' ? cn : us;
     const otherLabel = state.market === 'us' ? 'A股' : '美股';
-    sessionBadge.innerHTML = '';
-    sessionBadge.appendChild(h('i', { class: 'dot' }));
-    sessionBadge.appendChild(h('span', { text: s.label + ' · ' + s.detail + '　|　' + otherLabel + '：' + other.label }));
+    const text = s.label + ' · ' + s.detail + '　|　' + otherLabel + '：' + other.label;
+    if (sessionText.textContent !== text) sessionText.textContent = text;
     sessionBadge.title = 'A股：' + cn.label + '（' + cn.detail + '）　美股：' + us.label + '（' + us.detail + '）';
   }
 

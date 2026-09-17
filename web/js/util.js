@@ -145,6 +145,137 @@
     return el;
   }
 
+  /* ------------------------------------------------------------------------
+     增量更新（无感刷新）
+     刷新数据时整块 clear + 重建会让界面闪动，还会丢掉滚动位置、hover 与输入焦点。
+     下面这组函数按「结构相同就原地改写、结构不同才换节点」的原则更新 DOM：
+       morph(oldEl, newEl)          让 newEl 的结构落到 oldEl 上，返回真正留在页面上的节点
+       morphChildren(host, fresh)   把 fresh 的子节点合并进 host（配合 h() 构造的游离树使用）
+       paint(host, children)        h(children) → 合并到 host，最常用的一步到位写法
+       reconcile(host, items, cfg)  带 key 的列表复用（行没变就不碰 DOM）
+     ------------------------------------------------------------------------ */
+
+  /* 这些是「属性(property)」而不是 attribute，h() 直接赋值，比较时也要按属性比 */
+  const PROP_KEYS = ['value', 'checked', 'disabled', 'colSpan', 'rowSpan', 'title', 'placeholder', 'src', 'href'];
+
+  function isTextish(n) { return n && (n.nodeType === 3 || n.nodeType === 8); }
+
+  function replaceNode(oldEl, newEl) {
+    const p = oldEl.parentNode;
+    if (p) p.replaceChild(newEl, oldEl);      /* 游离树里的节点会被移动过来 */
+    return newEl;
+  }
+
+  function syncAttrs(oldEl, newEl) {
+    const na = newEl.attributes || [];
+    for (let i = 0; i < na.length; i++) {
+      if (oldEl.getAttribute(na[i].name) !== na[i].value) oldEl.setAttribute(na[i].name, na[i].value);
+    }
+    const oa = oldEl.attributes || [];
+    for (let i = oa.length - 1; i >= 0; i--) {     /* 倒序：删除会改变 attributes 列表 */
+      if (!newEl.hasAttribute(oa[i].name)) oldEl.removeAttribute(oa[i].name);
+    }
+    /* 正在输入的控件不抢它的值；其余按属性比较 */
+    if (oldEl === document.activeElement) return;
+    PROP_KEYS.forEach((k) => {
+      if (!(k in newEl) || !(k in oldEl)) return;
+      if (oldEl[k] !== newEl[k]) { try { oldEl[k] = newEl[k]; } catch (e) { /* 只读属性忽略 */ } }
+    });
+  }
+
+  /* 把 fresh 的子节点按位置合并进 host：文本只改内容，元素递归合并，多余节点才删除 */
+  function morphChildren(host, fresh) {
+    const freshKids = Array.prototype.slice.call(fresh.childNodes);
+    let i = 0;
+    for (;;) {
+      const ok = host.childNodes[i];
+      const nk = freshKids[i];
+      if (!ok && !nk) return host;
+      if (nk && !ok) { host.appendChild(nk); i++; continue; }
+      if (!nk && ok) { host.removeChild(ok); continue; }      /* 不前进：删掉后原位换成下一个 */
+      if (isTextish(ok) && isTextish(nk)) {
+        if (ok.nodeValue !== nk.nodeValue) ok.nodeValue = nk.nodeValue;
+      } else {
+        morph(ok, nk);
+      }
+      i++;
+    }
+  }
+
+  function morph(oldEl, newEl) {
+    if (!oldEl) return newEl;
+    if (!newEl) return oldEl;
+    if (oldEl === newEl) return oldEl;
+    if (oldEl.nodeType !== newEl.nodeType) return replaceNode(oldEl, newEl);
+    if (isTextish(oldEl)) {
+      if (oldEl.nodeValue !== newEl.nodeValue) oldEl.nodeValue = newEl.nodeValue;
+      return oldEl;
+    }
+    if (oldEl.nodeType !== 1) return oldEl;
+    if (oldEl.tagName !== newEl.tagName) return replaceNode(oldEl, newEl);
+    /* <canvas> 换掉就丢了画布内容与上下文，必须保留原节点 */
+    if (oldEl.tagName === 'CANVAS') return oldEl;
+    syncAttrs(oldEl, newEl);
+    morphChildren(oldEl, newEl);
+    /* 事件监听无法复制：结构一致时沿用旧节点的监听（处理器一律读取节点上的最新数据） */
+    return oldEl;
+  }
+
+  /* 用 h() 的 children 语义构造游离树，再合并到 host */
+  function paint(host, children) {
+    const fresh = document.createElement('div');
+    const list = Array.isArray(children) ? children : [children];
+    list.forEach((c) => {
+      if (c === null || c === undefined || c === false) return;
+      fresh.appendChild(typeof c === 'string' || typeof c === 'number'
+        ? document.createTextNode(String(c)) : c);
+    });
+    return morphChildren(host, fresh);
+  }
+
+  function defaultKey(it, i) {
+    if (it && it.id !== undefined && it.id !== null && it.id !== '') return 'id:' + it.id;
+    if (it && (it.code || it.symbol)) return (it.market || '') + ':' + (it.code || it.symbol);
+    return '#' + i;
+  }
+
+  /**
+   * 列表增量更新：按 key 复用节点，顺序变化只做移动（节点不重建）。
+   * cfg = { key(item, i), render(item, i), emptyText }
+   * 渲染出的节点会收到 __row = item，行内事件处理器应读 node.__row 而不是闭包里的旧对象。
+   */
+  function reconcile(host, items, cfg) {
+    const c = cfg || {};
+    const keyFn = c.key || defaultKey;
+    const render = c.render || ((it, i) => h('div', { text: it === null || it === undefined ? '' : String(it) }));
+    const live = (host.__adRows instanceof Map) ? host.__adRows : (host.__adRows = new Map());
+    const list = Array.isArray(items) ? items : [];
+    const used = new Set();
+    const want = [];
+    list.forEach((it, i) => {
+      const k = String(keyFn(it, i));
+      if (used.has(k)) return;                       /* 同一 key 只保留第一条，避免节点被搬来搬去 */
+      used.add(k);
+      const fresh = render(it, i);
+      let node = live.get(k);
+      if (node && node.parentNode !== host) { live.delete(k); node = null; }
+      node = node ? morph(node, fresh) : fresh;
+      node.__row = it;                               /* 让旧的监听读到最新数据 */
+      live.set(k, node);
+      want.push(node);
+    });
+    live.forEach((node, k) => {
+      if (used.has(k)) return;
+      if (node.parentNode === host) host.removeChild(node);
+      live.delete(k);
+    });
+    want.forEach((node, i) => {
+      const cur = host.childNodes[i];
+      if (cur !== node) host.insertBefore(node, cur || null);   /* 移动而非重建 */
+    });
+    return host;
+  }
+
   const dom = {
     h,
     frag(children) {
@@ -155,6 +286,10 @@
       return f;
     },
     clear(el) { while (el && el.firstChild) el.removeChild(el.firstChild); return el; },
+    morph,
+    morphChildren,
+    paint,
+    reconcile,
     q(sel, root) { return (root || document).querySelector(sel); },
     qa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); },
     /* 涨跌着色文本 */

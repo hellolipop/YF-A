@@ -8,7 +8,7 @@
 (function () {
   'use strict';
 
-  const { h, clear, pct } = window.AD.dom;
+  const { h, clear, pct, reconcile } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -239,9 +239,13 @@
       }).filter((m) => m.idx >= 0);
       kChart = window.AD.chart.kline(canvasWrap, {
         height: 360, period: st.period, market: st.market, showMA: true, sub: 'MACD', marks,
+        /* 图例会被鼠标移动高频触发：按槽位原位改写文本，不能每次重建节点 */
         onLegend: (rows) => {
-          legend.innerHTML = '';
-          rows.forEach((row) => legend.appendChild(h('i', { style: { color: row.color }, text: row.text })));
+          const list = (rows || []).map((row, i) => ({ key: 'r' + i, text: row.text, color: row.color }));
+          reconcile(legend, list, {
+            key: (it) => it.key,
+            render: (it) => h('i', { style: { color: it.color }, text: it.text }),
+          });
         },
       });
       kChart.setData(bars, { marks });

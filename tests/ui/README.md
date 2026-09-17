@@ -12,9 +12,11 @@
 # 在项目根目录
 npm i jsdom
 node tests/ui/create_tracker_sync.js
+node tests/ui/seamless_refresh.js
 
 # 若 jsdom 装在别处
 NODE_PATH=/path/to/node_modules node tests/ui/create_tracker_sync.js
+NODE_PATH=/path/to/node_modules node tests/ui/seamless_refresh.js
 
 # 服务不在默认端口
 AD_BASE=http://127.0.0.1:9000 node tests/ui/create_tracker_sync.js
@@ -27,6 +29,7 @@ AD_BASE=http://127.0.0.1:9000 node tests/ui/create_tracker_sync.js
 | 文件 | 覆盖内容 |
 | --- | --- |
 | `create_tracker_sync.js` | 新建跟踪任务的表单状态同步：输入框有值但不触发 blur、创建后表单残留、改代码后沿用旧名称、成本假设是否保留 |
+| `seamless_refresh.js` | **无感刷新（更新不重构图）**：A 段离线断言增量更新语义（数据未变时零 DOM 写入、顺序变化只移动节点、焦点输入框不被覆盖、canvas 不被替换、行内监听读到最新数据）；B 段在真实页面上断言自选股轮询后表体/首行、个股详情刷新与切换周期后的 canvas 都是**同一个节点对象**，且刷新期间不出现「加载中」占位 |
 
 ## 为什么需要它
 
@@ -37,3 +40,7 @@ AD_BASE=http://127.0.0.1:9000 node tests/ui/create_tracker_sync.js
 - 输入框与内部状态脱节，导致"标的已填却提示要填写"。
 
 因此这里同时断言 **DOM 变化、提交体内容与 toast 文案**，而不只看是否抛异常。
+
+`seamless_refresh.js` 用 `MutationObserver` 与节点身份比较来锁住"更新即重构图"的回归：
+只看"渲染有没有报错"是不够的，整块 `clear() + 重建` 同样不报错，但界面会闪、
+滚动位置与 hover 会丢——这正是用户实际反馈的那类问题。

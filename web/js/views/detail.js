@@ -6,11 +6,17 @@
        不动 K 线、不动 AI 叠加层，也不整块重绘页头；
      · 连不上或断线会自动降级为轮询（用页面既有的 6 秒定时器兜底），只影响状态 chip；
      · destroy() 时关闭订阅。
+
+   无感刷新：本页所有刷新（定时轮询 / 手动刷新 / 切换周期复权）都不重建 DOM——
+     · 图表实例按「类型 + 标的 + 周期 + 复权」复用，只有换口径才重建，数据用 setData 增量喂；
+     · 头部、关键指标、五档盘口、信号雷达、图例都走 paint()/reconcile() 原位改写，
+       只有文本真的变了才写 DOM，因此没有闪动，也不会丢 hover / 滚动 / 焦点；
+     · 刷新中/刷新失败用容器右上角的小标签提示，不再用「加载中」替换内容。
    ========================================================================== */
 (function () {
   'use strict';
 
-  const { h, clear, pct } = window.AD.dom;
+  const { h, clear, pct, paint, reconcile } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -156,10 +162,13 @@
 
     const headHost = h('div');
     const legendHost = h('div', { class: 'chart-legend' });
-    const canvasHost = h('div');
+    const canvasHost = h('div', { class: 'chart-canvas-wrap' });
     const obHost = h('div');
     const metricHost = h('div', { class: 'metric-list' });
-    const flowHost = h('div', { style: { height: '200px' } });
+    /* 资金流：图表容器与文字说明分开，刷新时各自原位更新，画布不会被文字节点挤掉 */
+    const flowChartHost = h('div', { style: { height: '200px' } });
+    const flowNoteHost = h('div');
+    const flowHost = h('div', {}, [flowChartHost, flowNoteHost]);
     const signalHost = h('div');
     const indHost = h('div', { class: 'metric-list' });
     const metaHost = h('span', { class: 'hint' });
@@ -176,62 +185,65 @@
       return '行情时间 ' + ((q && q.updated) || '—') + (q && q.stale ? ' · 数据可能延迟' : '');
     }
 
+    /* 页头：结构不变，只改写变化的文本（paint 会保留原有节点与监听） */
     function renderHead() {
       const q = st.quote || {};
       const d = F.dir(q.changePct);
-      clear(headHost);
-      updHost = h('span', { text: updText(q) });
+      updHost = h('span', { class: 'qh-upd', text: updText(q) });
       const stat = (k, v, cls) => h('div', { class: 'qh-stat' }, [
         h('div', { class: 'k', text: k }),
         h('div', { class: 'v ' + (cls || ''), text: v }),
       ]);
-      headHost.appendChild(h('div', { class: 'quote-head' }, [
-        h('div', { class: 'qh-id' }, [
-          h('div', { class: 't1' }, [
-            h('h1', { text: q.name || code }),
-            ui.cells.star(ctx.isWatched(market, code), () => { ctx.toggleWatch(market, code, q.name || code); renderHead(); }),
+      paint(headHost, [
+        h('div', { class: 'quote-head' }, [
+          h('div', { class: 'qh-id' }, [
+            h('div', { class: 't1' }, [
+              h('h1', { text: q.name || code }),
+              ui.cells.star(ctx.isWatched(market, code), () => { ctx.toggleWatch(market, code, q.name || code); renderHead(); }),
+            ]),
+            h('div', { style: { marginTop: '3px', display: 'flex', gap: '7px', alignItems: 'center' } }, [
+              h('span', { class: 'code', text: (market === 'us' ? 'US:' : '') + code }),
+              h('span', { class: 'chip', text: market === 'us' ? '美股' : (code[0] === '6' ? '沪市' : code[0] === '3' ? '创业板' : code[0] === '8' || code[0] === '4' ? '北交所' : '深市') }),
+              q.source ? h('span', { class: 'chip', text: q.source }) : null,
+            ]),
           ]),
-          h('div', { style: { marginTop: '3px', display: 'flex', gap: '7px', alignItems: 'center' } }, [
-            h('span', { class: 'code', text: (market === 'us' ? 'US:' : '') + code }),
-            h('span', { class: 'chip', text: market === 'us' ? '美股' : (code[0] === '6' ? '沪市' : code[0] === '3' ? '创业板' : code[0] === '8' || code[0] === '4' ? '北交所' : '深市') }),
-            q.source ? h('span', { class: 'chip', text: q.source }) : null,
+          h('div', { class: 'qh-px' }, [
+            h('div', { class: 'big ' + d, text: F.price(q.price, market) }),
+            h('div', { class: 'chg ' + d }, [
+              h('span', { text: F.signed(q.change, 2) }),
+              h('span', { text: F.pct(q.changePct) }),
+            ]),
+          ]),
+          h('div', { class: 'qh-stats' }, [
+            stat('今开', F.price(q.open, market), F.dir((q.open || 0) - (q.prevClose || 0))),
+            stat('最高', F.price(q.high, market), ''),
+            stat('最低', F.price(q.low, market), ''),
+            stat('昨收', F.price(q.prevClose, market), 'dim'),
+            stat('成交量', F.vol(q.volume, market)),
+            stat('成交额', F.amt(q.amount, market)),
+            stat('换手率', F.num(q.turnover, 2) + '%'),
+            stat('量比', F.num(q.volumeRatio, 2)),
+            stat('振幅', F.num(q.amplitude, 2) + '%'),
+            stat('总市值', F.cap(q.marketCap, market)),
+            stat('PE(TTM)', F.num(q.peTtm, 1)),
+            stat('PB', F.num(q.pb, 2)),
+          ]),
+          h('div', { class: 'qh-actions' }, [
+            h('button', { class: 'btn sm', text: '加自选', on: { click: () => { ctx.toggleWatch(market, code, q.name || code); renderHead(); } } }),
+            h('button', { class: 'btn sm', text: '设预警', on: { click: () => ctx.openAlertFor(market, code, q.name || code) } }),
+            h('button', { class: 'btn sm', text: '回测', on: { click: () => ctx.openBacktest(market, code, q.name || code) } }),
+            h('button', { class: 'btn sm', text: '持续跟踪', on: { click: () => ctx.openTracker(market, code, q.name || code) } }),
           ]),
         ]),
-        h('div', { class: 'qh-px' }, [
-          h('div', { class: 'big ' + d, text: F.price(q.price, market) }),
-          h('div', { class: 'chg ' + d }, [
-            h('span', { text: F.signed(q.change, 2) }),
-            h('span', { text: F.pct(q.changePct) }),
-          ]),
+        h('div', { class: 'legend-inline', style: { marginTop: '8px' } }, [
+          updHost,                       /* 「行情时间 …」，推送时就地更新这一个节点 */
+          q.week52High ? '52周最高 ' + F.price(q.week52High, market) : '',
+          q.week52Low ? '52周最低 ' + F.price(q.week52Low, market) : '',
+          q.avgPrice ? '均价 ' + F.price(q.avgPrice, market) : '',
         ]),
-        h('div', { class: 'qh-stats' }, [
-          stat('今开', F.price(q.open, market), F.dir((q.open || 0) - (q.prevClose || 0))),
-          stat('最高', F.price(q.high, market), ''),
-          stat('最低', F.price(q.low, market), ''),
-          stat('昨收', F.price(q.prevClose, market), 'dim'),
-          stat('成交量', F.vol(q.volume, market)),
-          stat('成交额', F.amt(q.amount, market)),
-          stat('换手率', F.num(q.turnover, 2) + '%'),
-          stat('量比', F.num(q.volumeRatio, 2)),
-          stat('振幅', F.num(q.amplitude, 2) + '%'),
-          stat('总市值', F.cap(q.marketCap, market)),
-          stat('PE(TTM)', F.num(q.peTtm, 1)),
-          stat('PB', F.num(q.pb, 2)),
-        ]),
-        h('div', { class: 'qh-actions' }, [
-          h('button', { class: 'btn sm', text: '加自选', on: { click: () => { ctx.toggleWatch(market, code, q.name || code); renderHead(); } } }),
-          h('button', { class: 'btn sm', text: '设预警', on: { click: () => ctx.openAlertFor(market, code, q.name || code) } }),
-          h('button', { class: 'btn sm', text: '回测', on: { click: () => ctx.openBacktest(market, code, q.name || code) } }),
-          h('button', { class: 'btn sm', text: '持续跟踪', on: { click: () => ctx.openTracker(market, code, q.name || code) } }),
-        ]),
-      ]));
-      const upd = h('div', { class: 'legend-inline', style: { marginTop: '8px' } }, [
-        updHost,                       /* 「行情时间 …」，推送时就地更新这一个节点 */
-        q.week52High ? '52周最高 ' + F.price(q.week52High, market) : '',
-        q.week52Low ? '52周最低 ' + F.price(q.week52Low, market) : '',
-        q.avgPrice ? '均价 ' + F.price(q.avgPrice, market) : '',
       ]);
-      headHost.appendChild(upd);
+      /* paint 之后节点可能被复用，重新取一次引用，保证推送刷新的是页面上那个节点 */
+      updHost = headHost.querySelector('.qh-upd') || updHost;
     }
 
     /* ------------------------------------------------------ 实时行情推送 */
@@ -329,60 +341,58 @@
 
     function renderOrderbook() {
       const ob = st.orderbook;
-      clear(obHost);
       if (!ob || !ob.supported) {
-        obHost.appendChild(h('div', { class: 'legend-inline' }, [
-          (ob && ob.reason) || '五档盘口数据暂不可用',
-        ]));
-        if (st.quote) {
-          obHost.appendChild(h('div', { style: { marginTop: '10px' } }, [
+        paint(obHost, [
+          h('div', { class: 'legend-inline' }, [
+            (ob && ob.reason) || '五档盘口数据暂不可用',
+          ]),
+          st.quote ? h('div', { style: { marginTop: '10px' } }, [
             h('div', { class: 'ob-mid' }, [
               h('span', { text: '外盘 ' + F.vol(st.quote.outer, market) }),
               h('span', { text: '内盘 ' + F.vol(st.quote.inner, market) }),
             ]),
-          ]));
-        }
+          ]) : null,
+        ]);
         return;
       }
-      const grid = h('div', { class: 'ob' });
       const maxVol = Math.max.apply(null, ob.asks.concat(ob.bids).map((x) => x.volume || 0).concat([1]));
+      const kids = [];
       ob.asks.slice().reverse().forEach((a, i) => {
         const lvl = 5 - i;
-        const row = h('div', { class: 'ob-row' }, [
+        kids.push(h('div', { class: 'ob-row' }, [
           h('span', { class: 'lvl', text: '卖' + lvl }),
           h('span', { class: 'px down', text: F.price(a.price, market) }),
           h('span', { class: 'vol', text: F.vol(a.volume, market) }),
           h('div', { class: 'fill', style: { width: ((a.volume || 0) / maxVol * 100).toFixed(1) + '%', background: 'var(--down)' } }),
-        ]);
-        grid.appendChild(row);
+        ]));
       });
-      grid.appendChild(h('div', { class: 'ob-sep' }));
+      kids.push(h('div', { class: 'ob-sep' }));
       const q = st.quote || {};
-      grid.appendChild(h('div', { class: 'ob-mid' }, [
+      kids.push(h('div', { class: 'ob-mid' }, [
         h('span', { class: F.dir(q.changePct), text: F.price(q.price, market) + '  ' + F.pct(q.changePct) }),
         h('span', { class: 'dim3', text: '均价 ' + F.price(ob.avgPrice || q.avgPrice, market) }),
       ]));
-      grid.appendChild(h('div', { class: 'ob-sep' }));
+      kids.push(h('div', { class: 'ob-sep' }));
       ob.bids.forEach((b, i) => {
-        const row = h('div', { class: 'ob-row' }, [
+        kids.push(h('div', { class: 'ob-row' }, [
           h('span', { class: 'lvl', text: '买' + (i + 1) }),
           h('span', { class: 'px up', text: F.price(b.price, market) }),
           h('span', { class: 'vol', text: F.vol(b.volume, market) }),
           h('div', { class: 'fill', style: { width: ((b.volume || 0) / maxVol * 100).toFixed(1) + '%', background: 'var(--up)' } }),
-        ]);
-        grid.appendChild(row);
+        ]));
       });
-      obHost.appendChild(grid);
-      obHost.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '10px' } }, [
-        '委比参考：外盘 ' + F.vol(ob.outer, market) + ' / 内盘 ' + F.vol(ob.inner, market),
-      ]));
+      paint(obHost, [
+        h('div', { class: 'ob' }, kids),
+        h('div', { class: 'legend-inline', style: { marginTop: '10px' } }, [
+          '委比参考：外盘 ' + F.vol(ob.outer, market) + ' / 内盘 ' + F.vol(ob.inner, market),
+        ]),
+      ]);
     }
 
     /* ------------------------------------------------------- 关键指标 */
 
     function renderMetrics() {
       const q = st.quote || {};
-      clear(metricHost);
       const items = [
         ['今开', F.price(q.open, market)], ['昨收', F.price(q.prevClose, market)],
         ['涨停价', F.price(q.limitUp, market)], ['跌停价', F.price(q.limitDown, market)],
@@ -393,7 +403,7 @@
         ['PE(TTM)', F.num(q.peTtm, 1)], ['市净率', F.num(q.pb, 2)],
         ['均价', F.price(q.avgPrice, market)], ['货币', q.currency || '—'],
       ];
-      items.forEach(([k, v]) => metricHost.appendChild(metric(k, v)));
+      paint(metricHost, items.map(([k, v]) => metric(k, v)));
     }
 
     /* --------------------------------------------------------- 图表 */
@@ -405,56 +415,116 @@
       loadChart();
     }
 
-    async function loadChart() {
-      clear(canvasHost);
-      legendHost.innerHTML = '';
-      if (chart) { chart.destroy(); chart = null; }
-      canvasHost.appendChild(ui.loading('图表加载中…'));
+    /* 图表实例复用：只有「形态变了」（分时 ↔ K线）才重建 canvas。
+       周期 / 复权只换数据与刻度，用 setOptions + setData 就地更新，切换时不会闪。
+       数据请求期间旧图一直留在页面上，新数据到了才在同一帧内换掉。 */
+    let chartKind = null;
+    let chartSeries = '';          /* 最近一次成功绘制的「周期|复权」，用来判断能否保留缩放位置 */
+    let legendSrc = '';            /* 图例里的数据源，onLegend 回调读它，避免闭包里的旧值 */
+
+    /* 刷新中 / 刷新失败都用右下角之外的小标签说明，不再替换内容 */
+    function chartBusy(on, msg) {
+      if (!on && canvasHost.classList.contains('is-warn')) return;   /* 失败提示保留到下次刷新 */
+      canvasHost.classList.toggle('is-busy', !!on);
+      if (msg) canvasHost.setAttribute('data-busy', msg);
+    }
+
+    function chartNote(msg, keepOld) {
+      if (keepOld) {
+        canvasHost.classList.add('is-busy', 'is-warn');
+        canvasHost.setAttribute('data-busy', msg);
+        return;
+      }
+      canvasHost.classList.remove('is-busy', 'is-warn');
+      paint(canvasHost, [ui.empty(msg)]);
+    }
+
+    /* 清掉空态文字节点，canvas 与 tip 一律保留 */
+    function clearChartNote() {
+      canvasHost.classList.remove('is-warn');
+      Array.prototype.slice.call(canvasHost.childNodes).forEach((n) => {
+        if (n.nodeType === 1 && n.tagName !== 'CANVAS' && !n.classList.contains('chart-tip')) {
+          canvasHost.removeChild(n);
+        }
+      });
+    }
+
+    /* 图例：槽位复用，只改文本（鼠标在图上移动时会高频调用，不能重建节点） */
+    function paintLegend(rows, src) {
+      const list = (rows || []).map((r, i) => ({ key: 'r' + i, tag: 'i', text: r.text, color: r.color }));
+      list.push({ key: 'src', tag: 'span', text: '数据源：' + (src || '—'), cls: 'dim3' });
+      reconcile(legendHost, list, {
+        key: (it) => it.key,
+        render: (it) => (it.tag === 'i'
+          ? h('i', { style: { color: it.color }, text: it.text })
+          : h('span', { class: it.cls, style: { marginLeft: 'auto' }, text: it.text })),
+      });
+    }
+
+    async function loadChart(opts) {
+      const o = opts || {};
+      const isTrend = st.period === 'trend';
+      const kind = isTrend ? 'trend' : 'kline';
+      const series = isTrend ? 'trend' : (st.period + '|' + st.fq);
+      /* 本视图一次只挂一只标的（换标的会重新 mount），所以复用只看「分时 / K线」这一层 */
+      const reuse = !o.force && !!chart && chartKind === kind;
+      const keepView = reuse && chartSeries === series;
+      chartBusy(true, reuse ? '更新中…' : '加载中…');
       try {
-        if (st.period === 'trend') {
+        if (isTrend) {
           const res = await api.trends(market, code);
-          clear(canvasHost);
+          if (st.destroyed || !root.isConnected) return;
+          const pc = res.prevClose || (st.quote && st.quote.prevClose);
           if (!res.points || !res.points.length) {
-            canvasHost.appendChild(ui.empty('暂无分时数据：' + (res.error || '数据源暂不可用')));
-          } else {
-            chart = window.AD.chart.trend(canvasHost, {
-              height: 340, prevClose: res.prevClose || (st.quote && st.quote.prevClose), market,
-              onLegend: (rows) => {
-                legendHost.innerHTML = '';
-                rows.forEach((r) => legendHost.appendChild(h('i', { style: { color: r.color }, text: r.text })));
-                legendHost.appendChild(h('span', { class: 'dim3', style: { marginLeft: 'auto' }, text: '数据源：' + (res.source || '—') }));
-              },
-            });
-            chart.setData(res.points, {});
-            metaHost.textContent = '分时 · ' + (res.source || '') + ' · 昨收 ' + F.price(res.prevClose || (st.quote && st.quote.prevClose) || 0, market);
+            chartNote('暂无分时数据：' + (res.error || '数据源暂不可用'), reuse);
+            return;
           }
+          st.trends = res;
+          legendSrc = res.source || '';
+          if (!reuse) {
+            if (chart) { chart.destroy(); chart = null; }
+            chart = window.AD.chart.trend(canvasHost, {
+              height: 340, prevClose: pc, market,
+              onLegend: (rows) => paintLegend(rows, legendSrc),
+            });
+            chartKind = 'trend';
+          }
+          chart.setData(res.points, { prevClose: pc });
+          chartSeries = series;
+          metaHost.textContent = '分时 · ' + (res.source || '') + ' · 昨收 ' + F.price(pc || 0, market);
           loadSignals();
         } else {
           const res = await api.kline(market, code, st.period, st.fq, 320);
-          clear(canvasHost);
+          if (st.destroyed || !root.isConnected) return;
           if (!res.bars || !res.bars.length) {
-            canvasHost.appendChild(ui.empty('暂无K线数据：' + (res.error || '数据源暂不可用')));
+            chartNote('暂无K线数据：' + (res.error || '数据源暂不可用'), reuse);
             return;
           }
           st.kline = res;
-          chart = window.AD.chart.kline(canvasHost, {
-            height: 430, period: st.period, market, showMA: st.showMA, showBOLL: st.showBOLL, sub: st.sub,
-            onLegend: (rows) => {
-              legendHost.innerHTML = '';
-              rows.forEach((r) => legendHost.appendChild(h('i', { style: { color: r.color }, text: r.text })));
-              legendHost.appendChild(h('span', { class: 'dim3', style: { marginLeft: 'auto' }, text: '数据源：' + (res.source || '—') }));
-            },
-          });
-          chart.setData(res.bars, {});
+          legendSrc = res.source || '';
+          if (!reuse) {
+            if (chart) { chart.destroy(); chart = null; }
+            chart = window.AD.chart.kline(canvasHost, {
+              height: 430, period: st.period, market, showMA: st.showMA, showBOLL: st.showBOLL, sub: st.sub,
+              onLegend: (rows) => paintLegend(rows, legendSrc),
+            });
+            chartKind = 'kline';
+          }
+          /* 周期 / 复权 / 副图 / 均线开关都只是配置，就地同步即可 */
+          chart.setOptions({ period: st.period, market, showMA: st.showMA, showBOLL: st.showBOLL, sub: st.sub });
+          chart.setData(res.bars, { keepView: keepView });
+          chartSeries = series;
           applyAdvisorToChart(res.bars);
           metaHost.textContent = res.bars.length + ' 根K线 · ' + (res.source || '') + ' · 复权方式 ' +
             (['不复权', '前复权', '后复权'][st.fq] || '—');
           if (st.period !== 'day') loadSignals();
           else runAnalysis(res.bars);
         }
+        clearChartNote();
       } catch (e) {
-        clear(canvasHost);
-        canvasHost.appendChild(ui.empty('图表加载失败：' + e.message));
+        chartNote('图表加载失败：' + e.message, reuse);
+      } finally {
+        chartBusy(false);
       }
     }
 
@@ -465,9 +535,9 @@
       try {
         const res = await api.kline(market, code, 'day', 1, 320);
         if (res.bars && res.bars.length >= 30) runAnalysis(res.bars);
-        else signalHost.appendChild(ui.empty('日线数据不足，暂无法生成信号雷达'));
+        else paint(signalHost, [ui.empty('日线数据不足，暂无法生成信号雷达')]);
       } catch (e) {
-        signalHost.appendChild(ui.empty('信号雷达数据获取失败：' + e.message));
+        paint(signalHost, [ui.empty('信号雷达数据获取失败：' + e.message)]);
       }
     }
 
@@ -476,21 +546,29 @@
     function runAnalysis(bars) {
       const res = window.AD.quant.analyze(bars);
       st.analysis = res;
-      clear(signalHost);
-      clear(indHost);
+      const kids = [h('div', { class: 'score-wrap', style: { marginBottom: '12px' } }, [
+        scoreRing(res.score),
+        h('div', {}, [
+          h('div', { style: { fontSize: '13px' }, text: '综合技术面：' + res.bias }),
+          h('div', { class: 'legend-inline', style: { marginTop: '6px' } }, [
+            '基于 ' + res.signals.length + ' 项信号加权（趋势 / 动能 / 超买超卖 / 量能 / 位置）',
+          ]),
+          h('div', { class: 'legend-inline', style: { marginTop: '4px', color: 'var(--text-3)' } }, [
+            '信号仅反映历史价量统计特征，不构成买卖建议',
+          ]),
+        ]),
+      ])];
       if (!res.signals.length) {
-        signalHost.appendChild(ui.empty('当前没有明显技术信号'));
+        kids.push(ui.empty('当前没有明显技术信号'));
       } else {
-        const list = h('div', { class: 'signal-list' });
-        res.signals.slice().sort((a, b) => Math.abs(b.weight * b.dir) - Math.abs(a.weight * a.dir)).forEach((s) => {
-          list.appendChild(h('div', { class: 'signal-item' }, [
+        kids.push(h('div', { class: 'signal-list' },
+          res.signals.slice().sort((a, b) => Math.abs(b.weight * b.dir) - Math.abs(a.weight * a.dir)).map((s) => h('div', { class: 'signal-item' }, [
             h('span', { class: 'dotm', style: { background: s.dir > 0 ? 'var(--up)' : 'var(--down)' } }),
             h('span', { class: 'txt' }, [h('b', { text: s.name }), '　' + s.desc]),
             h('span', { class: 'w', text: (s.dir > 0 ? '+' : '-') + s.weight }),
-          ]));
-        });
-        signalHost.appendChild(list);
+          ]))));
       }
+      paint(signalHost, kids);
       const i = res.ind || {};
       const metrics = [
         ['均线 MA5 / MA20', F.num(i.ma5, 2) + ' / ' + F.num(i.ma20, 2)],
@@ -503,19 +581,7 @@
         ['20日高 / 低', F.num(i.hi20, 2) + ' / ' + F.num(i.lo20, 2)],
         ['60日高 / 低', F.num(i.hi60, 2) + ' / ' + F.num(i.lo60, 2)],
       ];
-      metrics.forEach(([k, v]) => indHost.appendChild(metric(k, v)));
-      signalHost.insertBefore(h('div', { class: 'score-wrap', style: { marginBottom: '12px' } }, [
-        scoreRing(res.score),
-        h('div', {}, [
-          h('div', { style: { fontSize: '13px' }, text: '综合技术面：' + res.bias }),
-          h('div', { class: 'legend-inline', style: { marginTop: '6px' } }, [
-            '基于 ' + res.signals.length + ' 项信号加权（趋势 / 动能 / 超买超卖 / 量能 / 位置）',
-          ]),
-          h('div', { class: 'legend-inline', style: { marginTop: '4px', color: 'var(--text-3)' } }, [
-            '信号仅反映历史价量统计特征，不构成买卖建议',
-          ]),
-        ]),
-      ]), signalHost.firstChild);
+      paint(indHost, metrics.map(([k, v]) => metric(k, v)));
       /* 日线数据就绪 -> 自动研判一次（仅一次，不轮询） */
       ensureAdvisor();
     }
@@ -964,42 +1030,52 @@
     /* ------------------------------------------------------- 资金流 */
 
     async function loadFlow() {
-      clear(flowHost);
-      flowHost.appendChild(ui.loading('资金流加载中…'));
+      flowBusy(true);
       try {
         const res = await api.fundflow(market, code);
-        clear(flowHost);
+        if (st.destroyed || !root.isConnected) return;
         if (!res.series || !res.series.length) {
-          flowHost.appendChild(ui.empty('资金流数据暂不可用' + (res.error ? '：' + res.error : '')));
+          if (!flowChart) paint(flowChartHost, [ui.empty('资金流数据暂不可用' + (res.error ? '：' + res.error : ''))]);
           return;
         }
         st.fundflow = res;
         const data = res.series.map((x) => ({ t: x.t, v: x.main }));
-        flowChart = window.AD.chart.line(flowHost, {
-          height: 200, zeroLine: true, fmt: (v) => F.amt(v, market),
-          series: [{
-            name: '主力净额', data, color: res.series[res.series.length - 1].main >= 0 ? 'var(--up)' : 'var(--down)',
-            fill: 'rgba(77,141,255,0.10)', width: 1.4,
-            fmt: (v) => F.amt(v, market),
-          }],
-        });
+        const series = [{
+          name: '主力净额', data, color: res.series[res.series.length - 1].main >= 0 ? 'var(--up)' : 'var(--down)',
+          fill: 'rgba(77,141,255,0.10)', width: 1.4,
+          fmt: (v) => F.amt(v, market),
+        }];
+        /* 复用同一个折线实例，只喂新数据（重建会把 canvas 换掉，肉眼可见闪一下） */
+        if (flowChart) {
+          flowChart.setData(series);
+        } else {
+          clear(flowChartHost);                    /* 清掉先前的空态文字，再建画布 */
+          flowChart = window.AD.chart.line(flowChartHost, { height: 200, zeroLine: true, fmt: (v) => F.amt(v, market), series });
+        }
         const last = res.series[res.series.length - 1];
         const note = h('div', { class: 'legend-inline', style: { marginTop: '8px' } }, [
           '最新（' + last.t + '）主力净额 ' + F.amt(last.main, market),
           res.limited ? '数据源：' + res.source : '含超大单 / 大单 / 中单 / 小单拆分',
         ]);
-        flowHost.appendChild(note);
         if (!res.limited) {
-          const detail = h('div', { class: 'metric-list', style: { marginTop: '10px' } });
-          [['超大单', last.huge], ['大单', last.big], ['中单', last.mid], ['小单', last.small]].forEach(([k, v]) => {
-            detail.appendChild(metric(k + '净额', F.amt(v, market), F.dir(v)));
-          });
-          flowHost.appendChild(detail);
+          const detail = h('div', { class: 'metric-list', style: { marginTop: '10px' } },
+            [['超大单', last.huge], ['大单', last.big], ['中单', last.mid], ['小单', last.small]]
+              .map(([k, v]) => metric(k + '净额', F.amt(v, market), F.dir(v))));
+          paint(flowNoteHost, [note, detail]);
+        } else {
+          paint(flowNoteHost, [note]);
         }
       } catch (e) {
-        clear(flowHost);
-        flowHost.appendChild(ui.empty('资金流加载失败：' + e.message));
+        if (!flowChart) paint(flowChartHost, [ui.empty('资金流加载失败：' + e.message)]);
+      } finally {
+        flowBusy(false);
       }
+    }
+
+    /* 资金流刷新中的提示同样走容器角标，不动既有内容 */
+    function flowBusy(on) {
+      flowHost.classList.toggle('is-busy', !!on);
+      if (on) flowHost.setAttribute('data-busy', flowChart ? '更新中…' : '加载中…');
     }
 
     /* --------------------------------------------------------- 工具栏 */

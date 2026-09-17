@@ -7,7 +7,7 @@
 (function () {
   'use strict';
 
-  const { h, clear, pct } = window.AD.dom;
+  const { h, clear, pct, paint } = window.AD.dom;
   const F = window.AD.fmt;
   const ui = window.AD.ui;
   const api = window.AD.api;
@@ -40,13 +40,20 @@
     return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : null;
   }
 
-  /* 可点击股票代码 -> 个股详情 */
+  /* 可点击股票代码 -> 个股详情
+     代码/名称同时写到 data-* 上：这两个属性会被原位改写同步，
+     因此节点被复用时点击读到的仍是最新的代码，而不是首次渲染时的闭包 */
   function codeCell(code, name, ctx) {
-    return h('button', {
+    const btn = h('button', {
       class: 'chip accent', text: code, title: '查看 ' + (name || code) + ' 个股详情',
       style: { cursor: 'pointer' },
-      on: { click: (e) => { e.stopPropagation(); ctx.openSymbol('cn', code, name); } },
+      dataset: { code: code || '', name: name || '' },
     });
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      ctx.openSymbol('cn', btn.dataset.code, btn.dataset.name);
+    });
+    return btn;
   }
 
   function numSpan(text, cls) {
@@ -136,6 +143,78 @@
     const metaHost = h('span', { class: 'hint', text: '加载中…' });
     const tagHost = h('span', { style: { display: 'inline-flex', gap: '6px', alignItems: 'center' } });
     const bodyHost = h('div');
+
+    /* ------------------------------------------------------------------
+       无感刷新：每个页签一份常驻骨架
+       区块标题 / 指标槽 / 图形槽 / 表格 / 说明槽只建一次，定时刷新只往槽位里
+       paint() 与 update()，不再整块 clear + 重建，滚动位置与 hover 都不会丢。
+       骨架放在 mount 内（不能放模块级），换页签时旧骨架留在内存里，回来直接复用。
+       ------------------------------------------------------------------ */
+    const views = {};              /* tab -> 常驻骨架 */
+
+    /* 结果区同一时刻只显示一个节点（加载 / 失败 / 页签骨架）：
+       节点身份变了就显式换掉，不参与 morph —— morph 是按位置合并的，身份变了会串内容 */
+    function showOnly(node) {
+      if (bodyHost.firstChild === node) return;
+      clear(bodyHost);
+      bodyHost.appendChild(node);
+    }
+
+    /* 常驻表格槽位：首次（或从空态切回）挂载实例，之后只 ref.update(rows) */
+    function tblSlot(host) {
+      let node = null;
+      return {
+        /* build() 只在实例不存在时调用一次；返回 { node, fresh } */
+        get(build) {
+          const fresh = !node;
+          if (fresh) node = build();
+          if (fresh || node.parentNode !== host) {
+            clear(host);
+            host.appendChild(node);
+          }
+          return { node, fresh };
+        },
+        /* 空态与表体是两种结构、且会互相 morph 时用这个：释放实例，下次按首屏重建 */
+        drop() { node = null; },
+      };
+    }
+
+    /* 互斥区块的挂载/摘除：摘下来的节点留在内存里，切回时原位挂回，结构不重建 */
+    function place(parent, node, before, on) {
+      const inDom = node.parentNode === parent;
+      if (on && !inDom) parent.insertBefore(node, before || null);
+      else if (!on && inDom) parent.removeChild(node);
+    }
+
+    /* 连板层级筛选：结构与 ui.seg 一致，但层级值写在 data-level 上、
+       点击时读节点属性 —— 层级项数会随梯队变化，原位改写不会留下过期的闭包取值 */
+    function levelSeg(items, onPick) {
+      const wrap = h('div', { class: 'seg' });
+      items.forEach((it) => {
+        const btn = h('button', {
+          class: it.value === state.level ? 'active' : '',
+          text: it.label,
+          dataset: { level: it.value },
+        });
+        btn.addEventListener('click', () => onPick(btn.dataset.level));
+        wrap.appendChild(btn);
+      });
+      return wrap;
+    }
+
+    /* 加载 / 失败占位：每个页签各留一份常驻节点，避免刷新时反复换节点 */
+    function showLoading(v, tab) {
+      if (!v.loadingNode) {
+        v.loadingNode = h('div', { class: 'section' }, [ui.loading(TAB_LABEL[tab] + '加载中…')]);
+      }
+      showOnly(v.loadingNode);
+    }
+
+    function showError(v, tab, msg) {
+      if (!v.errorNode) v.errorNode = h('div', { class: 'section' }, [ui.empty('')]);
+      paint(v.errorNode, [ui.empty(TAB_LABEL[tab] + '获取失败：' + msg)]);
+      showOnly(v.errorNode);
+    }
 
     /* -------------------------------------------- 常驻控件（不随 render 重建） */
 
@@ -260,26 +339,27 @@
 
     /* ------------------------------------------------------------ 渲染 */
 
+    /* 页签 -> 常驻骨架（首次取用时建结构，之后一直复用） */
+    function viewOf(tab) {
+      if (tab === 'limit_up') return ladderView();
+      if (tab === 'dragon_tiger') return lhbView();
+      if (tab === 'auction') return auctionView();
+      return ticksView();
+    }
+
     function render() {
       if (!state.env && state.error) metaHost.textContent = '获取失败：' + state.error;
       else metaHost.textContent = envText(state.env);
-      clear(tagHost);
-      envTags(state.env).forEach((t) => tagHost.appendChild(t));
+      /* 状态标签原位改写：结构一致时只改文本 / class，不换节点 */
+      paint(tagHost, envTags(state.env));
 
-      clear(bodyHost);
-      if (!state.env && !state.error) {
-        bodyHost.appendChild(h('div', { class: 'section' }, [ui.loading(TAB_LABEL[state.tab] + '加载中…')]));
-        return;
-      }
-      if (!state.env) {
-        bodyHost.appendChild(h('div', { class: 'section' }, [
-          ui.empty(TAB_LABEL[state.tab] + '获取失败：' + state.error),
-        ]));
-        return;
-      }
-      if (state.tab === 'limit_up') renderLadder();
-      else if (state.tab === 'dragon_tiger') renderLhb();
-      else if (state.tab === 'auction') renderAuction();
+      const tab = state.tab;
+      const v = viewOf(tab);
+      if (!state.env && !state.error) { showLoading(v, tab); return; }
+      if (!state.env) { showError(v, tab, state.error); return; }
+      if (tab === 'limit_up') renderLadder();
+      else if (tab === 'dragon_tiger') renderLhb();
+      else if (tab === 'auction') renderAuction();
       else renderTicks();
     }
 
@@ -322,6 +402,29 @@
       ];
     }
 
+    /* 常驻骨架：层级筛选 / 指标 / 分布条 / 表格 / 说明，各自一个槽位 */
+    function ladderView() {
+      if (views.limit_up) return views.limit_up;
+      const segHost = h('div');
+      const metricHost = h('div');
+      const midHost = h('div');            /* 连板分布条 + 图例 + 断层提示 */
+      const tableHost = h('div');          /* 涨停梯队表（常驻实例） */
+      const noteHost = h('div');
+      const root = ui.section(
+        '涨停梯队',
+        '东方财富涨停池（push2ex）：按连板数（lbc）降序分梯队；价格原始字段 p 实测为「元 × 1000」，服务端已还原',
+        [segHost],
+        h('div', {}, [metricHost, midHost, tableHost, noteHost])
+      );
+      views.limit_up = {
+        title: root.querySelector('.section-head h2'),
+        segHost, metricHost, midHost, tableHost, noteHost,
+        tbl: tblSlot(tableHost),
+        root,
+      };
+      return views.limit_up;
+    }
+
     function renderLadder() {
       const env = state.env;
       const d = env.data || {};
@@ -331,17 +434,16 @@
       const levelValues = ladders.map((l) => String(l.level));
       if (state.level !== 'all' && levelValues.indexOf(state.level) < 0) state.level = 'all';
       const rows = state.level === 'all' ? stocks : stocks.filter((s) => String(s.ladder) === state.level);
+      const v = ladderView();
 
-      const levelSeg = ui.seg(
+      paint(v.segHost, [levelSeg(
         [{ value: 'all', label: '全部 ' + stocks.length }].concat(
           ladders.map((l) => ({ value: String(l.level), label: l.level + ' 板 ' + l.count }))
         ),
-        state.level,
-        (v) => { state.level = v; render(); }
-      );
+        (val) => { state.level = val; render(); }
+      )]);
 
-      const content = h('div');
-      content.appendChild(metrics([
+      paint(v.metricHost, [metrics([
         ['涨停家数', d.count],
         ['最高连板', d.maxLadder ? d.maxLadder + ' 板' : '—'],
         ['梯队层级', ladders.length ? ladders.length + ' 层' : '—'],
@@ -349,8 +451,9 @@
         ['实际交易日', d.date],
         ['请求交易日', d.requestedDate],
         ['交易日回溯', d.fallback ? d.fallbackDays + ' 天' : '否'],
-      ]));
+      ])]);
 
+      const mid = [];
       if (ladders.length) {
         const total = Math.max(1, d.count || stocks.length);
         const maxLevel = Math.max(1, d.maxLadder || 1);
@@ -365,27 +468,29 @@
             title: l.level + ' 板 · ' + l.count + ' 只',
           }));
         });
-        content.appendChild(bar);
+        mid.push(bar);
         const legend = h('div', { class: 'breadth-legend' });
         ladders.forEach((l) => legend.appendChild(h('span', {}, [
           h('b', { text: String(l.count) }), ' 只 · ' + l.level + ' 板',
         ])));
-        content.appendChild(legend);
+        mid.push(legend);
       }
-
       if (gaps.length) {
-        content.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '10px' } }, [
+        mid.push(h('div', { class: 'legend-inline', style: { marginTop: '10px' } }, [
           h('span', { class: 'chip warn', text: '梯队断层' }),
           h('span', { text: gaps.map((g) => g + ' 板').join('、') + ' 无个股（1 ~ ' + (d.maxLadder || 0) + ' 板之间的缺失层级，通常意味着中位连板缺位）' }),
         ]));
       }
+      paint(v.midHost, mid);
 
       if (!rows.length) {
-        content.appendChild(ui.empty(state.error
+        /* 空态与表体是两种结构：释放常驻实例，下次按首屏重新挂载 */
+        v.tbl.drop();
+        paint(v.tableHost, [ui.empty(state.error
           ? ('涨停梯队不可用：' + state.error)
-          : (d.note || '该交易日无涨停池数据（接口实测仅保留最近约 20 个自然日）')));
+          : (d.note || '该交易日无涨停池数据（接口实测仅保留最近约 20 个自然日）'))]);
       } else {
-        content.appendChild(ui.tbl({
+        const t = v.tbl.get(() => ui.tbl({
           cols: ladderCols(),
           rows,
           sortKey: 'ladder',
@@ -395,16 +500,16 @@
           onRow: (r) => ctx.openSymbol('cn', r.code, r.name),
           emptyText: '该连板层级暂无个股',
         }));
+        if (!t.fresh) t.node.update(rows);   /* 只更新行：表体、滚动位置与排序状态都留着 */
       }
-      if (d.note) content.appendChild(noteLine(d.note));
-      if (state.error) content.appendChild(noteLine('上游返回：' + state.error));
 
-      bodyHost.appendChild(ui.section(
-        '涨停梯队' + (d.date ? ' · ' + d.date : ''),
-        '东方财富涨停池（push2ex）：按连板数（lbc）降序分梯队；价格原始字段 p 实测为「元 × 1000」，服务端已还原',
-        [levelSeg],
-        content
-      ));
+      const notes = [];
+      if (d.note) notes.push(noteLine(d.note));
+      if (state.error) notes.push(noteLine('上游返回：' + state.error));
+      paint(v.noteHost, notes);
+
+      paint(v.title, ['涨停梯队' + (d.date ? ' · ' + d.date : '')]);
+      showOnly(v.root);
     }
 
     /* ----------------------------------------------- 页签 2：龙虎榜 */
@@ -511,79 +616,140 @@
       ];
     }
 
+    /* 常驻骨架：指标 / 三块数据区（含 4 张常驻表）/ 空态 / 说明 */
+    function lhbView() {
+      if (views.dragon_tiger) return views.dragon_tiger;
+      const metricHost = h('div');
+      const dataHost = h('div');           /* 净买额 / 净卖额 / 明细 / 聚合，表实例常驻 */
+      const emptyHost = h('div');
+      const noteHost = h('div');
+      const openRow = (r) => ctx.openSymbol('cn', r.code, r.name);
+
+      /* 表实例只建一次：刷新时 update 行，不重建表体 */
+      const buyTbl = ui.tbl({
+        cols: lhbTopCols(), rows: [], sortKey: 'netAmt', sortDir: 'desc',
+        maxHeight: '300px', compact: true, onRow: openRow, emptyText: '暂无数据',
+      });
+      const sellTbl = ui.tbl({
+        cols: lhbTopCols(), rows: [], sortKey: 'netAmt', sortDir: 'asc',
+        maxHeight: '300px', compact: true, onRow: openRow, emptyText: '暂无数据',
+      });
+      const detailTbl = ui.tbl({
+        cols: lhbDetailCols(), rows: [], sortKey: 'netAmt', sortDir: 'desc',
+        maxHeight: '560px', compact: true, onRow: openRow, emptyText: '暂无明细',
+      });
+      const stockTbl = ui.tbl({
+        cols: lhbStockCols(), rows: [], sortKey: 'changePct', sortDir: 'desc',
+        maxHeight: '420px', compact: true, onRow: openRow, emptyText: '暂无数据',
+      });
+
+      dataHost.appendChild(h('div', { class: 'grid g-2', style: { marginTop: '14px' } }, [
+        ui.section('净买额前 10', '基于逐条上榜记录（同一标的可能多行，未做合并）', [], buyTbl),
+        ui.section('净卖额前 10', '基于逐条上榜记录（同一标的可能多行，未做合并）', [], sellTbl),
+      ]));
+      dataHost.appendChild(ui.section(
+        '上榜明细（一行 = 一个上榜原因）',
+        '同一标的当日可能因多个原因上榜，各行金额口径不同，服务端未做求和（避免编造口径）',
+        [], detailTbl
+      ));
+      dataHost.appendChild(ui.section(
+        '按个股聚合',
+        '仅按代码合并上榜原因与明细行索引，不对金额求和；完整金额请查看上方逐条明细',
+        [], stockTbl
+      ));
+
+      const body = h('div', {}, [metricHost, dataHost, emptyHost, noteHost]);
+      const root = ui.section(
+        '龙虎榜',
+        '东方财富数据中心（RPT_DAILYBILLBOARD_DETAILSNEW）；当日榜单通常盘后发布，服务端会自动回溯最多 15 个自然日',
+        [], body
+      );
+      views.dragon_tiger = {
+        title: root.querySelector('.section-head h2'),
+        body, metricHost, dataHost, emptyHost, noteHost,
+        buyTbl, sellTbl, detailTbl, stockTbl,
+        root,
+      };
+      return views.dragon_tiger;
+    }
+
     function renderLhb() {
       const env = state.env;
       const d = env.data || {};
       const rows = d.rows || [];
       const stocks = d.stocks || [];
-      const openRow = (r) => ctx.openSymbol('cn', r.code, r.name);
+      const v = lhbView();
 
-      const content = h('div');
-      content.appendChild(metrics([
+      paint(v.metricHost, [metrics([
         ['榜单记录', (d.count || 0) + ' 条'],
         ['涉及个股', stocks.length + ' 只'],
         ['榜单日期', d.date],
         ['请求日期', d.requestedDate],
         ['交易日回溯', d.fallback ? d.fallbackDays + ' 天' : '否'],
-      ]));
+      ])]);
 
       if (rows.length) {
-        content.appendChild(h('div', { class: 'grid g-2', style: { marginTop: '14px' } }, [
-          ui.section('净买额前 10', '基于逐条上榜记录（同一标的可能多行，未做合并）', [], ui.tbl({
-            cols: lhbTopCols(), rows: d.topNetBuy || [], sortKey: 'netAmt', sortDir: 'desc',
-            maxHeight: '300px', compact: true, onRow: openRow, emptyText: '暂无数据',
-          })),
-          ui.section('净卖额前 10', '基于逐条上榜记录（同一标的可能多行，未做合并）', [], ui.tbl({
-            cols: lhbTopCols(), rows: d.topNetSell || [], sortKey: 'netAmt', sortDir: 'asc',
-            maxHeight: '300px', compact: true, onRow: openRow, emptyText: '暂无数据',
-          })),
-        ]));
-
-        content.appendChild(ui.section(
-          '上榜明细（一行 = 一个上榜原因）',
-          '同一标的当日可能因多个原因上榜，各行金额口径不同，服务端未做求和（避免编造口径）',
-          [],
-          ui.tbl({
-            cols: lhbDetailCols(), rows, sortKey: 'netAmt', sortDir: 'desc',
-            maxHeight: '560px', compact: true, onRow: openRow, emptyText: '暂无明细',
-          })
-        ));
-
-        content.appendChild(ui.section(
-          '按个股聚合',
-          '仅按代码合并上榜原因与明细行索引，不对金额求和；完整金额请查看上方逐条明细',
-          [],
-          ui.tbl({
-            cols: lhbStockCols(), rows: stocks, sortKey: 'changePct', sortDir: 'desc',
-            maxHeight: '420px', compact: true, onRow: openRow, emptyText: '暂无数据',
-          })
-        ));
+        /* 数据块（含 4 张常驻表）挂回原位，只 update 行；空态槽位清空 */
+        place(v.body, v.dataHost, v.emptyHost, true);
+        paint(v.emptyHost, []);
+        v.buyTbl.update(d.topNetBuy || []);
+        v.sellTbl.update(d.topNetSell || []);
+        v.detailTbl.update(rows);
+        v.stockTbl.update(stocks);
       } else {
-        content.appendChild(ui.empty(state.error
+        /* 无数据：数据块整体摘下（结构留在内存里），原位换成空态 */
+        place(v.body, v.dataHost, v.emptyHost, false);
+        paint(v.emptyHost, [ui.empty(state.error
           ? ('龙虎榜不可用：' + state.error)
-          : '该交易日暂无龙虎榜数据'));
+          : '该交易日暂无龙虎榜数据')]);
       }
-      if (d.note) content.appendChild(noteLine(d.note));
-      if (state.error) content.appendChild(noteLine('上游返回：' + state.error));
 
-      bodyHost.appendChild(ui.section(
-        '龙虎榜' + (d.date ? ' · ' + d.date : ''),
-        '东方财富数据中心（RPT_DAILYBILLBOARD_DETAILSNEW）；当日榜单通常盘后发布，服务端会自动回溯最多 15 个自然日',
-        [],
-        content
-      ));
+      const notes = [];
+      if (d.note) notes.push(noteLine(d.note));
+      if (state.error) notes.push(noteLine('上游返回：' + state.error));
+      paint(v.noteHost, notes);
+
+      paint(v.title, ['龙虎榜' + (d.date ? ' · ' + d.date : '')]);
+      showOnly(v.root);
     }
 
     /* --------------------------------------------- 页签 3：集合竞价 */
+
+    /* 常驻骨架：代码按钮 / 指标 / 提示行 / 未匹配量 / 表格 / 空态 / 说明 */
+    function auctionView() {
+      if (views.auction) return views.auction;
+      const asideHost = h('div');          /* 页头「代码」按钮 */
+      const metricHost = h('div');
+      const preHost = h('div');            /* 竞价价来源 / 竞价中提示 */
+      const unmatchedHost = h('div');      /* 未匹配量不可得（常驻一行） */
+      const tblWrap = h('div', { style: { marginTop: '14px' } });
+      const emptyHost = h('div');
+      const noteHost = h('div');
+      const root = ui.section(
+        '集合竞价',
+        '东方财富分笔 09:15~09:25 段为主源；腾讯分笔首条 + 实时行情为降级源。竞价成交价 = 当日今开',
+        [asideHost],
+        h('div', {}, [metricHost, preHost, unmatchedHost, tblWrap, emptyHost, noteHost])
+      );
+      views.auction = {
+        title: root.querySelector('.section-head h2'),
+        asideHost, metricHost, preHost, unmatchedHost, tblWrap, emptyHost, noteHost,
+        tbl: tblSlot(tblWrap),
+        root,
+      };
+      return views.auction;
+    }
 
     function renderAuction() {
       const env = state.env;
       const d = env.data || {};
       const phase = d.phase || 'no_data';
       const ticks = d.orderTicks || [];
+      const v = auctionView();
 
-      const content = h('div');
-      content.appendChild(metrics([
+      paint(v.asideHost, d.code ? [codeCell(d.code, null, ctx)] : []);
+
+      paint(v.metricHost, [metrics([
         ['竞价阶段', PHASE_TEXT[phase] || phase],
         ['竞价成交价（今开）', d.price === null || d.price === undefined
           ? '—' : numSpan(F.price(d.price), F.dir(d.changePct))],
@@ -599,24 +765,28 @@
         ['委托量合计（仅参考）', F.vol(d.orderVolume)],
         ['撮合前最后委托量', F.vol(d.lastOrderVolume)],
         ['未匹配量', '—'],
-      ]));
+      ])]);
 
-      if (d.priceSource) content.appendChild(noteLine('竞价价来源：' + d.priceSource));
+      const pre = [];
+      if (d.priceSource) pre.push(noteLine('竞价价来源：' + d.priceSource));
       if (phase === 'auctioning') {
-        content.appendChild(warnLine(
+        pre.push(warnLine(
           '仍在 09:15~09:25 竞价中：price 为最后一条竞价委托快照价，尚未撮合，成交量与笔数不可得，仅供盘中观察。'
         ));
       }
+      paint(v.preHost, pre);
+
       /* 未匹配量 / 撤单量：公开接口缺失，服务端恒返回 null，此处按降级口径展示 */
-      content.appendChild(h('div', { class: 'legend-inline', style: { marginTop: '10px', lineHeight: '1.7' } }, [
+      paint(v.unmatchedHost, [h('div', { class: 'legend-inline', style: { marginTop: '10px', lineHeight: '1.7' } }, [
         h('span', { class: 'chip warn', text: '未匹配量不可得' }),
         h('span', {
           class: 'dim3',
           text: 'unmatched = null。' + (d.unmatchedNote
             || '公开接口（腾讯 / 东方财富）均未提供集合竞价未匹配量与撤单量，该字段留空。'),
         }),
-      ]));
+      ])]);
 
+      const notes = [];
       if (ticks.length) {
         /* 仅做前端展示标记（不上报、不参与字段口径）：最后一条 = 撮合前最后一条委托快照 */
         const rows = ticks.map((t, i) => ({ time: t.time, price: t.price, volume: t.volume, last: i === ticks.length - 1 }));
@@ -631,32 +801,57 @@
               : h('span', { class: 'dim3', text: '竞价委托快照（成交笔数 0）' })),
           },
         ];
-        content.appendChild(h('div', { style: { marginTop: '14px' } }, [
-          ui.tbl({
-            cols, rows, sortKey: 'time', sortDir: 'desc', maxHeight: '300px', compact: true,
-            emptyText: '当日无竞价委托快照',
-          }),
-        ]));
-        content.appendChild(noteLine(
+        const t = v.tbl.get(() => ui.tbl({
+          cols, rows, sortKey: 'time', sortDir: 'desc', maxHeight: '300px', compact: true,
+          emptyText: '当日无竞价委托快照',
+        }));
+        if (!t.fresh) t.node.update(rows);
+        paint(v.emptyHost, []);
+        notes.push(noteLine(
           '竞价委托快照（09:15:00~09:25:59）：该段记录的成交笔数恒为 0，不计入当日成交量；' +
           '「量」实测为非递增序列（撤单会回落），因此 orderVolume 只是逐条快照量合计，仅作参考，' +
           'lastOrderVolume（撮合前最后一条）更接近待撮合委托量口径；服务端最多回传 30 条。'
         ));
-      } else if (phase === 'no_data') {
-        content.appendChild(ui.empty(state.error
-          ? ('集合竞价不可用：' + state.error)
-          : '当日无集合竞价数据（未开盘 / 非交易日；北交所实测无分笔与竞价数据）'));
+      } else {
+        v.tbl.drop();
+        paint(v.tblWrap, []);              /* 只摘掉常驻表格，空态槽位紧接着它 */
+        paint(v.emptyHost, phase === 'no_data'
+          ? [ui.empty(state.error
+            ? ('集合竞价不可用：' + state.error)
+            : '当日无集合竞价数据（未开盘 / 非交易日；北交所实测无分笔与竞价数据）')]
+          : []);
       }
+      paint(v.noteHost, notes);
 
-      bodyHost.appendChild(ui.section(
-        '集合竞价' + (d.code ? ' · ' + d.code : ''),
-        '东方财富分笔 09:15~09:25 段为主源；腾讯分笔首条 + 实时行情为降级源。竞价成交价 = 当日今开',
-        d.code ? [codeCell(d.code, null, ctx)] : [],
-        content
-      ));
+      paint(v.title, ['集合竞价' + (d.code ? ' · ' + d.code : '')]);
+      showOnly(v.root);
     }
 
     /* --------------------------------------------- 页签 4：分笔成交 */
+
+    /* 常驻骨架：代码按钮 / 指标 / 方向分布 / 表格 / 空态 / 说明 */
+    function ticksView() {
+      if (views.ticks) return views.ticks;
+      const asideHost = h('div');          /* 页头「代码」按钮 */
+      const metricHost = h('div');
+      const midHost = h('div');            /* 方向分布条 + 图例 + 汇总说明 */
+      const tblWrap = h('div', { style: { marginTop: '14px' } });
+      const emptyHost = h('div');
+      const noteHost = h('div');
+      const root = ui.section(
+        '分笔成交',
+        '东方财富分笔（含成交笔数与方向 1=卖盘 / 2=买盘 / 4=中性）为主源，腾讯分笔（方向 B/S/M）为降级源；两个源均仅支持当日',
+        [asideHost],
+        h('div', {}, [metricHost, midHost, tblWrap, emptyHost, noteHost])
+      );
+      views.ticks = {
+        title: root.querySelector('.section-head h2'),
+        asideHost, metricHost, midHost, tblWrap, emptyHost, noteHost,
+        tbl: tblSlot(tblWrap),
+        root,
+      };
+      return views.ticks;
+    }
 
     function renderTicks() {
       const env = state.env;
@@ -664,6 +859,7 @@
       const raw = d.ticks || [];
       const rows = raw.slice().reverse();          // 最新在上
       const base = window.AD.isNum(d.preClose) ? d.preClose : null;
+      const v = ticksView();
 
       const agg = { buy: 0, sell: 0, mid: 0, other: 0 };
       raw.forEach((t) => {
@@ -673,8 +869,9 @@
       });
       const chg = (window.AD.isNum(d.latestPrice) && base) ? d.latestPrice - base : null;
 
-      const content = h('div');
-      content.appendChild(metrics([
+      paint(v.asideHost, d.code ? [codeCell(d.code, null, ctx)] : []);
+
+      paint(v.metricHost, [metrics([
         ['最新价', window.AD.isNum(d.latestPrice) ? numSpan(F.price(d.latestPrice), F.dir(chg)) : '—'],
         ['最新成交时间', d.latestTime],
         ['返回笔数', d.count],
@@ -684,8 +881,9 @@
         ['买盘量（按 sideText 汇总）', F.vol(agg.buy)],
         ['卖盘量（按 sideText 汇总）', F.vol(agg.sell)],
         ['中性量（按 sideText 汇总）', F.vol(agg.mid)],
-      ]));
+      ])]);
 
+      const mid = [];
       if (raw.length) {
         const total = Math.max(1, agg.buy + agg.sell + agg.mid + agg.other);
         const bar = h('div', { class: 'breadth-bar', style: { marginTop: '12px' } });
@@ -702,7 +900,7 @@
             title: s.label + ' ' + F.vol(s.v),
           }));
         });
-        content.appendChild(bar);
+        mid.push(bar);
         const legend = h('div', { class: 'breadth-legend' });
         segs.forEach((s) => legend.appendChild(h('span', {}, [
           h('b', { text: F.vol(s.v) }), ' ' + s.label,
@@ -710,12 +908,13 @@
         legend.appendChild(h('span', {}, ['成交笔数合计 ', h('b', {
           text: String(raw.reduce((a, t) => a + (window.AD.isNum(t.trades) ? t.trades : 0), 0)),
         })]));
-        content.appendChild(legend);
-        content.appendChild(noteLine(
+        mid.push(legend);
+        mid.push(noteLine(
           '汇总为前端按 sideText 逐笔累加（服务端不提供方向汇总字段），仅作盘中观察；' +
           '服务端已说明：主动买卖判定与腾讯外盘/内盘口径不同，方向字段仅供参考。'
         ));
       }
+      paint(v.midHost, mid);
 
       if (rows.length) {
         const cols = [
@@ -736,30 +935,30 @@
             render: (r) => h('span', { class: 'chip ' + (SIDE_CLS[r.sideText] || ''), text: r.sideText || '—' }),
           },
         ];
-        content.appendChild(h('div', { style: { marginTop: '14px' } }, [
-          ui.tbl({
-            cols, rows, sortKey: 'time', sortDir: 'desc', maxHeight: '560px', compact: true,
-            onRow: (r) => { if (d.code) ctx.openSymbol('cn', d.code, d.code); },
-            emptyText: '当日无分笔明细',
-          }),
-        ]));
+        const t = v.tbl.get(() => ui.tbl({
+          cols, rows, sortKey: 'time', sortDir: 'desc', maxHeight: '560px', compact: true,
+          onRow: (r) => { if (d.code) ctx.openSymbol('cn', d.code, d.code); },
+          emptyText: '当日无分笔明细',
+        }));
+        if (!t.fresh) t.node.update(rows);
+        paint(v.emptyHost, []);
       } else {
-        content.appendChild(ui.empty(state.error
+        v.tbl.drop();
+        paint(v.tblWrap, []);
+        paint(v.emptyHost, [ui.empty(state.error
           ? ('分笔成交不可用：' + state.error)
-          : '当日无分笔明细（未开盘 / 非交易日；北交所实测无分笔数据）'));
+          : '当日无分笔明细（未开盘 / 非交易日；北交所实测无分笔数据）')]);
       }
 
-      if (d.sideRule) content.appendChild(noteLine('方向口径：' + d.sideRule));
-      if (d.note) content.appendChild(noteLine(d.note));
-      if (state.error) content.appendChild(noteLine('上游返回：' + state.error));
-      content.appendChild(noteLine('表格按时间倒序（最新在上）；「成交笔数」为「—」表示该数据源不提供该字段（降级源腾讯分笔）。'));
+      const notes = [];
+      if (d.sideRule) notes.push(noteLine('方向口径：' + d.sideRule));
+      if (d.note) notes.push(noteLine(d.note));
+      if (state.error) notes.push(noteLine('上游返回：' + state.error));
+      notes.push(noteLine('表格按时间倒序（最新在上）；「成交笔数」为「—」表示该数据源不提供该字段（降级源腾讯分笔）。'));
+      paint(v.noteHost, notes);
 
-      bodyHost.appendChild(ui.section(
-        '分笔成交' + (d.code ? ' · ' + d.code : ''),
-        '东方财富分笔（含成交笔数与方向 1=卖盘 / 2=买盘 / 4=中性）为主源，腾讯分笔（方向 B/S/M）为降级源；两个源均仅支持当日',
-        d.code ? [codeCell(d.code, null, ctx)] : [],
-        content
-      ));
+      paint(v.title, ['分笔成交' + (d.code ? ' · ' + d.code : '')]);
+      showOnly(v.root);
     }
 
     /* ------------------------------------------------------------ 装配 */
