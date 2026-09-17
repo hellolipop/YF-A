@@ -26,6 +26,7 @@ AlphaDesk · 策略跟踪引擎（分层版）
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import threading
@@ -102,6 +103,22 @@ def clip(v, lo, hi):
     if f != f:
         return None
     return max(lo, min(hi, f))
+
+
+
+def _lag_days(processed, available):
+    """「已处理到」与「最新可得K线」相差多少天；任一侧缺失或解析失败返回 None。
+
+    用途是把「引擎是否真的在消化新K线」变成界面上看得见的数字。事故背景：游标曾静默冻结，
+    `tickCount` 照涨、`lastBarTime` 照更新（由盘中分支写入），界面上完全看不出异常 ——
+    四个任务全是空仓也没人知道为什么。一个能自证「推进到哪了」的字段比任何日志都直观。
+    """
+    try:
+        a = _dt.date.fromisoformat(str(processed)[:10])
+        b = _dt.date.fromisoformat(str(available)[:10])
+    except (TypeError, ValueError):
+        return None
+    return max(0, (b - a).days)
 
 
 class Runner:
@@ -346,6 +363,10 @@ class Runner:
             "startDate": run.get("startDate"),
             "startedFrom": run.get("benchmarkStartDate"),
             "lastBarTime": run.get("lastBarTime"),
+            "lastBarDate": run.get("lastBarDate"),
+            "availableTo": str(run.get("lastBarTime") or "")[:10] or None,
+            "lagDays": _lag_days(run.get("lastBarDate"), run.get("lastBarTime")),
+            "stalled": bool((_lag_days(run.get("lastBarDate"), run.get("lastBarTime")) or 0) >= 5),
             "lastTick": run.get("lastTick"),
             "tickCount": run.get("tickCount"),
             "strategy": run.get("strategyName"),
@@ -389,6 +410,10 @@ class Runner:
                 "createdDate": run.get("createdDate"), "startDate": run.get("startDate"),
                 "targetDays": run.get("targetDays"), "note": run.get("note"),
                 "lastBarTime": run.get("lastBarTime"), "lastTick": run.get("lastTick"),
+                "lastBarDate": run.get("lastBarDate"),
+                "availableTo": str(run.get("lastBarTime") or "")[:10] or None,
+                "lagDays": _lag_days(run.get("lastBarDate"), run.get("lastBarTime")),
+                "stalled": bool((_lag_days(run.get("lastBarDate"), run.get("lastBarTime")) or 0) >= 5),
                 "lastError": run.get("lastError"), "tickCount": run.get("tickCount"),
                 "fillModel": run.get("fillModel"), "initial": run.get("initial"),
                 "position": acc.position(last_price), "stats": st,
@@ -445,11 +470,13 @@ class Runner:
                         idx = max(0, len(bars) - 2)
                     run["startedFromIdx"] = idx
                     run["barProcessed"] = max(1, idx)
+                    # 起点前一根的日期作为初始游标：重放会从 idx 那根开始
+                    run["lastBarDate"] = str(bars[max(0, idx - 1)]["t"])[:10]
                     run["benchmarkStart"] = bars[idx]["close"]
                     run["benchmarkStartDate"] = str(bars[idx]["t"])[:10]
                     self.store.upsert_run(run)
 
-                start_i = max(1, int(run["barProcessed"]))
+                start_i = self._cursor_start(run, bars, complete_n)
                 new_trades = []
                 new_equity = []
                 new_signals = []
@@ -487,6 +514,42 @@ class Runner:
 
     # --------------------------------------------------------- 回放（共用）
 
+    def _cursor_start(self, run, bars, complete_n):
+        """返回本轮要从第几根K线开始重放。**日期游标优先**，位置索引只作兜底。
+
+        为什么要改成日期口径（这是一次真实事故的修复）：
+        引擎每次固定取 800 根（`self.fetch_bars(..., 800)`），拿到的是一个**滑动窗口**，
+        而位置索引 `barProcessed` 只在「窗口不滑、序列只增长」时才成立。事故链条：
+        首次取到的根数比 800 多 1（801）→ `barProcessed` 被推到 801 → 此后窗口只有 800 根，
+        `start_i(801) >= complete_n(≤800)` 永远成立 → **replay 分支再也不进入**，
+        任务从此冻结在创建时的状态。而 `tickCount` 照涨、`lastBarTime` 照更新（由盘中分支写入），
+        界面上看起来一切正常 —— 实测四个任务 3000+ 次 tick、一整天K线都没推进，
+        用户看到的现象就是「策略跟踪里全是空仓」。
+
+        返回值等于 `complete_n` 表示没有更新的已收盘K线（本轮只做盘中与风控）。
+        """
+        last_date = str(run.get("lastBarDate") or "")[:10]
+        if not last_date:
+            # 旧任务迁移（只有位置索引）：用「已记录事件的最晚日期」与创建日取较大者。
+            # 该日期之后在冻结事故中确实从未被处理过，而重放「无事件区间」是幂等的
+            # （不会凭空造出交易，也不会重复计数已有交易），所以这个迁移不会重复计数。
+            cands = [str(run.get("createdDate") or "")[:10],
+                     str(run.get("executedOnDate") or "")[:10]]
+            for t in (run.get("trades") or []):
+                cands.append(str(t.get("out_date") or "")[:10])
+                cands.append(str(t.get("in_date") or "")[:10])
+            last_date = max([c for c in cands if c] or [""])
+            if last_date:
+                run["lastBarDate"] = last_date
+                run["cursorMigrated"] = True
+        if last_date:
+            for i in range(1, complete_n):
+                if str(bars[i]["t"])[:10] > last_date:
+                    return i
+            return complete_n
+        # 全新任务：用位置索引建立起点
+        return max(1, min(int(run.get("barProcessed") or 0), complete_n))
+
     def _replay(self, run, acc, bars, from_idx, to_idx, _a, _b,
                 out_trades, out_equity, out_signals, orderbook=None):
         """处理 [from_idx, to_idx) 区间的已收盘K线。
@@ -515,6 +578,9 @@ class Runner:
             acc.mark_bars(1)
             out_equity.append(self._equity_point(run, acc, bar, bar["close"]))
             run["barProcessed"] = i + 1
+            # 日期游标：记录「最后一根已处理的已收盘K线」的日期。它才是推进任务的权威口径 ——
+            # 位置索引 barProcessed 在固定长度滑动窗口下会指错（见 _cursor_start 的说明）
+            run["lastBarDate"] = date
             run["lastBarTime"] = str(bar["t"])
             self._emit_bar(run, bar, i)
 
@@ -646,7 +712,7 @@ class Runner:
             "fillModel": model,
             "participation": float(clip(cfg.get("participation") or 0.05, 0.005, 0.5)),
             "metricsMode": "simple" if str(cfg.get("metricsMode") or "compound") == "simple" else "compound",
-            "pending": None, "barProcessed": 0, "startedFromIdx": 0,
+            "pending": None, "barProcessed": 0, "lastBarDate": None, "startedFromIdx": 0,
             "executedOnDate": None, "qty": 0,
         }
         acc = Account(initial, market=market, fee=run["fee"], slippage=run["slippage"],
@@ -868,7 +934,7 @@ class Runner:
 
     def _reset_records(self, run):
         run.update({
-            "barProcessed": 0, "startedFromIdx": 0, "pending": None, "cash": run["initial"],
+            "barProcessed": 0, "lastBarDate": None, "startedFromIdx": 0, "pending": None, "cash": run["initial"],
             "qty": 0, "entryPrice": None, "entryDate": None, "entryIdx": 0, "entryFee": 0,
             "entryPhase": None, "executedOnDate": None, "feeTotal": 0.0, "slippageTotal": 0.0,
             "skippedBuys": 0, "benchmarkStart": None, "benchmarkStartDate": None,

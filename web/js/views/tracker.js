@@ -342,11 +342,28 @@
       listHost.appendChild(ui.tbl({
         cols: [
           {
-            key: 'status', label: '状态', noSort: true, width: '74px',
-            render: (r) => h('span', {
-              class: 'chip ' + (r.status === 'running' ? 'accent' : ''),
-              text: r.status === 'running' ? '跟踪中' : '已暂停',
-            }),
+            key: 'status', label: '状态', noSort: true, width: '92px',
+            // 除了「跟踪中」，还必须能看到引擎**消化到哪一天**：曾经出现过游标静默冻结的
+            // 事故（任务全是空仓、tick 次数照涨、界面毫无提示），所以把推进健康度做成显式提示
+            render: (r) => {
+              const kids = [h('span', {
+                class: 'chip ' + (r.status === 'running' ? 'accent' : ''),
+                text: r.status === 'running' ? '跟踪中' : '已暂停',
+              })];
+              if (r.stalled) {
+                kids.push(h('span', {
+                  class: 'chip warn', text: '落后 ' + r.lagDays + ' 天',
+                  title: '引擎已处理至 ' + (r.lastBarDate || '?') + '，最新K线 ' + (r.availableTo || '?')
+                    + '：尚未消化新K线，请检查数据源或重启引擎',
+                }));
+              } else if (r.lastBarDate) {
+                kids.push(h('span', {
+                  class: 'dim3', text: '至 ' + String(r.lastBarDate).slice(5),
+                  title: '已处理至 ' + r.lastBarDate + (r.availableTo ? '，最新K线 ' + r.availableTo : ''),
+                }));
+              }
+              return h('span', {}, kids);
+            },
           },
           {
             key: 'name', label: '标的', noSort: true,
