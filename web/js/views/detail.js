@@ -737,14 +737,25 @@
         ['折算股数', isNum(k.shares) ? F.num(k.shares, 0) + ' 股' : '—'],
       ])));
 
-      /* 交易计划 */
-      advisorBody.appendChild(advGroup('交易计划', '入场 / 止损 / 目标位由服务端模型给出，仅作计划参考', advMetrics([
-        ['建议买入', F.price(plan.entry, market)],
-        ['止损', F.price(plan.stop, market), 'down'],
-        ['目标1', F.price(plan.target1, market), 'up'],
-        ['目标2', F.price(plan.target2, market), 'up'],
+      /* 交易计划 —— 必须按方向渲染标签：
+         档位为减仓/卖出/回避时，服务端给的是**离场计划**（止损在上方 = 涨破则离场判断失效，
+         目标在下方 = 下行参考），若照买入计划的标签显示，用户会读成
+         「止损价 42.04 高于建议买入价 38.66」这种自相矛盾的买入计划（实际发生过的误读）。
+         服务端已在 plan.labels 里给出各方位的正确标签，这里以它为准，缺失时按方向兜底。 */
+      const pLabels = plan.labels || {};
+      const isExit = plan.direction === 'exit';
+      const noNewPosition = plan.tradeable === false || isExit;
+      advisorBody.appendChild(advGroup('交易计划', isExit
+        ? '当前档位不新开仓位：下方是**离场判断**（参考价 / 涨破即失效 / 下行目标），不是买入价与止损'
+        : '入场 / 止损 / 目标位由服务端模型给出，仅作计划参考', advMetrics([
+        [pLabels.entry || (isExit ? '参考价' : '建议买入'), F.price(plan.entry, market),
+          '', noNewPosition ? '不新开仓位' : ''],
+        [pLabels.stop || (isExit ? '离场失效价' : '止损'), F.price(plan.stop, market), isExit ? 'warn' : 'down',
+          isExit ? '涨破则该判断失效' : ''],
+        [pLabels.target1 || (isExit ? '下行目标1' : '目标1'), F.price(plan.target1, market), isExit ? 'down' : 'up'],
+        [pLabels.target2 || (isExit ? '下行目标2' : '目标2'), F.price(plan.target2, market), isExit ? 'down' : 'up'],
         ['盈亏比', F.num(plan.riskReward, 2)],
-        ['方向', adText(plan.direction, '—')],
+        ['方向', (plan.side ? plan.side : adText(plan.direction, '—')) + (noNewPosition ? '（不新开仓位）' : '')],
       ])));
 
       /* 风险 */

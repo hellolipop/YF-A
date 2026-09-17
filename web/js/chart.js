@@ -366,11 +366,20 @@
 
       /* ===== AI 选股叠加层 ===== */
       if (plan) {
-        const planRows = [
-          ['entry', '建议买入', PALETTE.planEntry || '#4d8dff'],
-          ['target1', '目标1', upColor],
-          ['target2', '目标2', upColor],
-          ['stop', '止损', downColor],
+        // 线名与颜色都按方向走：离场计划里「stop」在上方（涨破则判断失效，属上行方向），
+        // 「目标」在下方（下行参考）。照买入计划的标签画，用户会把 42.04 读成买入价上的止损。
+        const isExit = plan.direction === 'exit';
+        const pm = plan.labels || {};
+        const planRows = isExit ? [
+          ['entry', pm.entry || '参考价', PALETTE.planEntry || '#4d8dff'],
+          ['target1', pm.target1 || '下行目标1', downColor],
+          ['target2', pm.target2 || '下行目标2', downColor],
+          ['stop', pm.stop || '离场失效价', upColor],
+        ] : [
+          ['entry', pm.entry || '建议买入', PALETTE.planEntry || '#4d8dff'],
+          ['target1', pm.target1 || '目标1', upColor],
+          ['target2', pm.target2 || '目标2', upColor],
+          ['stop', pm.stop || '止损', downColor],
         ];
         ctx.save();
         ctx.setLineDash([5, 4]);

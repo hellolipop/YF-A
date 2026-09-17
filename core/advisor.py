@@ -659,6 +659,7 @@ def _plan(price, atr, action, fc, market):
     if price is None or price <= 0:
         return {"entry": None, "stop": None, "target1": None, "target2": None,
                 "riskReward": None, "atr": None, "direction": None,
+                "side": None, "tradeable": None, "inverted": None, "labels": None,
                 "forecastTarget": None, "note": "无有效价格，无法给出交易计划"}
     a = atr if (atr and atr > 0) else price * 0.02
     last = _num(fc.get("lastClose"))
@@ -707,9 +708,19 @@ def _plan(price, atr, action, fc, market):
         direction, side = "long", "建仓"
 
     rr = (reward / risk) if risk > 0 else None
-    stop_pct = (1.0 - stop / entry) * 100.0 if direction == "long" else (stop / entry - 1.0) * 100.0
-    note = ("%s计划：现价作参考入场价，止损 %.4f（1.5×ATR，距现价 %.2f%%，且不超过 -12%%），"
-            "目标1 %.4f、目标2 %.4f。" % (side, stop, stop_pct, t1, t2))
+    long_side = direction == "long"
+    stop_pct = (1.0 - stop / entry) * 100.0 if long_side else (stop / entry - 1.0) * 100.0
+    # 一句话必须点明「这是建仓计划还是离场计划」以及「能不能据此买入」：
+    # 离场口径下止损在上方、目标在下方，若只写「止损 X、目标 Y」，用户会读成
+    # 「止损价高于买入价」这种自相矛盾的买入计划（实际发生过的误读）
+    act_label = ACTION_LABEL.get(action, side)
+    if long_side:
+        note = ("建仓计划（档位「%s」）：建议买入 %.4f；止损 %.4f（1.5×ATR，距现价 %.2f%%，"
+                "且不超过 -12%%）；目标1 %.4f、目标2 %.4f。" % (act_label, entry, stop, stop_pct, t1, t2))
+    else:
+        note = ("离场计划（档位「%s」，**不新开仓位**）：参考价 %.4f；涨破 %.4f 则离场判断失效"
+                "（1.5×ATR，距现价 %.2f%%）；下行目标1 %.4f、下行目标2 %.4f。"
+                % (act_label, entry, stop, stop_pct, t1, t2))
     if anchors:
         note += "其中" + "、".join(anchors) + "（统计分位，取不到时才退回 ATR 倍数）。"
     else:
@@ -721,6 +732,17 @@ def _plan(price, atr, action, fc, market):
         "riskReward": _r(rr, 3), "atr": _r(a, 4),
         "forecastTarget": _r(hi_p if direction == "long" else lo_p, 4),
         "direction": direction, "note": note,
+        # 让消费方无需自己推断语义：side（建仓/离场）、tradeable（能否据此新开仓位）、
+        # inverted（是否「止损在上、目标在下」的离场口径）、labels（各方位的正确中文标签）。
+        # 界面与导出只要照 labels 渲染，就不会再把离场计划标成「建议买入 / 止损」
+        "side": side, "tradeable": long_side, "inverted": not long_side,
+        "labels": ({
+            "entry": "建议买入", "stop": "止损（跌破离场）",
+            "target1": "目标1（上行）", "target2": "目标2（上行）",
+        } if long_side else {
+            "entry": "参考价（不新开仓位）", "stop": "离场失效价（涨破则判断失效）",
+            "target1": "下行目标1（离场参考）", "target2": "下行目标2（离场参考）",
+        }),
     }
 
 
