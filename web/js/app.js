@@ -28,12 +28,15 @@
     pollMs: store.get('pollMs', 6000),
     colorMode: store.get('colorMode', 'cn'),
     watch: store.get('watchlist', null) || PRESET_WATCH.slice(),
+    /* 美股数据源：'' = 常规时段（腾讯 / 东财）；'binance' = 币安 bStocks · 7×24（代币化美股） */
+    usSource: store.get('usSource', '') === 'binance' ? 'binance' : '',
     active: null,
   };
 
   const viewRoot = document.getElementById('view-root');
   const rail = document.getElementById('rail');
   const marketSwitch = document.getElementById('market-switch');
+  const usSourceSwitch = document.getElementById('us-source');
   const toasts = document.getElementById('toasts');
   const palette = document.getElementById('palette');
   const paletteInput = document.getElementById('palette-input');
@@ -130,6 +133,7 @@
       state.market = m;
       store.set('market', m);
       Array.prototype.forEach.call(marketSwitch.children, (b) => b.classList.toggle('active', b.dataset.market === m));
+      paintUsSource();
       document.documentElement.setAttribute('data-color', state.colorMode === 'us' ? 'us' : 'cn');
       if (state.view === 'detail' && state.symbol.market !== m) {
         state.symbol = Object.assign({}, DEFAULT_SYMBOL[m]);
@@ -137,7 +141,28 @@
       }
       render();
     },
+    /* 美股数据源切换：只影响「美股」的取数口径，A股与其它市场逻辑完全不变 */
+    setUsSource(v) {
+      const next = v === 'binance' ? 'binance' : '';
+      if (next === state.usSource) return;
+      state.usSource = next;
+      store.set('usSource', next);
+      paintUsSource();
+      toast(next
+        ? '美股数据源已切为「币安 bStocks · 7×24」：代币化美股、7×24 连续行情，口径差异见个股详情页说明'
+        : '美股数据源已切回「常规时段（腾讯 / 东财）」', 'info');
+      render();
+    },
   };
+
+  /* 顶栏「美股源」按钮：只在美股时出现（A股没有这个维度） */
+  function paintUsSource() {
+    if (!usSourceSwitch) return;
+    usSourceSwitch.classList.toggle('hidden', state.market !== 'us');
+    Array.prototype.forEach.call(usSourceSwitch.children, (b) => {
+      b.classList.toggle('active', (b.dataset.src || '') === state.usSource);
+    });
+  }
 
   const VIEWS = {
     market: '市场总览', watchlist: '自选股', detail: '个股详情', screener: '选股器',
@@ -378,6 +403,13 @@
     if (b) ctx.setMarket(b.dataset.market);
   });
 
+  if (usSourceSwitch) {
+    usSourceSwitch.addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-src]');
+      if (b) ctx.setUsSource(b.dataset.src || '');
+    });
+  }
+
   rail.addEventListener('click', (e) => {
     const b = e.target.closest('.rail-item');
     if (b) switchView(b.dataset.view);
@@ -437,6 +469,7 @@
 
   document.documentElement.setAttribute('data-color', state.colorMode === 'us' ? 'us' : 'cn');
   Array.prototype.forEach.call(marketSwitch.children, (b) => b.classList.toggle('active', b.dataset.market === state.market));
+  paintUsSource();
   window.AD.alertEngine.load();
   updateAlertBadge();
   window.AD.alertEngine.start(ctx);

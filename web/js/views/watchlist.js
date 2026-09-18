@@ -74,7 +74,9 @@
     function cols() {
       return [
         { key: 'name', label: '名称', noSort: true, render: (r) => h('span', {}, [ui.cells.name(r), h('span', { class: 'chip', style: { marginLeft: '6px' }, text: r.market === 'us' ? '美股' : 'A股' })]) },
-        { key: 'price', label: '最新价', cls: 'n', value: (r) => r.price, render: (r) => ui.cells.price(r) },
+        { key: 'price', label: '最新价', cls: 'n', value: (r) => r.price, render: (r) => (r._noPair
+          ? h('span', { class: 'chip warn', text: '无币安交易对' })
+          : ui.cells.price(r)) },
         { key: 'changePct', label: '涨跌幅', cls: 'n', value: (r) => r.changePct, render: (r) => pct(r.changePct) },
         { key: 'change', label: '涨跌额', cls: 'n', value: (r) => r.change, render: (r) => h('span', { class: 'num ' + F.dir(r.change), text: F.signed(r.change, 2) }) },
         { key: 'amount', label: '成交额', cls: 'n', value: (r) => r.amount, render: (r) => ui.cells.amount(r) },
@@ -114,18 +116,27 @@
       }
       const byMarket = { cn: [], us: [] };
       list.forEach((it) => { (byMarket[it.market] || byMarket.cn).push(it.code); });
+      /* 美股按顶栏选择的数据源取价（常规时段 / 币安 bStocks 7×24）；A股 恒用默认源 */
+      const src = ctx.state.usSource || '';
       const tasks = [];
       if (byMarket.cn.length) tasks.push(api.quote('cn', byMarket.cn));
-      if (byMarket.us.length) tasks.push(api.quote('us', byMarket.us));
+      if (byMarket.us.length) tasks.push(api.quote('us', byMarket.us, src));
       try {
         const res = await Promise.all(tasks);
         const map = {};
-        res.forEach((r) => (r.rows || []).forEach((q) => { map[q.market + ':' + q.code] = q; }));
+        let noPair = [];
+        res.forEach((r) => {
+          (r.rows || []).forEach((q) => { map[q.market + ':' + q.code] = q; });
+          if (r.missing && r.missing.length) noPair = noPair.concat(r.missing);
+        });
         state.rows = list.map((it) => {
           const q = map[it.market + ':' + it.code];
-          return q ? Object.assign({}, q, { name: q.name || it.name }) : {
+          if (q) return Object.assign({}, q, { name: q.name || it.name });
+          return {
             market: it.market, code: it.code, name: it.name, price: null, changePct: null,
             amount: null, turnover: null, volumeRatio: null, marketCap: null, peTtm: null, amplitude: null,
+            /* 币安源下「没有代币化交易对」与「取数失败」要分开说，不能都显示成 — */
+            _noPair: noPair.indexOf(it.code) >= 0,
             _missing: true,
           };
         }).filter((r) => !state.filter || (r.name || '').indexOf(state.filter) >= 0 || r.code.indexOf(state.filter) >= 0);
@@ -136,6 +147,10 @@
           ' 只 · 美股 ' + byMarket.us.length + ' 只 · 更新 ' + F.clock(Date.now());
         hint += ' · 上涨 ' + up + ' / 下跌 ' + down;
         if (state.filter) hint += ' · 筛选「' + state.filter + '」命中 ' + state.rows.length + ' 只';
+        if (src === 'binance') {
+          hint += ' · 美股源：币安 bStocks · 7×24（滚动 24 小时口径、USDT 计价）';
+          if (noPair.length) hint += ' · ' + noPair.length + ' 只无币安代币化交易对（' + noPair.slice(0, 3).join(' / ') + '）';
+        }
         paint(statHost, [hint]);                     /* 统计说明原位改写，不会先清空再填 */
         mountInto(tableHost, table);
         table.update(state.rows);                    /* 增量更新表体：滚动位置与 hover 都保留 */

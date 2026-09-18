@@ -24,6 +24,12 @@
       <button data-market="us" role="tab">美股</button>
     </div>
 
+    <!-- 美股数据源（仅美股时出现）：常规时段按美东交易日；币安 bStocks 是 1:1 代币化美股，7×24 -->
+    <div class="market-switch sub hidden" id="us-source" role="tablist" aria-label="美股数据源">
+      <button data-src="" class="active" role="tab" title="腾讯 / 东财：按美股交易日口径（美东开盘 / 收盘），盘后与周末是静态价">常规时段</button>
+      <button data-src="binance" role="tab" title="币安 bStocks（1:1 代币化美股）：7×24 连续行情，盘后与周末也能看到成交；口径差异见个股详情页说明">币安 7×24</button>
+    </div>
+
     <button class="search-trigger" id="search-trigger">
       <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6"/><path d="M10.6 10.6L14 14"/></svg>
       <span>搜索代码 / 名称 / 拼音</span>

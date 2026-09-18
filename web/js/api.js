@@ -95,15 +95,23 @@
     news: (limit) => get('news', { limit: limit || 30 }),
     search: (q) => get('search', { q }, { noDedupe: true }),
 
-    quote: (market, codes) => get('quote', { market, codes: (codes || []).join(',') }, { noDedupe: true }),
-    stock: (market, code) => get('stock', { market, code }, { noDedupe: true }),
-    orderbook: (market, code) => get('orderbook', { market, code }, { noDedupe: true }),
+    quote: (market, codes, source) => get('quote', {
+      market, codes: (codes || []).join(','), source: source || undefined,
+    }, { noDedupe: true }),
+    stock: (market, code, source) => get('stock', { market, code, source: source || undefined }, { noDedupe: true }),
+    orderbook: (market, code, source) => get('orderbook', { market, code, source: source || undefined }, { noDedupe: true }),
 
-    kline: (market, code, period, fq, limit) => get('kline', {
+    /* 美股可选数据源（常规时段 / 币安 bStocks 7×24）与各自的口径说明 */
+    usSources: () => get('us/source', {}, { noDedupe: true }),
+
+    kline: (market, code, period, fq, limit, source) => get('kline', {
       market, code, period: period || 'day', fq: fq === undefined ? 1 : fq, limit: limit || 320,
+      source: source || undefined,
     }, { noDedupe: true }),
 
-    trends: (market, code, days) => get('trends', { market, code, days: days || 1 }, { noDedupe: true }),
+    trends: (market, code, days, source) => get('trends', {
+      market, code, days: days || 1, source: source || undefined,
+    }, { noDedupe: true }),
     fundflow: (market, code) => get('fundflow', { market, code }),
 
     screener(market, filters, sort, order, page, size) {

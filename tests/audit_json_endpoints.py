@@ -57,6 +57,13 @@ for p in ("/api/health", "/api/sysinfo", "/api/logs?limit=50",
           "/api/quote?market=cn&codes=600519", "/api/kline?market=cn&code=600519&period=day&limit=120",
           "/api/stock?market=cn&code=600519", "/api/orderbook?market=cn&code=600519",
           "/api/trends?market=cn&code=600519", "/api/fundflow?market=cn&code=600519",
+          # 美股数据源（常规时段 / 币安 bStocks 7×24）：清单与币安源的四类出口
+          "/api/us/source",
+          "/api/stock?market=us&code=AAPL&source=binance",
+          "/api/kline?market=us&code=AAPL&period=day&limit=120&source=binance",
+          "/api/trends?market=us&code=AAPL&source=binance",
+          "/api/orderbook?market=us&code=AAPL&source=binance",
+          "/api/quote?market=us&codes=AAPL,NVDA&source=binance",
           "/api/list?market=cn&page=1&size=10"):
     hit(p)
 

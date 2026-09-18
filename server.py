@@ -145,7 +145,14 @@ def cached(key, ttl, producer, allow_stale=True):
             raise
 
 
-def http_get(url, referer="https://quote.eastmoney.com/", encoding="utf-8", raw=False, retry=RETRY):
+def http_get(url, referer="https://quote.eastmoney.com/", encoding="utf-8", raw=False, retry=RETRY,
+             soft_http_error=False):
+    """抓取上游 JSON。
+
+    soft_http_error：把上游的 4xx 响应体原样解析后返回，而不是抛异常。
+    币安这类接口用 400 + {"code":-1121,"msg":"Invalid symbol."} 说明「交易对不存在」，
+    这是**确定性结论**、不该重试，也不该被当成网络故障——只有调用方显式开启才生效。
+    """
     ensure_ssl()
     last_err = None
     for _ in range(retry + 1):
@@ -160,6 +167,16 @@ def http_get(url, referer="https://quote.eastmoney.com/", encoding="utf-8", raw=
                     data = gzip.decompress(data)
             return data.decode(encoding, errors="ignore") if raw else json.loads(
                 data.decode("utf-8", errors="ignore"))
+        except urllib.error.HTTPError as exc:
+            if soft_http_error and 400 <= int(getattr(exc, "code", 0) or 0) < 500:
+                try:
+                    body = json.loads(exc.read().decode("utf-8", errors="ignore"))
+                except Exception:  # noqa: BLE001
+                    body = None
+                if isinstance(body, dict) and body.get("code") is not None:
+                    return body
+            last_err = exc
+            time.sleep(0.2)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             time.sleep(0.2)
@@ -332,8 +349,16 @@ def tx_parse(sym, f, market):
     }
 
 
-def quotes(market, codes):
-    """批量实时报价（腾讯为主，A股缺失时用新浪兜底）"""
+def quotes(market, codes, source=None):
+    """批量实时报价（腾讯为主，A股缺失时用新浪兜底）
+
+    source="binance"：走币安代币化美股（7×24）；这是「美股」下的一个数据源维度，
+    不改变市场语义（market 仍是 us），A股与其它功能都不受影响。
+    """
+    if source == "binance":
+        if market != "us":
+            raise RuntimeError("币安代币化美股只适用于美股（当前 market=%s）" % market)
+        return bs_quotes(codes)
     symbols = tx_symbols(market, codes)
     raw = {}
     err = None
@@ -591,6 +616,238 @@ def sina_kline(market, code, period, fq, limit):
     return bars, "新浪财经（不复权）"
 
 
+# --------------------------------------------------------------------------- #
+# 币安代币化美股（bStocks）：美股下的一个「数据源」选项，7×24 连续行情
+#   · 交易对形如 AAPLBUSDT（<代码>B + USDT），是 1:1 追踪标的的代币化凭证，
+#     美股常规时段休市、盘后与周末仍在成交 —— 这是常规美股行情源给不了的；
+#   · 公开行情接口，无需密钥：/ticker/24hr、/klines、/depth、/ping；
+#   · 口径与常规美股**不同**，必须如实标注（BS_NOTES 会随接口一起返回给界面）：
+#       1) 涨跌是「滚动 24 小时」，不是「当日」；
+#       2) 日/周/月K 按 UTC 换日（北京时间 08:00），不是美东交易日；
+#       3) USDT 计价（≈美元，但不是美元本身）；
+#       4) 代币化凭证、非直接持股，可能有溢价 / 折价；
+#       5) 支持碎股，成交量与盘口数量可以是小数。
+# --------------------------------------------------------------------------- #
+
+BINANCE_HOSTS = ("https://data-api.binance.vision", "https://api.binance.com")
+BS_QUOTE_ASSET = "USDT"
+BS_LABEL = "币安 bStocks · 7×24"
+BS_INTERVAL = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1h",
+               "day": "1d", "week": "1w", "month": "1M"}
+BS_MAX_LIMIT = 1000                       # 币安单次请求上限
+BS_NOT_FOUND = (-1121, -1100, -1101, -1102)
+BS_NOTE_24H = "涨跌为滚动 24 小时口径（非「当日」）"
+BS_NOTE_UTC = "日 / 周 / 月K 按 UTC 换日（北京时间 08:00），非美东交易日"
+BS_NOTE_HISTORY = "bStocks 自 2026-06 起才有成交，日K 历史每只仅约 50~100 根（长周期指标与回测请用常规源）"
+BS_NOTE_USDT = "USDT 计价（≈美元）"
+BS_NOTE_TOKEN = "代币化凭证（1:1 追踪标的），不是直接持股，可能有溢价 / 折价"
+BS_NOTE_FRAC = "支持碎股，成交量与盘口数量可为小数"
+BS_NOTES = (BS_NOTE_24H, BS_NOTE_UTC, BS_NOTE_HISTORY, BS_NOTE_USDT, BS_NOTE_TOKEN, BS_NOTE_FRAC)
+
+
+def bs_pair(code):
+    """AAPL → AAPLBUSDT；BRK.B / BRK-B → BRKBUSDT（币安交易对不含点与横线）"""
+    c = re.sub(r"[^0-9A-Za-z]", "", str(code or "")).upper()
+    if not c or len(c) > 12 or c.isdigit():      # 纯数字是 A 股代码，不是美股
+        return None
+    return "%sB%s" % (c, BS_QUOTE_ASSET)
+
+
+def bs_is_missing(exc):
+    """币安明确回答「没有这个交易对」：与网络故障要分开处理"""
+    s = str(exc)
+    return "-1121" in s or "Invalid symbol" in s
+
+
+def binance_get(path, params):
+    last = None
+    for host in BINANCE_HOSTS:
+        try:
+            return http_get(host + path + "?" + urllib.parse.urlencode(params),
+                            referer="https://www.binance.com/", soft_http_error=True)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise RuntimeError("币安行情接口不可用（%d 个域名均失败）: %s"
+                       % (len(BINANCE_HOSTS), str(last)[:110]))
+
+
+def bs_guard(code, res):
+    """把币安的 -1121 翻译成用户能看懂的话，并说明查的是哪个交易对"""
+    if isinstance(res, dict) and res.get("code") in BS_NOT_FOUND:
+        raise RuntimeError("该标的暂无币安代币化美股交易对（%s，查询交易对 %s）"
+                           % (str(code).upper(), bs_pair(code)))
+
+
+def bs_time(ms, intraday):
+    """毫秒时间戳 → 项目时间口径。
+
+    分钟线用北京时间（与本机其它行情一致，坐标轴好读）；
+    日/周/月线用 UTC 日期 —— 币安按 UTC 换日，标成北京时间会让人误以为是美东交易日。
+    """
+    try:
+        secs = int(ms) // 1000
+    except (TypeError, ValueError):
+        return ""
+    if intraday:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(secs))
+    return time.strftime("%Y-%m-%d", time.gmtime(secs))
+
+
+def bs_quote_row(code, name=None):
+    """单只 bStocks 行情 → 与 tx_parse 对齐的字段（取不到的字段一律 None，不臆造）"""
+    pair = bs_pair(code)
+    if not pair:
+        raise RuntimeError("美股代码不合法：%s" % code)
+
+    def build():
+        res = binance_get("/api/v3/ticker/24hr", {"symbol": pair})
+        bs_guard(code, res)
+        if not isinstance(res, dict) or not res.get("symbol"):
+            raise RuntimeError("币安未返回 %s 的行情" % pair)
+        bid, ask = num(res.get("bidPrice")), num(res.get("askPrice"))
+        return {
+            "code": str(code).upper(), "symbol": pair, "name": name or str(code).upper(),
+            "market": "us", "price": num(res.get("lastPrice")),
+            "prevClose": num(res.get("prevClosePrice")),
+            "change": num(res.get("priceChange")), "changePct": num(res.get("priceChangePercent")),
+            "open": num(res.get("openPrice")), "high": num(res.get("highPrice")),
+            "low": num(res.get("lowPrice")),
+            "volume": num(res.get("volume")), "amount": num(res.get("quoteVolume")),
+            "avgPrice": num(res.get("weightedAvgPrice")),
+            "turnover": None, "pe": None, "peTtm": None, "pb": None,
+            "marketCap": None, "floatCap": None, "amplitude": None, "volumeRatio": None,
+            "limitUp": None, "limitDown": None, "week52High": None, "week52Low": None,
+            "currency": BS_QUOTE_ASSET, "outer": None, "inner": None,
+            "bids": [{"price": bid, "volume": num(res.get("bidQty"))}] if bid else [],
+            "asks": [{"price": ask, "volume": num(res.get("askQty"))}] if ask else [],
+            "window": "24h",            # 界面据此把「今开/最高/最低/涨跌」标成 24 小时口径
+            "session": "7x24",
+            "source": BS_LABEL, "updated": now_ms(),
+        }
+
+    return cached("bs_q_%s" % pair, 3, build)
+
+
+def bs_quotes(codes):
+    """批量报价：币安的批量查询只要有一个无效标就整体报错，所以逐只取（并发 5）"""
+    def one(c):
+        try:
+            return bs_quote_row(c)
+        except Exception:  # noqa: BLE001
+            return None
+
+    out = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for r in pool.map(one, codes):
+            if r:
+                out.append(r)
+    return out
+
+
+def bs_missing_codes(codes):
+    """哪些代码没有币安交易对（前端据此标注「无 bStocks」而不是显示成空值）"""
+    miss = []
+    for c in codes:
+        pair = bs_pair(c)
+        if not pair:
+            miss.append(c)
+            continue
+        try:
+            res = binance_get("/api/v3/ticker/price", {"symbol": pair})
+            if isinstance(res, dict) and res.get("code") in BS_NOT_FOUND:
+                miss.append(c)
+        except Exception:  # noqa: BLE001
+            continue          # 网络问题不算「不存在」，不误报
+    return miss
+
+
+def bs_kline(code, period, limit):
+    interval = BS_INTERVAL.get(period)
+    if not interval:
+        raise RuntimeError("币安不支持该周期：%s" % period)
+    pair = bs_pair(code)
+    n = max(10, min(int(limit or 320), BS_MAX_LIMIT))
+    res = binance_get("/api/v3/klines", {"symbol": pair, "interval": interval, "limit": n})
+    bs_guard(code, res)
+    if not isinstance(res, list) or not res:
+        raise RuntimeError("币安K线为空（%s）" % pair)
+    intraday = period not in ("day", "week", "month")
+    bars = []
+    for r in res:
+        if not isinstance(r, list) or len(r) < 6:
+            continue
+        bars.append({"t": bs_time(r[0], intraday), "open": num(r[1]), "close": num(r[4]),
+                     "high": num(r[2]), "low": num(r[3]),
+                     "volume": num(r[5]), "amount": num(r[7]) if len(r) > 7 else None})
+    if not bars:
+        raise RuntimeError("币安K线解析为空（%s）" % pair)
+    return bars, BS_LABEL
+
+
+def bs_trends(code, hours=24):
+    """7×24 没有开盘 / 收盘，所以「分时」= 最近 N 小时的 5 分钟线（默认 24 小时）"""
+    pair = bs_pair(code)
+    n = max(30, min(int((hours or 24) * 12), 288))
+    res = binance_get("/api/v3/klines", {"symbol": pair, "interval": "5m", "limit": n})
+    bs_guard(code, res)
+    if not isinstance(res, list) or not res:
+        raise RuntimeError("币安分时为空（%s）" % pair)
+    pts, cum_v, cum_a = [], 0.0, 0.0
+    for r in res:
+        if not isinstance(r, list) or len(r) < 6:
+            continue
+        vol = num(r[5]) or 0.0
+        amt = num(r[7]) if len(r) > 7 else None
+        cum_v += vol
+        cum_a += amt or 0.0
+        pts.append({"t": bs_time(r[0], True), "price": num(r[4]), "volume": vol, "amount": amt,
+                    "avg": (cum_a / cum_v) if cum_v else None})
+    # 参考线取「上一 UTC 日收盘」：比「24 小时前的价格」更有意义，也更容易核对
+    prev = None
+    try:
+        d = binance_get("/api/v3/klines", {"symbol": pair, "interval": "1d", "limit": 2})
+        if isinstance(d, list) and len(d) >= 2:
+            prev = num(d[-2][4])
+    except Exception:  # noqa: BLE001
+        prev = None
+    return {"code": str(code).upper(), "market": "us", "prevClose": prev, "points": pts,
+            "baseline": "上一 UTC 日收盘", "window": "24h", "session": "7x24",
+            "source": BS_LABEL, "updated": now_ms()}
+
+
+def bs_depth(code, limit=5):
+    pair = bs_pair(code)
+    res = binance_get("/api/v3/depth", {"symbol": pair, "limit": max(1, min(int(limit), 20))})
+    bs_guard(code, res)
+    if not isinstance(res, dict):
+        raise RuntimeError("币安盘口不可用（%s）" % pair)
+    bids = [{"price": num(p), "volume": num(v)} for p, v in (res.get("bids") or [])]
+    asks = [{"price": num(p), "volume": num(v)} for p, v in (res.get("asks") or [])]
+    return {"code": str(code).upper(), "market": "us", "supported": bool(bids or asks),
+            "bids": bids, "asks": asks, "outer": None, "inner": None, "avgPrice": None,
+            "note": "币安现货深度：一档起连续五档（本项目其它美股源只有最优一档）",
+            "source": BS_LABEL}
+
+
+def bs_source_info():
+    """给前端渲染「美股数据源」选项（含可用性探测与口径说明）"""
+    available, err = True, None
+    try:
+        binance_get("/api/v3/ping", {})
+    except Exception as exc:  # noqa: BLE001
+        available, err = False, str(exc)[:160]
+    return {
+        "market": "us", "current": None,
+        "sources": [
+            {"value": "", "label": "常规时段（腾讯 / 东财）", "sevenBy24": False, "available": True,
+             "notes": ["按美股交易日口径（美东开盘 / 收盘）",
+                       "常规时段之外没有实时成交，盘后与周末价格是静态的"]},
+            {"value": "binance", "label": BS_LABEL, "sevenBy24": True, "available": available,
+             "error": err, "notes": list(BS_NOTES)},
+        ],
+    }
+
+
 def aggregate_bars(bars, minutes):
     """把 1 分钟序列聚合成 N 分钟K线"""
     out, bucket = [], None
@@ -629,8 +886,18 @@ def fq_note_of(source, fq):
     return None
 
 
-def api_kline(market, code, period, fq, limit):
+def api_kline(market, code, period, fq, limit, source=None):
     def build():
+        if source == "binance":
+            if market != "us":
+                raise RuntimeError("币安代币化美股只适用于美股（当前 market=%s）" % market)
+            bars, src = bs_kline(code, period, limit)
+            return {"code": code, "market": market, "period": period, "fq": fq,
+                    "bars": bars, "source": src, "session": "7x24", "window": "utc-day",
+                    "sevenBy24": True, "notes": list(BS_NOTES),
+                    "chartNotes": [BS_NOTE_UTC, BS_NOTE_HISTORY],
+                    "fqNote": "代币化美股价格本身即含调整，没有复权口径（请求的 fq=%s 不适用）" % fq,
+                    "updated": now_ms()}
         attempts = []
         errors = []
         if period in ("day", "week", "month", "5m", "15m", "30m", "60m"):
@@ -673,12 +940,17 @@ def api_kline(market, code, period, fq, limit):
         return {"code": code, "market": market, "period": period, "fq": fq, "bars": [],
                 "source": None, "error": "；".join(errors) or "无数据", "updated": now_ms()}
 
-    return cached("kline_v3_%s_%s_%s_%s_%s" % (market, code, period, fq, limit), 20, build)
+    return cached("kline_v3_%s_%s_%s_%s_%s_%s" % (market, code, period, fq, limit, source or "-"), 20, build)
 
 
-def api_trends(market, code, days=1):
-    """分时：东财 trends2 优先（含均价/成交额），腾讯 minute 兜底"""
+def api_trends(market, code, days=1, source=None):
+    """分时：东财 trends2 优先（含均价/成交额），腾讯 minute 兜底；
+    source="binance" 时用币安 5 分钟线拼出「近 24 小时」（7×24 没有开盘 / 收盘）"""
     def build():
+        if source == "binance":
+            if market != "us":
+                raise RuntimeError("币安代币化美股只适用于美股（当前 market=%s）" % market)
+            return bs_trends(code, 24)
         errors = []
         try:
             secid = em_secid(market, code)
@@ -750,7 +1022,7 @@ def api_trends(market, code, days=1):
         return {"code": code, "market": market, "prevClose": None, "points": [],
                 "source": None, "error": "；".join(errors), "updated": now_ms()}
 
-    return cached("trends_v3_%s_%s_%d" % (market, code, days), 12, build)
+    return cached("trends_v3_%s_%s_%d_%s" % (market, code, days, source or "-"), 12, build)
 
 
 def date_hint():
@@ -1327,14 +1599,21 @@ def api_fundflow(market, code):
 
 
 
-def api_stock(market, code):
-    """个股详情：腾讯全文行情（含五档、市值、估值）"""
+def api_stock(market, code, source=None):
+    """个股详情：腾讯全文行情（含五档、市值、估值）；币安源则是 bStocks 行情"""
     def build():
-        rows = quotes(market, [code])
+        rows = quotes(market, [code], source)
         if not rows:
             raise RuntimeError("未获取到 %s 行情" % code)
         q = rows[0]
         q["fundflow"] = None
+        if source == "binance":
+            # 币安没有资金流、市值、估值这些字段：一律保持 None（界面按「—」降级），
+            # 并把口径说明随行情一起返回，界面必须展示
+            q["sevenBy24"] = True
+            q["notes"] = list(BS_NOTES)
+            q["updated"] = now_ms()
+            return q
         try:
             ff = api_fundflow(market, code)
             if ff.get("series"):
@@ -1348,7 +1627,7 @@ def api_stock(market, code):
         q["updated"] = now_ms()
         return q
 
-    return cached("stock_v3_%s_%s" % (market, code), 5, build)
+    return cached("stock_v3_%s_%s_%s" % (market, code, source or "-"), 5, build)
 
 
 def now_ms():
@@ -2892,8 +3171,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/movers":
                 return self.send_json(api_movers(market))
             if path == "/api/stock":
-                return self.send_json(api_stock(market, code))
+                return self.send_json(api_stock(market, code, q.get("source") or None))
             if path == "/api/orderbook":
+                if (q.get("source") or None) == "binance" and market == "us":
+                    # 币安源能给到真正的一档起连续五档（其它美股源只有最优一档）
+                    return self.send_json(bs_depth(code, 5))
                 st = api_stock(market, code)
                 return self.send_json({
                     "code": code, "market": market, "supported": bool(st.get("bids")),
@@ -2904,15 +3186,24 @@ class Handler(BaseHTTPRequestHandler):
                     "source": st.get("source")})
             if path == "/api/kline":
                 return self.send_json(api_kline(market, code, q.get("period", "day"),
-                                                int(fnum("fq", 1) or 0), fnum("limit", 320)))
+                                                int(fnum("fq", 1) or 0), fnum("limit", 320),
+                                                q.get("source") or None))
             if path == "/api/trends":
-                return self.send_json(api_trends(market, code, int(fnum("days", 1) or 1)))
+                return self.send_json(api_trends(market, code, int(fnum("days", 1) or 1),
+                                                 q.get("source") or None))
+            if path == "/api/us/source":
+                return self.send_json(bs_source_info())
             if path == "/api/fundflow":
                 return self.send_json(api_fundflow(market, code))
             if path == "/api/quote":
                 codes = [c for c in (q.get("codes") or "").split(",") if c.strip()]
-                return self.send_json({"market": market, "rows": quotes(market, codes),
-                                       "updated": now_ms()})
+                src = q.get("source") or None
+                out = {"market": market, "rows": quotes(market, codes, src),
+                       "source": src, "updated": now_ms()}
+                if src == "binance":
+                    # 哪些代码没有币安交易对：明确告诉界面，别让它显示成「有标的但没数据」
+                    out["missing"] = bs_missing_codes(codes)
+                return self.send_json(out)
             if path == "/api/sectors":
                 return self.send_json(api_sectors(q.get("kind", "industry")))
             if path == "/api/search":

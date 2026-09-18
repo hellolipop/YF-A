@@ -66,6 +66,8 @@
         if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(2) + 'B';
         if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(2) + 'M';
         if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+        /* 碎股：币安 bStocks 的盘口 / 成交量常小于 1 股，toFixed(0) 会显示成 0 */
+        if (v !== 0 && Math.abs(v) < 1) return v.toFixed(3);
         return v.toFixed(0);
       }
       if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(2) + '亿手';

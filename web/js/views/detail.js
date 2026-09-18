@@ -160,6 +160,10 @@
     let updHost = null;          /* 「行情时间 …」标注节点，推送时只改它的文本 */
     let lastQuoteAt = 0;         /* 最近一次行情请求时间（含既有定时器），给降级轮询去重 */
 
+    /* 美股数据源：'' 常规时段（腾讯 / 东财）；'binance' 币安 bStocks 7×24。
+       这是「美股」下的数据源维度，A股 永远走默认源（后端也会拒绝 A股 + binance）。 */
+    function usSrc() { return market === 'us' ? (ctx.state.usSource || '') : ''; }
+
     const headHost = h('div');
     const legendHost = h('div', { class: 'chart-legend' });
     const canvasHost = h('div', { class: 'chart-canvas-wrap' });
@@ -189,6 +193,8 @@
     function renderHead() {
       const q = st.quote || {};
       const d = F.dir(q.changePct);
+      /* 币安 bStocks 的行情是「滚动 24 小时」口径：标签必须跟着改，不能继续写「今开 / 昨收」 */
+      const is24 = q.window === '24h';
       updHost = h('span', { class: 'qh-upd', text: updText(q) });
       const stat = (k, v, cls) => h('div', { class: 'qh-stat' }, [
         h('div', { class: 'k', text: k }),
@@ -204,7 +210,8 @@
             h('div', { style: { marginTop: '3px', display: 'flex', gap: '7px', alignItems: 'center' } }, [
               h('span', { class: 'code', text: (market === 'us' ? 'US:' : '') + code }),
               h('span', { class: 'chip', text: market === 'us' ? '美股' : (code[0] === '6' ? '沪市' : code[0] === '3' ? '创业板' : code[0] === '8' || code[0] === '4' ? '北交所' : '深市') }),
-              q.source ? h('span', { class: 'chip', text: q.source }) : null,
+              q.source ? h('span', { class: 'chip accent', text: q.source }) : null,
+              is24 ? h('span', { class: 'chip', text: '7×24 连续交易' }) : null,
             ]),
           ]),
           h('div', { class: 'qh-px' }, [
@@ -213,14 +220,15 @@
               h('span', { text: F.signed(q.change, 2) }),
               h('span', { text: F.pct(q.changePct) }),
             ]),
+            is24 ? h('div', { class: 'dim3', style: { fontSize: '10.5px', marginTop: '2px' }, text: '涨跌为滚动 24 小时' }) : null,
           ]),
           h('div', { class: 'qh-stats' }, [
-            stat('今开', F.price(q.open, market), F.dir((q.open || 0) - (q.prevClose || 0))),
-            stat('最高', F.price(q.high, market), ''),
-            stat('最低', F.price(q.low, market), ''),
-            stat('昨收', F.price(q.prevClose, market), 'dim'),
-            stat('成交量', F.vol(q.volume, market)),
-            stat('成交额', F.amt(q.amount, market)),
+            stat(is24 ? '24h开' : '今开', F.price(q.open, market), F.dir((q.open || 0) - (q.prevClose || 0))),
+            stat(is24 ? '24h高' : '最高', F.price(q.high, market), ''),
+            stat(is24 ? '24h低' : '最低', F.price(q.low, market), ''),
+            stat(is24 ? '前 24h 收' : '昨收', F.price(q.prevClose, market), 'dim'),
+            stat(is24 ? '24h量' : '成交量', F.vol(q.volume, market)),
+            stat(is24 ? '24h额' : '成交额', F.amt(q.amount, market)),
             stat('换手率', F.num(q.turnover, 2) + '%'),
             stat('量比', F.num(q.volumeRatio, 2)),
             stat('振幅', F.num(q.amplitude, 2) + '%'),
@@ -239,8 +247,12 @@
           updHost,                       /* 「行情时间 …」，推送时就地更新这一个节点 */
           q.week52High ? '52周最高 ' + F.price(q.week52High, market) : '',
           q.week52Low ? '52周最低 ' + F.price(q.week52Low, market) : '',
-          q.avgPrice ? '均价 ' + F.price(q.avgPrice, market) : '',
+          q.avgPrice ? (is24 ? '24h均价 ' : '均价 ') + F.price(q.avgPrice, market) : '',
         ]),
+        /* 数据源口径说明：币安源与常规源差异大，必须在页面顶部讲清（不放进折叠） */
+        (q.notes && q.notes.length) ? h('div', { class: 'legend-inline', style: { marginTop: '6px', lineHeight: '1.8', alignItems: 'baseline' } },
+          [h('span', { class: 'chip warn', text: '口径' })].concat(
+            q.notes.map((n, i) => h('span', { class: 'dim3' }, [(i ? '　·　' : '') + n])))) : null,
       ]);
       /* paint 之后节点可能被复用，重新取一次引用，保证推送刷新的是页面上那个节点 */
       updHost = headHost.querySelector('.qh-upd') || updHost;
@@ -317,6 +329,14 @@
       const s = window.AD.stream;
       if (!s || typeof s.quotes !== 'function' || st.destroyed) return;
       stopQuoteStream();
+      /* 币安 bStocks 不在常规行情推送的通道里（推送按腾讯/东财的标的与时段来），
+         这个源改用页面既有的 6 秒轮询取价，避免两种口径互相覆盖 */
+      if (usSrc() === 'binance') {
+        paintQuoteChip('fallback',
+          '币安 bStocks · 7×24 源：不走常规行情推送（该通道按美股常规时段推送腾讯/东财报价），' +
+          '改用页面每 ' + Math.round(Math.max(6000, ctx.state.pollMs) / 1000) + ' 秒的轮询取价。');
+        return;
+      }
       quoteStream = s.quotes({
         market: market,
         symbols: [code],
@@ -357,8 +377,10 @@
       }
       const maxVol = Math.max.apply(null, ob.asks.concat(ob.bids).map((x) => x.volume || 0).concat([1]));
       const kids = [];
+      const nAsk = ob.asks.length;
       ob.asks.slice().reverse().forEach((a, i) => {
-        const lvl = 5 - i;
+        /* 档位按实际深度编号：常规美股源只有 1 档（不能写成「卖5」），币安源是完整 5 档 */
+        const lvl = nAsk - i;
         kids.push(h('div', { class: 'ob-row' }, [
           h('span', { class: 'lvl', text: '卖' + lvl }),
           h('span', { class: 'px down', text: F.price(a.price, market) }),
@@ -381,10 +403,14 @@
           h('div', { class: 'fill', style: { width: ((b.volume || 0) / maxVol * 100).toFixed(1) + '%', background: 'var(--up)' } }),
         ]));
       });
+      /* 外盘 / 内盘是 A股 口径；币安源没有这两个字段，改为展示该源的盘口说明 */
+      const hasOuterInner = isNum(ob.outer) || isNum(ob.inner);
       paint(obHost, [
         h('div', { class: 'ob' }, kids),
         h('div', { class: 'legend-inline', style: { marginTop: '10px' } }, [
-          '委比参考：外盘 ' + F.vol(ob.outer, market) + ' / 内盘 ' + F.vol(ob.inner, market),
+          hasOuterInner
+            ? '委比参考：外盘 ' + F.vol(ob.outer, market) + ' / 内盘 ' + F.vol(ob.inner, market)
+            : ((ob.note || '该数据源不提供外盘 / 内盘') + (ob.source ? '　·　来源 ' + ob.source : '')),
         ]),
       ]);
     }
@@ -472,7 +498,7 @@
       chartBusy(true, reuse ? '更新中…' : '加载中…');
       try {
         if (isTrend) {
-          const res = await api.trends(market, code);
+          const res = await api.trends(market, code, 1, usSrc());
           if (st.destroyed || !root.isConnected) return;
           const pc = res.prevClose || (st.quote && st.quote.prevClose);
           if (!res.points || !res.points.length) {
@@ -491,10 +517,14 @@
           }
           chart.setData(res.points, { prevClose: pc });
           chartSeries = series;
-          metaHost.textContent = '分时 · ' + (res.source || '') + ' · 昨收 ' + F.price(pc || 0, market);
+          /* 币安源的分时是「近 24 小时」5 分钟线（7×24 没有开盘/收盘），基准线是上一 UTC 日收盘 */
+          metaHost.textContent = (res.window === '24h' ? '近 24 小时（5 分钟）' : '分时') + ' · '
+            + (res.source || '') + (res.window === '24h'
+              ? ' · 基准线 ' + (res.baseline || '—') + ' ' + F.price(pc || 0, market)
+              : ' · 昨收 ' + F.price(pc || 0, market));
           loadSignals();
         } else {
-          const res = await api.kline(market, code, st.period, st.fq, 320);
+          const res = await api.kline(market, code, st.period, st.fq, 320, usSrc());
           if (st.destroyed || !root.isConnected) return;
           if (!res.bars || !res.bars.length) {
             chartNote('暂无K线数据：' + (res.error || '数据源暂不可用'), reuse);
@@ -518,7 +548,8 @@
           /* 复权口径以「实际拿到的数据」为准：上游只有不复权数据时（如新浪兜底）
              必须把差异写出来，不能让「前复权」的标签配着不复权的价格 */
           metaHost.textContent = res.bars.length + ' 根K线 · ' + (res.source || '') + ' · 复权方式 ' +
-            (['不复权', '前复权', '后复权'][st.fq] || '—') + (res.fqNote ? ' · ' + res.fqNote : '');
+            (['不复权', '前复权', '后复权'][st.fq] || '—') + (res.fqNote ? ' · ' + res.fqNote : '') +
+            ((res.chartNotes && res.chartNotes.length) ? ' · ' + res.chartNotes.join(' · ') : '');
           if (st.period !== 'day') loadSignals();
           else runAnalysis(res.bars);
         }
@@ -535,9 +566,10 @@
       if (signalsLoaded) return;
       signalsLoaded = true;
       try {
-        const res = await api.kline(market, code, 'day', 1, 320);
+        const res = await api.kline(market, code, 'day', 1, 320, usSrc());
         if (res.bars && res.bars.length >= 30) runAnalysis(res.bars);
-        else paint(signalHost, [ui.empty('日线数据不足，暂无法生成信号雷达')]);
+        else paint(signalHost, [ui.empty('日线数据不足（当前源仅 ' + ((res.bars || []).length) +
+          ' 根），暂无法生成信号雷达' + (usSrc() ? '；币安 bStocks 历史较短，可切回常规源看信号' : ''))]);
       } catch (e) {
         paint(signalHost, [ui.empty('信号雷达数据获取失败：' + e.message)]);
       }
@@ -1032,6 +1064,15 @@
     /* ------------------------------------------------------- 资金流 */
 
     async function loadFlow() {
+      /* 币安 bStocks 不提供资金流（主力 / 大单拆分）：与其拿常规源的数据混着显示，
+         不如明确说「该源没有这个数据」 */
+      if (usSrc() === 'binance') {
+        flowChart = null;
+        paint(flowChartHost, [ui.empty('币安 bStocks 源不提供资金流数据（该数据仅 A股 / 常规美股源提供）；' +
+          '需要资金流请把顶栏美股源切回「常规时段」')]);
+        paint(flowNoteHost, []);
+        return;
+      }
       flowBusy(true);
       try {
         const res = await api.fundflow(market, code);
@@ -1153,7 +1194,8 @@
             legendHost,
             canvasHost,
           ])),
-          ui.section('AI 研判', '建议档位 / 评分 / 置信度 / 策略共识 / 统计优势 / 预测 / 凯利仓位 / 交易计划 / 关键因子 / 风险；字段缺失按「—」降级',
+          ui.section('AI 研判', '建议档位 / 评分 / 置信度 / 策略共识 / 统计优势 / 预测 / 凯利仓位 / 交易计划 / 关键因子 / 风险；字段缺失按「—」降级' +
+            (usSrc() === 'binance' ? '；<b>本区块仍用常规美股源</b>（模型需要长历史样本，bStocks 日K 仅约 50~100 根）' : ''),
             [advisorHint, advisorToggle, advSaveBtn, advisorBtn],
             h('div', {}, [advisorParamHost, advisorSavedHost, advisorBody])),
           ui.section('技术信号雷达', '多指标加权评分', [], signalHost),
@@ -1170,7 +1212,7 @@
     async function loadQuote() {
       lastQuoteAt = Date.now();          /* 记录请求时间：降级轮询据此避免与定时器重复拉取 */
       try {
-        const q = await api.stock(market, code);
+        const q = await api.stock(market, code, usSrc());
         st.quote = q;
         renderHead();
         renderMetrics();
@@ -1190,7 +1232,7 @@
       await loadChart();
       loadFlow();
       try {
-        const ob = await api.orderbook(market, code);
+        const ob = await api.orderbook(market, code, usSrc());
         st.orderbook = ob;
         renderOrderbook();
       } catch (e) { /* 忽略盘口失败 */ }

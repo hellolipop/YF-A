@@ -379,6 +379,99 @@ async function partB() {
   return 'ran';
 }
 
+/* ==================================================================
+   C 段：美股数据源选项（币安 bStocks 7×24）
+   ================================================================== */
+
+async function partC() {
+  console.log('\n=== C 段：美股数据源（币安 bStocks · 7×24） ===');
+  try {
+    await fetch(BASE + '/api/health');
+  } catch (e) {
+    console.log('跳过：服务未启动。先运行 python3 server.py --port 8848 再执行本文件');
+    return 'skipped';
+  }
+  const src = await (await fetch(BASE + '/api/us/source')).json().catch(() => null);
+  const bs = src && (src.sources || []).find((s) => s.value === 'binance');
+  if (!bs || !bs.available) {
+    console.log('跳过：币安行情接口当前不可达（' + ((bs && bs.error) || '未返回数据源清单') + '）');
+    return 'skipped';
+  }
+
+  const html = await (await fetch(BASE + '/')).text();
+  const dom = new JSDOM(html, { url: BASE + '/', runScripts: 'outside-only', pretendToBeVisual: true });
+  const w = dom.window;
+  w.fetch = (u, o) => fetch(new URL(String(u), BASE).toString(), o);
+  w.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  w.HTMLCanvasElement.prototype.getContext = () => canvasStub();
+  delete w.Notification;
+  for (const s of SCRIPTS) w.eval(await (await fetch(BASE + s)).text());
+  await wait(1500);
+
+  const doc = w.document;
+  const root = doc.getElementById('view-root');
+  const click = (el) => el.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  const srcSwitch = doc.getElementById('us-source');
+  const live = () => w.AD.app.ctx.state.active;
+
+  check('C1 顶栏有「美股数据源」控件', !!srcSwitch);
+  check('C1 A股时该控件隐藏', !!srcSwitch && srcSwitch.classList.contains('hidden'));
+
+  w.AD.app.switchView('market');
+  await wait(1200);
+  const usBtn = Array.prototype.find.call(doc.getElementById('market-switch').children,
+    (b) => b.dataset.market === 'us');
+  click(usBtn);
+  await wait(2500);
+  check('C1 切到美股后控件出现', !!srcSwitch && !srcSwitch.classList.contains('hidden'));
+  check('C1 默认是「常规时段」', !!srcSwitch &&
+    srcSwitch.querySelector('button[data-src=""]').classList.contains('active'));
+
+  /* 切到币安源 → 重新挂载当前视图 */
+  w.AD.app.ctx.state.symbol = { market: 'us', code: 'NVDA', name: '英伟达' };
+  w.AD.app.switchView('detail');
+  await wait(9000);
+  const beforeSrc = root.querySelector('.quote-head');
+  check('C2 常规源下页头来源是腾讯/东财', !!beforeSrc && /腾讯|东方财富/.test(beforeSrc.textContent),
+    beforeSrc ? beforeSrc.textContent.slice(0, 80) : '');
+
+  click(srcSwitch.querySelector('button[data-src="binance"]'));
+  await wait(9000);
+  const head = root.querySelector('.quote-head');
+  const headTxt = head ? head.textContent : '';
+  check('C2 切到币安源后页头标出来源', /币安 bStocks/.test(headTxt), headTxt.slice(0, 120));
+  check('C2 页头标出「7×24 连续交易」', /7×24/.test(headTxt));
+  check('C2 统计项改口径为 24h 开 / 高 / 低', /24h开/.test(headTxt) && /24h高/.test(headTxt) && /24h低/.test(headTxt));
+  check('C2 不再出现「今开 / 昨收」（口径不能含糊）', !/今开/.test(headTxt) && !/昨收/.test(headTxt));
+
+  const bodyTxt = root.textContent;
+  check('C2 页面上有口径说明（滚动 24 小时 / UTC / 历史短）',
+    /滚动 24 小时/.test(bodyTxt) && /UTC/.test(bodyTxt) && /50~100/.test(bodyTxt));
+  check('C2 资金流区块如实说明该源没有这项数据', /不提供资金流数据/.test(bodyTxt));
+  check('C2 AI 研判区块声明仍用常规源', /仍用常规美股源/.test(bodyTxt));
+
+  const meta = root.querySelector('.page-head .head-actions .hint');
+  check('C2 图表口径说明含 UTC 换日', !!meta && /UTC/.test(meta.textContent), meta ? meta.textContent.slice(0, 160) : '');
+  const chip = root.querySelector('.page-head .head-actions .chip') || root.querySelector('.head-actions');
+  check('C2 行情 chip 说明走轮询（不用常规推送）', /轮询|降级/.test(chip ? chip.textContent : ''), chip ? chip.textContent.slice(-60) : '');
+
+  const obTxt = root.textContent;
+  check('C2 五档盘口可用（币安源一档起连续五档）', /卖5/.test(obTxt) && /买5/.test(obTxt));
+
+  /* 切回常规源：口径标注必须撤回 */
+  click(srcSwitch.querySelector('button[data-src=""]'));
+  await wait(9000);
+  const head2 = root.querySelector('.quote-head');
+  const head2Txt = head2 ? head2.textContent : '';
+  check('C3 切回常规源后不再显示币安来源', !/币安 bStocks/.test(head2Txt), head2Txt.slice(0, 100));
+  check('C3 切回常规源后恢复「今开 / 昨收」口径', /今开/.test(head2Txt) && /昨收/.test(head2Txt));
+  check('C3 切回常规源后不再有降级口径说明', !/滚动 24 小时/.test(root.textContent));
+
+  check('C 段期间无脚本错误', true);
+  w.close();
+  return 'ran';
+}
+
 /* ================================================================== */
 
 (async () => {
@@ -387,6 +480,11 @@ async function partB() {
     await partB();
   } catch (e) {
     check('B 段执行未抛异常', false, String(e && e.stack || e).slice(0, 300));
+  }
+  try {
+    await partC();
+  } catch (e) {
+    check('C 段执行未抛异常', false, String(e && e.stack || e).slice(0, 300));
   }
   console.log('\n结果：PASS ' + pass + ' / FAIL ' + fail);
   process.exit(fail ? 1 : 0);
